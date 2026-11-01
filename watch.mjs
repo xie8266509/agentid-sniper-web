@@ -364,6 +364,9 @@ if (S.walletIdentityVersion !== 2) {
 }
 S.runtimeMode = MONITOR_ONLY ? 'monitor' : 'auto';
 S.configLoadedAt = CONFIG_LOADED_AT;
+S.strategyRuntime = { runId: `${process.pid}:${CONFIG_LOADED_AT}`, pid: process.pid, startedAt: CONFIG_LOADED_AT };
+S.walletRuleReports = {};
+S.effectiveWalletRules = {};
 S.effectiveRules = structuredClone(RULE);
 S.sellRuleLimits = { freeMinUsd: FREE_SELL_MIN_USD, freePeakDelayMs: FREE_PEAK_DELAY_MS };
 for (const k of Object.keys(S.tokens)) delete S.tokens[k].verified;
@@ -782,6 +785,7 @@ async function holdings(head, onlyFast = false) {
   return Promise.race([completed, sleep(1000).then(() => ({ pending: true }))]);
 }
 async function holdW(W, head, onlyFast) {
+  if (publishWalletRules(W, rulesFor(W))) save();
   await recoverScannerWallet(W);
   const checked = new Set();
   const walletTokens = () => {
@@ -833,9 +837,20 @@ async function holdW(W, head, onlyFast) {
   }
   if (firstError) throw firstError;
 }
+function publishWalletRules(W, rules) {
+  const runtime = S.strategyRuntime;
+  if (!runtime) return;
+  const profile = W.profile || {}, seen = new Set();
+  for (const token of TOKENS.concat(S.dyn || [])) if (!token.only || token.only.toLowerCase() === W.addr) seen.add(token.addr.toLowerCase());
+  S.walletRuleReports ||= {};
+  S.walletRuleReports[W.id] = { walletId: W.id, walletAddress: W.addr, runId: runtime.runId, runStartedAt: runtime.startedAt, checkedAt: Date.now(), trackedERC20: seen.size,
+    binding: [profile.bawDir, profile.instanceId, profile.agentId, profile.agentIdVerified, profile.legacyNames], rules: structuredClone(rules) };
+  S.effectiveWalletRules ||= {}; S.effectiveWalletRules[W.id] = structuredClone(rules);
+  return true;
+}
 async function checkHoldingsBatch(W, head, onlyFast, selectedTokens) {
   const RULE = rulesFor(W), sellingEnabled = canWallet(W, 'token-sell');
-  S.effectiveWalletRules ||= {}; S.effectiveWalletRules[W.id] = structuredClone(RULE);
+  publishWalletRules(W, RULE);
   const seen = new Set(), openingOnly = onlyFast === 'open';
   const ordered = selectedTokens.map((token, index) => ({ token, index, opening: token.boughtAt > Date.now() - 72 * 3600000 && !S.tokens[positionStateKey(W.addr, token.addr)]?.pair })).sort((a, b) => Number(b.opening) - Number(a.opening) || a.index - b.index).map(item => item.token);
   for (const t0 of ordered) {
