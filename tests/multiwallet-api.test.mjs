@@ -44,20 +44,68 @@ async function fixture(t) {
   return { root, request, calls, controls, disconnected, config: () => readConfig({ path }), bind: (id, address) => identities.set(id, address), setProof: (tx, r) => { transaction = tx; receipt = r; }, setExecuteResult: value => { executeResult = value; } };
 }
 
-test('new wallet is independently paired, bound to the verified address and remains paused', async t => {
+test('new wallet is independently paired and bound without enabling automatic execution or forcing pause', async t => {
   const f = await fixture(t), created = await f.request('/api/wallets', { name: '第三个钱包' });
   assert.equal(created.status, 200);
   const wallet = created.data.wallet;
-  assert.equal(wallet.draft, true); assert.equal(wallet.paused, true); assert.equal(wallet.address, '');
+  assert.equal(wallet.draft, true); assert.equal(wallet.paused, false); assert.equal(wallet.mode, 'monitor'); assert.equal(wallet.address, '');
+  assert.equal((await f.request('/api/wallets/' + wallet.id + '/settings', { patch: { mode: 'auto', paused: false }, confirmed: true })).status, 409);
   f.bind(wallet.id, C);
   assert.equal((await f.request('/api/wallet/login', { walletId: wallet.id })).data.walletId, wallet.id);
   const imported = await f.request('/api/wallet/import', { walletId: wallet.id });
   assert.equal(imported.status, 200);
   const bound = imported.data.config.wallets.find(w => w.id === wallet.id);
-  assert.equal(bound.address, C); assert.equal(bound.agentId, 'claimedname'); assert.equal(bound.agentIdVerified, true); assert.equal(bound.mode, 'monitor'); assert.equal(bound.paused, true); assert.equal(bound.draft, false);
+  assert.equal(bound.address, C); assert.equal(bound.agentId, 'claimedname'); assert.equal(bound.agentIdVerified, true); assert.equal(bound.mode, 'monitor'); assert.equal(bound.paused, false); assert.equal(bound.draft, false);
+  assert.equal(f.config().wallets.find(w => w.id === wallet.id).paused, false);
   assert.equal((await f.request('/api/wallets/' + wallet.id + '/settings', { patch: { address: A } })).status, 400);
   assert.equal((await f.request('/api/wallets/' + wallet.id + '/settings', { patch: { mode: 'auto', paused: false } })).status, 409);
   assert.equal((await f.request('/api/wallets/' + wallet.id + '/settings', { patch: { mode: 'sell-only', paused: false }, confirmed: true })).status, 200);
+  assert.equal(f.calls.some(call => call.args[0] === 'contract-call'), false);
+});
+
+test('a pause explicitly chosen before first binding survives import and later verification', async t => {
+  const f = await fixture(t), created = await f.request('/api/wallets', { name: '手动暂停的钱包' }), { id } = created.data.wallet;
+  assert.equal((await f.request('/api/wallets/' + id + '/settings', { patch: { paused: true } })).status, 200);
+  f.bind(id, C);
+  for (let i = 0; i < 2; i++) {
+    const imported = await f.request('/api/wallet/import', { walletId: id });
+    assert.equal(imported.status, 200);
+    const wallet = imported.data.config.wallets.find(wallet => wallet.id === id);
+    assert.equal(wallet.paused, true); assert.equal(wallet.mode, 'monitor'); assert.equal(wallet.draft, false);
+  }
+  assert.equal(f.config().wallets.find(wallet => wallet.id === id).paused, true);
+  assert.equal(f.calls.some(call => call.args[0] === 'contract-call'), false);
+});
+
+test('saving an unchecked pause persists false with wallet budgets and rules after reload and binding', async t => {
+  const f = await fixture(t), created = await f.request('/api/wallets', { name: '保留设置的钱包' }), { id } = created.data.wallet;
+  const siblings = structuredClone(f.config().wallets.filter(wallet => wallet.id !== id));
+  assert.equal((await f.request('/api/wallets/' + id + '/settings', { patch: { paused: true, paid: { maxUsd: 7, maxBnbPerDay: 0.02 }, rules: { backX: 3 } } })).status, 200);
+  const saved = await f.request('/api/wallets/' + id + '/settings', { patch: { paused: false } });
+  assert.equal(saved.status, 200); assert.equal(saved.data.wallet.paused, false);
+  const assertSaved = wallet => {
+    assert.equal(wallet.paused, false); assert.equal(wallet.mode, 'monitor');
+    assert.equal(wallet.paid.maxUsd, 7); assert.equal(wallet.paid.maxBnbPerDay, 0.02); assert.equal(wallet.rules.backX, 3);
+  };
+  assertSaved(f.config().wallets.find(wallet => wallet.id === id));
+  assertSaved((await f.request('/api/config')).data.config.wallets.find(wallet => wallet.id === id));
+  assertSaved((await f.request('/api/wallets')).data.wallets.find(wallet => wallet.id === id));
+  f.bind(id, C);
+  const imported = await f.request('/api/wallet/import', { walletId: id }); assert.equal(imported.status, 200);
+  assertSaved(imported.data.config.wallets.find(wallet => wallet.id === id));
+  assertSaved(f.config().wallets.find(wallet => wallet.id === id));
+  assert.deepEqual(f.config().wallets.filter(wallet => wallet.id !== id), siblings);
+  assert.equal(f.calls.some(call => call.args[0] === 'contract-call'), false);
+});
+
+test('unpaused monitor wallets still require explicit automatic authorization and valid connection', async t => {
+  const f = await fixture(t), created = await f.request('/api/wallets', { name: '监控钱包' }), { id } = created.data.wallet;
+  f.bind(id, C); assert.equal((await f.request('/api/wallet/import', { walletId: id })).status, 200);
+  assert.equal((await f.request('/api/wallets/' + id + '/settings', { patch: { mode: 'auto' } })).status, 409);
+  f.disconnected.add(id);
+  assert.equal((await f.request('/api/wallets/' + id + '/settings', { patch: { mode: 'auto' }, confirmed: true })).status, 409);
+  const current = f.config().wallets.find(wallet => wallet.id === id);
+  assert.equal(current.paused, false); assert.equal(current.mode, 'monitor');
   assert.equal(f.calls.some(call => call.args[0] === 'contract-call'), false);
 });
 

@@ -1,13 +1,13 @@
-# v0.4.5 发布与维护
+# v0.4.6 发布与维护
 
-发行仓库：[xie8266509/agentid-sniper-web](https://github.com/xie8266509/agentid-sniper-web)。当前正式发行 **v0.4.5（2026-11-01）**，同步上游 v2.8.2，加入闲时安装、上游检测及审核后自动发行，保留更新器时差修复及多钱包工作台；历史保留在 [变更记录](CHANGELOG.md)。线上提交、CI 和发行结果分别以仓库页面为准。
+发行仓库：[xie8266509/agentid-sniper-web](https://github.com/xie8266509/agentid-sniper-web)。当前正式发行 **v0.4.6（2026-11-01）**，同步上游 v2.8.2，加入闲时安装、上游检测及审核后自动发行，保留更新器时差修复及多钱包工作台；历史保留在 [变更记录](CHANGELOG.md)。线上提交、CI 和发行结果分别以仓库页面为准。
 
 ## 归属与发行方式
 
 - 原项目：[Nancy / Agent ID Sniper](https://github.com/nancyc0813-maker/agentid-sniper)，原作者 [@nancy_c813](https://x.com/nancy_c813)。
 - 社区 Web 增强版维护：[@supra_bnb](https://x.com/supra_bnb)。Web 页脚、README 和 NOTICE 已标注双方来源。
 - 保留 `LICENSE` 中 Nancy 的 MIT 版权与完整许可；保留 `lib/vendor/element-sdk-LICENSE` 和 ABI 来源提交。不替换原作者版权。
-- 首个增强版版本为 `v0.1.0`，当前正式版为 `v0.4.5`；上游基线单独记录为 `v2.8.2 / ef74121`。
+- 首个增强版版本为 `v0.1.0`，当前正式版为 `v0.4.6`；上游基线单独记录为 `v2.8.2 / ef74121`。
 - 发行目标是 GitHub，`package.json` 的 `private: true` 可保留。
 
 ## 执行清单
@@ -19,7 +19,7 @@
 | 更新渠道与完整发行清单 | 本地验证通过 | 用户只跟随增强版正式发布标签与 `release.json`；校验 Web、钱包、NFT 等完整发行内容，更新与回退不覆盖数据。 |
 | 源码收齐、忽略规则与敏感信息检查 | 已知模式检查通过 | 首个提交包括增强版完整源码；完整历史和发布候选检查通过，不含配置、会话、Key 或日志。 |
 | CI、干净安装与升级/回退回归 | 本地验证通过 | Node.js 24 离线测试及 macOS 安装验证通过，不使用真实钱包或交易权限。 |
-| 发行提交与标签 | [查看正式发行](https://github.com/xie8266509/agentid-sniper-web/releases) | `v0.4.5` 正式标签对应发行清单与通过检查的源码。 |
+| 发行提交与标签 | [查看正式发行](https://github.com/xie8266509/agentid-sniper-web/releases) | `v0.4.6` 正式标签对应发行清单与通过检查的源码。 |
 | GitHub Fork、线上 CI 与 Release | [发行仓库](https://github.com/xie8266509/agentid-sniper-web) | [线上 CI](https://github.com/xie8266509/agentid-sniper-web/actions) 与 Release 记录可核对；发行内容必须与已验证源码一致。 |
 
 ## 更新渠道
@@ -33,7 +33,7 @@
 - 已验证环境以 macOS 和 Node.js 24 为准；最低 Node.js 22.15，Git 必需。Linux/Windows 的增强版后台服务尚未完成验证。
 - 使用 `git clone` 安装；Download ZIP 缺少 `.git`，暂无一键更新保证。旧 Windows 根目录入口已停用，原始安装/启动脚本保存在 `docs/legacy/*.txt`；`setup.mjs` 已改为安全只读初始化兼容入口。
 - 首次配置保持只读模式、空钱包、零每日付费预算。自动交易必须由用户登录并核对规则后明确开启。
-- 多钱包测试不代表已验证 2–3 个真实币安账号同时在线实盘；新增钱包保持暂停和只监控，不自动启用交易。
+- 多钱包测试不代表已验证 2–3 个真实币安账号同时在线实盘；新增钱包默认只监控、不勾选暂停，不自动启用交易；已有的手动暂停状态保持不变。
 - NFT 自动卖出依赖 Element API Key/权限；无有效买单时等待。真实挂牌和成交尚未完成完整实盘验证，不宣传为已验证盈利或保证成交。
 - 首发不引用本机 `data/` 截图；公开截图需另外生成，先检查钱包、日志和敏感信息。
 

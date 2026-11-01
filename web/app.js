@@ -401,9 +401,10 @@ async function openWalletSettings(id) {
   const mode = el('select', { class: 'input', id: 'wallet-mode', name: 'mode' }, Object.entries(walletModes).map(([value, label]) => el('option', { value }, label))); mode.value = walletMode(w);
   const features = [['autoMint', '自动铸造'], ['autoSellTokens', '代币卖出与止盈'], ['autoSellNfts', 'NFT 自动卖出']].map(([key, label]) => el('label', { class: 'checkbox-row' }, el('input', { type: 'checkbox', name: key, checked: w[key] !== false }), label));
   const paused = el('input', { type: 'checkbox', name: 'paused', checked: w.paused === true });
+  const saveError = el('p', { class: 'table-error', role: 'alert', hidden: true });
   const editor = configRulesEditor(r);
   form.append(walletLabel(w), el('div', { class: 'form-grid section-spacer' }, field('显示名称', 'wallet-name', w.name, { required: true }), el('div', { class: 'field' }, el('label', { for: 'wallet-mode' }, '执行模式'), mode)),
-    el('div', { class: 'wallet-mode-summary' }, el('label', { class: 'checkbox-row' }, paused, '暂停此钱包的新自动操作'), el('p', { class: 'help' }, state.config.monitorOnly !== false ? '全局为只读模式。即使选择自动交易，也不会发送自动交易。' : '仅卖出模式不参与铸造或买入；已提交订单会继续核对。')),
+    el('div', { class: 'wallet-mode-summary' }, el('label', { class: 'checkbox-row' }, paused, '暂停此钱包的新自动操作'), el('p', { class: 'help' }, state.config.monitorOnly !== false ? '全局为只读模式。即使选择自动交易，也不会发送自动交易。' : '仅卖出模式不参与铸造或买入；已提交订单会继续核对。')), saveError,
     el('fieldset', { class: 'feature-switches' }, el('legend', {}, '允许的自动操作'), features),
     el('div', { class: 'section-heading-inline' }, el('h3', {}, '钱包预算'), button('使用全局模板', 'copy', async () => { closeModal(); await copyTemplateToWallet(id); }, 'small ghost')),
     el('div', { class: 'form-grid three' }, field('单项目上限', 'wallet-maxUsd', p.maxUsd ?? 20, { type: 'number', min: 0, step: 'any', suffix: 'USD', required: true }), field('每日美元上限', 'wallet-dayUsd', p.dayUsd ?? 60, { type: 'number', min: 0, max: 60, step: .01, suffix: 'USD', required: true }), field('每日 BNB 上限', 'wallet-maxBnb', p.maxBnbPerDay ?? 0, { type: 'number', min: 0, step: 'any', suffix: 'BNB', required: true }), field('保留 Gas 余额', 'wallet-keepBnb', p.keepBnb ?? .006, { type: 'number', min: 0, step: 'any', suffix: 'BNB', required: true }), field('最低进场进度', 'wallet-goPct', (p.goPct ?? .6) * 100, { type: 'number', min: 0, max: 100, step: .1, suffix: '%', help: '与安装随机门槛取较高者。', required: true })),
@@ -412,21 +413,30 @@ async function openWalletSettings(id) {
     el('p', { class: 'page-footnote' }, 'NFT 的价格、数量和成交规则在持仓页按资产单独配置。'));
   const save = button('保存钱包设置', 'save', async () => {
     if (!form.reportValidity()) return;
+    saveError.hidden = true;
     const fd = new FormData(form), patch = { name: String(fd.get('wallet-name')).trim(), mode: mode.value, paused: paused.checked, paid: { ...p, maxUsd: Number(fd.get('wallet-maxUsd')), dayUsd: Number(fd.get('wallet-dayUsd')), maxBnbPerDay: Number(fd.get('wallet-maxBnb')), keepBnb: Number(fd.get('wallet-keepBnb')), goPct: Number(fd.get('wallet-goPct')) / 100, earlyPct: Math.min(p.earlyPct ?? .6, Number(fd.get('wallet-goPct')) / 100) }, rules: editor.read(fd) };
     for (const key of ['autoMint', 'autoSellTokens', 'autoSellNfts']) patch[key] = fd.get(key) === 'on';
     let confirmed = false;
     if (!patch.paused && patch.mode !== 'monitor') {
-      confirmed = await confirmAction('应用钱包执行规则', '此钱包将按下列范围执行。请核对钱包地址、预算和功能开关。', '确认并应用', { checkbox: '我已核对该钱包的地址、权限及规则', details: [w.name, w.address || '尚未绑定地址', `执行模式：${walletModes[patch.mode]}`, `每日上限：${usd(patch.paid.dayUsd)} / ${patch.paid.maxBnbPerDay} BNB`, `自动操作：${[['autoMint','铸造'],['autoSellTokens','代币卖出'],['autoSellNfts','NFT 卖出']].filter(([key]) => patch[key]).map(([,label]) => label).join('、') || '全部关闭'}`, `止盈策略：${ruleStrategyName(patch.rules)}`, ...(state.config.monitorOnly !== false ? ['全局只读仍在生效，自动操作暂不执行。'] : [])] });
-      if (!confirmed) { openModal('钱包设置', form, [archive, button('取消', null, async () => closeModal()), save]); modal.classList.add('wallet-settings-dialog'); return; }
+      const confirmation = confirmAction('应用钱包执行规则', '此钱包将按下列范围执行。请核对钱包地址、预算和功能开关。', '确认并应用', { checkbox: '我已核对该钱包的地址、权限及规则', details: [w.name, w.address || '尚未绑定地址', `执行模式：${walletModes[patch.mode]}`, `每日上限：${usd(patch.paid.dayUsd)} / ${patch.paid.maxBnbPerDay} BNB`, `自动操作：${[['autoMint','铸造'],['autoSellTokens','代币卖出'],['autoSellNfts','NFT 卖出']].filter(([key]) => patch[key]).map(([,label]) => label).join('、') || '全部关闭'}`, `止盈策略：${ruleStrategyName(patch.rules)}`, ...(state.config.monitorOnly !== false ? ['全局只读仍在生效，自动操作暂不执行。'] : [])] });
+      const confirmationGeneration = modalGeneration;
+      confirmed = await confirmation;
+      if (!modal.open && modalGeneration === confirmationGeneration + 1) showSettings();
+      if (!confirmed) return;
     }
-    const data = await api(`/api/wallets/${encodeURIComponent(id)}/settings`, { method: 'POST', body: { patch, confirmed } });
-    if (data.config) state.config = data.config; else await loadConfig(); closeModal(); updateChrome(); toast('钱包设置已保存'); await route();
+    let data;
+    try { data = await api(`/api/wallets/${encodeURIComponent(id)}/settings`, { method: 'POST', body: { patch, confirmed } }); }
+    catch (error) { saveError.textContent = '设置未保存：' + error.message; saveError.hidden = false; throw error; }
+    if (data.config) state.config = data.config; else await loadConfig();
+    if (modal.open && form.isConnected) closeModal();
+    updateChrome(); toast('钱包设置已保存'); await route();
   }, 'primary');
   const archive = button(w.archived ? '恢复钱包' : '归档钱包', 'trash', async () => {
     if (!await confirmAction(w.archived ? '恢复钱包' : '归档钱包', w.archived ? '恢复后保持暂停。登录会话和历史记录继续保留。' : '停止该钱包的新自动操作，并从默认列表隐藏。会话和历史订单保留；有未决操作时无法归档。', w.archived ? '恢复并暂停' : '归档', { details: [w.name, w.address || '尚未绑定地址'] })) return;
     await api(`/api/wallets/${encodeURIComponent(id)}/settings`, { method: 'POST', body: { patch: { archived: !w.archived, paused: true } } }); await loadConfig(); closeModal(); updateChrome(); toast(w.archived ? '钱包已恢复并暂停' : '钱包已归档'); await route();
   }, 'danger ghost');
-  openModal('钱包设置', form, [archive, button('取消', null, async () => closeModal()), save]); modal.classList.add('wallet-settings-dialog');
+  function showSettings() { openModal('钱包设置', form, [archive, button('取消', null, async () => closeModal()), save]); modal.classList.add('wallet-settings-dialog'); }
+  showSettings();
 }
 async function copyTemplateToWallet(id) {
   const w = walletById(id); if (!w) return;
