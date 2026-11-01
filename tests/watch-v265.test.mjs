@@ -113,7 +113,7 @@ test('old recipient-based participation caches clear once without changing compl
 });
 
 test('an unreadable mint-inventory balance cannot become a false 100% sold progress', async () => {
-  for (const [balance, expected] of [[null, null], ['0x', null], ['malformed', null], ['0x' + word(1000), 0], ['0x' + word(0), 1]]) {
+  for (const [balance, expected] of [[null, null], ['0x', null], ['malformed', null], ['0x' + word(1000), 0], ['0x' + word(0), null]]) {
     const sandbox = {
       S: { prog: { [target]: { init: '1000', tok: target } } }, decodeAbiUint,
       wa: address => address.slice(2).padStart(64, '0'),

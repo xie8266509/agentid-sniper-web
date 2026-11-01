@@ -28,6 +28,8 @@ function harness({ fast = false, hold, rpc, scan } = {}) {
     UPD: { on: true }, async updCheck() { seen.updateChecks++; return null; },
     async doUpdate() { throw new Error('no update command file was supplied'); },
     tgCmdLoop: async () => {}, async scanNew() { seen.scanCalls++; return scan?.(); },
+    socialCandidateWatch: async () => {},
+    inscScan: async () => {},
   };
   const context = vm.createContext(sandbox);
   vm.runInContext(schedulerSource + mainSource + '\nglobalThis.api = { startHoldingsScheduler, main };', context);

@@ -4,7 +4,7 @@
   "channel": "stable",
   "upstream": {
     "repository": "nancyc0813-maker/agentid-sniper",
-    "version": "2.6.5",
-    "commit": "d104eef587f7b0fdc5c3875e92f0b6a0668aca70"
+    "version": "2.7.4",
+    "commit": "b8fd1147aa087b7b23d4fc51fb235ae80389bcf7"
   }
 }

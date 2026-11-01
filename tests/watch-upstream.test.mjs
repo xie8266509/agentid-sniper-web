@@ -5,7 +5,8 @@ import vm from 'node:vm';
 import { getPaidConfig, withinPaidBudget } from '../lib/config.mjs';
 import { marketOrderRecord, marketOrderState } from '../lib/sell-rules.mjs';
 import { scannerRuntimeDouble } from './watch-runtime-fixture.mjs';
-import { createMintRisk, effectiveEntryPolicy, entryGate } from '../lib/mint-policy.mjs';
+import { createMintRisk, effectiveEntryPolicy, entryGate, deriveMintCost } from '../lib/mint-policy.mjs';
+import { id as signatureHash } from 'ethers';
 import { decodeAbiUint } from '../lib/nft-codec.mjs';
 
 // Only evaluate the reviewed function bodies. Every RPC, CLI, file, and Telegram
@@ -31,6 +32,7 @@ const BNB = '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
 const word = (value) => BigInt(value).toString(16).padStart(64, '0');
 const transferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 const bad = new Set(['0xa9059cbb', '0x095ea7b3', '0x23b872dd', '0x42842e0e', '0xb88d4fde', '0xa22cb465', '0x39509351', '0xd505accf', '0xf242432a', '0x2eb2c2d6']);
+const limitSelector = signatureHash('maxPerWallet()').slice(0, 10);
 
 function harness(options = {}) {
   let clock = Date.now();
@@ -43,10 +45,10 @@ function harness(options = {}) {
   const balanceChanges = options.noReward ? [] : [{ owner: walletAddress, contractAddress: reward, change: '1', tokenType: 'Erc20' }];
   const sandbox = {
     Date: Clock, MONITOR_ONLY: options.monitorOnly === true, FILE_COMMANDS_ENABLED: options.fileEnabled === true, MONITOR_NOTE: '仅监控',
-    CONFIG: { timeZone: 'Asia/Shanghai' }, PAID: getPaidConfig({ paid: { goPct: options.goPct ?? 0.8, maxUsd: options.maxUsd ?? 20, maxBnbPerDay: options.maxBnbPerDay ?? 0.05, keepBnb: 0.006 } }),
-    ENTRY_POLICY: { goPct: 0.85, minAgents: 175 }, effectiveEntryPolicy, entryGate, decodeAbiUint,
+    CONFIG: { timeZone: 'Asia/Shanghai' }, PAID: getPaidConfig({ paid: { goPct: options.goPct ?? 0.8, maxUsd: options.maxUsd ?? 20, maxBnbPerDay: options.maxBnbPerDay ?? 0.05, dayUsd: options.dayUsd ?? 60, keepBnb: 0.006 } }),
+    ENTRY_POLICY: { version: 3, goPct: 0.65, minAgents: 115 }, effectiveEntryPolicy, entryGate, decodeAbiUint, deriveMintCost,
     S, WALLETS: [W], FORCE: new Set(options.hotGo || options.forced === false ? [] : [target]), HOT: new Map(),
-    USDT, NATIVE_BNB: BNB, WBNB: reward, FACTORY: reward, T_TRANSFER: transferTopic,
+    USDT, NATIVE_BNB: BNB, WBNB: '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c', FACTORY: reward, T_TRANSFER: transferTopic,
     CANDS: [['mint-test', '0x12345678']], INFRA: new Set(), CLAIM: new Set(), REGISTRY: '60b9262456de011f7d15a54cdd8c48baaa8b022f',
     getPaidConfig, marketOrderRecord, marketOrderState, withinPaidBudget, w: word, wa: (a) => a.slice(2).padStart(64, '0'), big: (value) => value && value !== '0x' ? BigInt(value) : 0n,
     badSel: (data) => bad.has(String(data || '').slice(0, 10).toLowerCase()), tokStr: () => '',
@@ -55,7 +57,7 @@ function harness(options = {}) {
     fpCache: new Map(),
     async freeProgress() { return options.freeProgress === undefined ? 0.9 : options.freeProgress; },
     async serialDev() { return options.serialReason || ''; },
-    async fullCode() { return options.refund === false ? '0x' : '0x63590e1ae3'; },
+    async fullCode() { return '0x' + (options.refund === false ? '' : '63590e1ae3') + (options.noLimit ? '' : limitSelector.slice(2)) + (options.nft ? 'c87b56dd' : ''); },
     async poolOpen() { return options.poolOpen === true; },
     trackFromSim() {}, noteFree() {}, MQ: new Map(),
     async autoMintMax(c, name, wallet, value) { return sandbox.api.autoMint(c, name, wallet, value); },
@@ -74,6 +76,8 @@ function harness(options = {}) {
       if (method === 'eth_getCode') return '0x6000';
       if (method === 'eth_getBlockNumber' || method === 'eth_blockNumber') return '0x1000';
       if (method === 'eth_call' && params?.[0]?.data?.startsWith('0x70a08231')) return '0x' + word(1000n * 10n ** 18n);
+      if (method === 'eth_call' && params?.[0]?.data === limitSelector) return '0x' + word(10);
+      if (method === 'eth_call' && params?.[0]?.data?.startsWith('0xc87b56dd')) { const bytes = Buffer.from('https://mock-nft.test/1.json'); return '0x' + word(32) + word(bytes.length) + bytes.toString('hex').padEnd(Math.ceil(bytes.length / 32) * 64, '0'); }
       if (method === 'eth_call') return '0x';
       if (method === 'eth_getLogs') return [];
       throw new Error('Unmocked RPC ' + method);
@@ -101,9 +105,9 @@ function harness(options = {}) {
     writeFileSync(path, data) { events.writes.push({ path, data }); },
   };
   Object.assign(sandbox, scannerRuntimeDouble({ sandbox, wallet: W, state: S, events }));
-  sandbox.MINT_RISK = createMintRisk({ state: S, rpc: (...args) => sandbox.rpc(...args), fullCode: (...args) => sandbox.fullCode(...args), save: (...args) => sandbox.save(...args), now: () => clock, timeZone: 'Asia/Shanghai', usdt: USDT });
+  sandbox.MINT_RISK = createMintRisk({ state: S, rpc: (...args) => sandbox.rpc(...args), fullCode: (...args) => sandbox.fullCode(...args), nftMediaCheck: async () => ({ verified: true }), save: (...args) => sandbox.save(...args), now: () => clock, timeZone: 'Asia/Shanghai', usdt: USDT });
   const context = vm.createContext(sandbox);
-  vm.runInContext(helpers + addressSafety + policyHelpers + learner + paid + manual + autoMint + (options.realPreview ? extract('async function previewExec(', 'async function poolOut(') : '') + (options.withQueue ? extract('const MQK =', '// 每個錢包可以打多份的') : '') + '\nglobalThis.api = { executeUsdtMint, prepareUsdtReplay, mintSimulationCheck, approvalSimulationCheck, validateFileJob, manualMints, paidLoop, learnReplay, safeAddrs, revokeOnFail, hasPositiveMintGain, autoMint, previewExec, settleConfirmedMintRisk, queueMint: typeof queueMint === \'function\' ? queueMint : null };', context);
+  vm.runInContext((options.trackBasis ? extract('function trackFromSim(', 'function positionFor(') : extract('function mintTrackingPlan(', 'function positionFor(')) + helpers + addressSafety + policyHelpers + learner + paid + manual + autoMint + (options.realPreview ? extract('async function previewExec(', 'async function poolOut(') : '') + (options.withQueue ? extract('const MQK =', '// 每個錢包可以打多份的') : '') + '\nglobalThis.api = { executeUsdtMint, prepareUsdtReplay, mintSimulationCheck, approvalSimulationCheck, validateFileJob, manualMints, paidLoop, learnReplay, safeAddrs, revokeOnFail, hasPositiveMintGain, autoMint, previewExec, settleConfirmedMintRisk, recoverScannerWallet, othersPay, verifyAgentProject, queuePaidPhase, queueMint: typeof queueMint === \'function\' ? queueMint : null };', context);
   return { api: sandbox.api, context, sandbox, events, P, S, W };
 }
 
@@ -188,7 +192,7 @@ test('unlearned replay records refresh, and hot fallback without a usable histor
   h.sandbox.progressOf = async () => ({ progress: null });
   h.P.replay = { data: '0x12345678', value: String(10n ** 16n) }; h.P.ph = [];
   h.P.agents = 175; h.P.burst = 15; // unreadable progress still requires the verified-sender threshold
-  h.sandbox.learnReplay = async () => { h.events.learned++; return { data: '0x12345678', value: String(10n ** 16n), hot: 15, learned: 1, learnedAt: h.sandbox.Date.now() }; };
+  h.sandbox.learnReplay = async () => { h.events.learned++; return { data: '0x12345678', value: String(10n ** 16n), sampleData: '0x12345678', sampleValue: String(10n ** 16n), hot: 15, learned: 1, learnedAt: h.sandbox.Date.now() }; };
   await h.api.paidLoop();
   assert.equal(h.events.learned, 1);
   assert.equal(h.P.done.test, 'minted');
@@ -256,7 +260,7 @@ test('fee-bearing mint does not execute for zero net gains or assets received by
     const result = await h.api.autoMint(target, 'mint-test', h.W, 10n ** 14n);
     assert.equal(executes, 0); assert.match(result, /没有铸|沒有鑄/);
   }
-  const h = harness(); seedHot(h); let executes = 0;
+  const h = harness({ nft: true }); seedHot(h); let executes = 0;
   h.W.baw = async (args) => {
     if (args[1] === 'execute') { executes++; return { j: { success: true, data: { txHash: '0x' + 'ab'.repeat(32) } } }; }
     return { j: { success: true, data: { requestId: 'mock-preview', simulationResult: { balanceChanges: [{ owner: walletAddress, contractAddress: reward, change: '1', tokenType: 'Erc721' }], allowanceChanges: [], authorityChanges: [] } } } };
@@ -297,21 +301,21 @@ test('the common contract preview refuses malformed native changes even with a p
   assert.equal(executes, 0);
 });
 
-function attachMintWallet(h, { executeResult } = {}) {
+function attachMintWallet(h, { executeResult, rewardType = 'Erc20' } = {}) {
   const calls = [];
   h.W.baw = async (args) => {
     calls.push(args);
     if (args[1] === 'execute') return executeResult || { j: { success: true, data: { txHash: '0x' + 'ab'.repeat(32) } } };
     return { j: { success: true, data: { requestId: 'mock-mint-preview', simulationResult: {
-      balanceChanges: [{ owner: walletAddress, contractAddress: reward, change: '1', tokenType: 'Erc721' }],
+      balanceChanges: [{ owner: walletAddress, contractAddress: reward, change: '1', tokenType: rewardType }],
       allowanceChanges: [], authorityChanges: [],
     } } } };
   };
   return calls;
 }
 
-test('fee-bearing free mint requires refund code and full paid budgets before wallet preview', async () => {
-  for (const options of [{ refund: false }, { maxUsd: 0 }, { maxBnbPerDay: 0 }, { spent: 0.05 }, { maxUsd: 0.01 }]) {
+test('fee-bearing mint enforces full paid budgets before wallet preview', async () => {
+  for (const options of [{ maxUsd: 0 }, { maxBnbPerDay: 0 }, { spent: 0.05 }, { maxUsd: 0.01 }]) {
     const h = harness(options), calls = attachMintWallet(h);
     const result = await h.api.autoMint(target, 'mint-test', h.W, 10n ** 14n);
     assert.match(result, /^⏸/);
@@ -369,17 +373,17 @@ test('USDT project risk failures occur before recharge, approval, or any mint pr
 });
 
 test('known low mint progress cannot be bypassed by crowd heat; the installation threshold can proceed', async () => {
-  for (const progress of [0, 0.01, 0.79, 0.849, 0.85]) {
+  for (const progress of [0, 0.01, 0.64, 0.799, 0.8]) {
     const h = harness({ freeProgress: progress }), calls = attachMintWallet(h);
     h.P.agents = 1000;
     const result = await h.api.autoMint(target, 'mint-test', h.W, 10n ** 14n);
-    assert.equal(calls.filter(args => args[1] === 'execute').length, progress >= 0.85 ? 1 : 0);
-    assert.match(result, progress >= 0.85 ? /^🤖/ : /85%/);
+    assert.equal(calls.filter(args => args[1] === 'execute').length, progress >= 0.8 ? 1 : 0);
+    assert.match(result, progress >= 0.8 ? /^🤖/ : /80%/);
   }
 });
 
 test('unreadable progress requires verified transaction senders and no existing pool', async () => {
-  for (const [agents, poolOpen, expected] of [[174, false, false], [175, false, true], [175, true, false]]) {
+  for (const [agents, poolOpen, expected] of [[114, false, false], [115, false, true], [115, true, false]]) {
     const h = harness({ freeProgress: null, poolOpen }), calls = attachMintWallet(h);
     h.P.agents = agents;
     h.sandbox.HOT.set(target, { from: new Set(Array.from({ length: 300 }, (_, i) => 'hot-' + i)) });
@@ -391,7 +395,7 @@ test('unreadable progress requires verified transaction senders and no existing 
 
 test('paidLoop cannot use old 20-wallet rules when progress passes but verified senders do not', async () => {
   const h = harness({ forced: false });
-  h.P.agents = 174; h.P.wallets = 1000;
+  h.P.agents = 114; h.P.wallets = 1000;
   await h.api.paidLoop();
   assert.equal(h.events.previews.length, 0);
   assert.equal(h.events.swaps.length, 0);
@@ -468,7 +472,7 @@ test('concurrent fee mints for one wallet serialize preview and cannot overspend
     previewCount++;
     await waiting;
     return { j: { success: true, data: { requestId: 'mock-preview', simulationResult: {
-      balanceChanges: [{ owner: walletAddress, contractAddress: reward, change: '1', tokenType: 'Erc721' }],
+      balanceChanges: [{ owner: walletAddress, contractAddress: reward, change: '1', tokenType: 'Erc20' }],
       allowanceChanges: [], authorityChanges: [],
     } } } };
   };
@@ -526,7 +530,7 @@ for (const errorName of ['TIMEOUT', 'CANCELLED', 'CLI_PROCESS_ERROR', 'CLI_INVAL
 
   test(`${errorName}: paid native mint keeps its budget and terminal unknown state across loop retries`, async () => {
     const h = harness({ realPreview: true });
-    h.P.replay = { data: '0x12345678', value: String(10n ** 15n), learned: 1, learnedAt: h.sandbox.Date.now() };
+    h.P.replay = { data: '0x12345678', value: String(10n ** 15n), sampleData: '0x12345678', sampleValue: String(10n ** 15n), learned: 1, learnedAt: h.sandbox.Date.now() };
     const calls = attachMintWallet(h, { executeResult: { t: '', j: { success: false, error: { name: errorName, message: 'mock interrupted execution' } } } });
     await h.api.paidLoop();
     assert.equal(h.P.done.test, 'unknown');
@@ -546,7 +550,7 @@ for (const feeFirst of [true, false]) {
       previews++;
       await waiting;
       return { j: { success: true, data: { requestId: 'shared-wallet-preview', simulationResult: {
-        balanceChanges: [{ owner: walletAddress, contractAddress: reward, change: '1', tokenType: 'Erc721' }],
+        balanceChanges: [{ owner: walletAddress, contractAddress: reward, change: '1', tokenType: 'Erc20' }],
         allowanceChanges: [], authorityChanges: [],
       } } } };
     };
@@ -579,4 +583,139 @@ test('USDT recharge TIMEOUT keeps reserved BNB and blocks swap/approval retries 
   assert.equal(calls.filter(args => args[0] === 'contract-call').length, 0);
   assert.equal(h.events.previews.length, 0);
   assert.ok(Math.abs(h.S.paidSpend.test - 0.0104) < 1e-12);
+});
+
+function mockPaidHistory(h, { paid = 3, usdtPaid = 0, duplicateSender = false, broken = '', reverted = false, wrongTarget = false } = {}) {
+  const hashes = Array.from({ length: 5 }, (_, i) => '0x' + (i + 1).toString(16).padStart(64, '0'));
+  const senders = hashes.map((_, i) => '0x' + (i + 100).toString(16).padStart(40, '0'));
+  const baseRpc = h.sandbox.rpc;
+  h.context.rpc = h.sandbox.rpc = async (method, params) => {
+    if (method === 'eth_getLogs') { if (broken === 'logs') throw new Error('mock RPC logs unavailable'); return hashes.map(transactionHash => ({ address: target, transactionHash })); }
+    if (method === 'eth_getTransactionReceipt') {
+      const index = hashes.indexOf(params[0]), from = duplicateSender ? senders[0] : senders[index];
+      if (broken === 'receipt') return null;
+      return { transactionHash: broken === 'hash' ? '0x' + 'ff'.repeat(32) : params[0], status: reverted ? '0x0' : '0x1', logs: index < usdtPaid ? [{ address: USDT, topics: [transferTopic, '0x' + from.slice(2).padStart(64, '0'), '0x' + target.slice(2).padStart(64, '0')], data: '0x' + word(10n ** 18n) }] : [] };
+    }
+    return baseRpc(method, params);
+  };
+  h.context.rpcBatch = async () => broken === 'batch' ? [] : hashes.map((hash, i) => broken === 'transaction' && i === 2 ? undefined : ({ hash, to: wrongTarget ? reward : target, from: duplicateSender ? senders[0] : senders[i], value: i < paid ? '0x1' : '0x0', input: '0x12345678' }));
+}
+
+test('mixed mint phases require successful same-contract paid BNB or USDT evidence from distinct senders', async () => {
+  for (const [options, expected] of [[{ paid: 3 }, true], [{ paid: 0, usdtPaid: 3 }, true], [{ paid: 2 }, false], [{ paid: 0 }, false], [{ duplicateSender: true }, false], [{ reverted: true }, false], [{ wrongTarget: true }, false]]) {
+    const h = harness(); mockPaidHistory(h, options);
+    assert.equal(await h.api.othersPay(target), expected, JSON.stringify(options));
+    assert.equal(h.events.swaps.length, 0); assert.equal(h.events.previews.length, 0);
+  }
+});
+
+test('unreadable mixed-phase transaction or receipt data remains unknown and cannot become a free notification', async () => {
+  for (const broken of ['logs', 'batch', 'transaction', 'receipt', 'hash']) {
+    const h = harness(); mockPaidHistory(h, { broken }); const calls = attachMintWallet(h);
+    assert.equal(await h.api.othersPay(target), null, broken);
+    assert.match(await h.api.autoMint(target, 'mint-test', h.W), /无法核验/);
+    assert.equal(h.events.notifications.length, 0); assert.equal(calls.length, 0); assert.equal(h.S.freeNote?.[target], undefined);
+  }
+});
+
+test('a first-free later-paid project leaves the free notification queue and re-enters checked paid discovery without sending', async () => {
+  const h = harness(); mockPaidHistory(h); const calls = attachMintWallet(h);
+  h.P.replay = { data: '0x12345678', value: '0' }; h.P.done.test = 'free-notify'; h.S.freeNote = { [target]: true };
+  assert.match(await h.api.autoMint(target, 'mint-test', h.W), /转入付费/);
+  assert.equal(h.P.needLearn, 1); assert.equal(h.P.freePhase, true); assert.equal(h.P.replay, undefined); assert.equal(h.P.done.test, undefined);
+  assert.equal(h.S.freeNote[target], undefined); assert.equal(calls.length, 0); assert.equal(h.events.notifications.length, 0);
+});
+
+test('the daily USD cap blocks both native fee and held-USDT mint paths with no transaction submission', async () => {
+  const native = harness({ dayUsd: 0 }), calls = attachMintWallet(native);
+  await assert.rejects(native.api.autoMint(target, 'mint-test', native.W, 10n ** 14n), /USD/);
+  assert.equal(calls.filter(args => args[1] === 'execute').length, 0);
+  const usdt = harness({ dayUsd: 0 });
+  await assert.rejects(usdt.api.executeUsdtMint(usdt.W, { to: target, data: '0x12345678', need: 10n ** 18n }), /USD/);
+  assert.equal(usdt.events.previews.length, 0); assert.equal(usdt.events.swaps.length, 0);
+});
+
+test('paid mint succeeds without a refund selector while quantity and all spend limits stay enforced', async () => {
+  const h = harness({ refund: false }), calls = attachMintWallet(h);
+  assert.match(await h.api.autoMint(target, 'mint-test', h.W, 10n ** 14n), /^🤖/);
+  assert.equal(calls.filter(args => args[1] === 'execute').length, 1);
+  assert.ok(h.events.reservationCalls.every(record => BigInt(record.amountUsdMicros) > 0n));
+});
+
+test('native and held-USDT NFT mints reserve the shared ten-dollar project identity before submitting', async () => {
+  const native = harness({ nft: true }), calls = attachMintWallet(native, { rewardType: 'Erc721' });
+  assert.match(await native.api.autoMint(target, 'mint-test', native.W, 10n ** 14n), /^🤖/);
+  const usdt = harness({ nft: true }); await usdt.api.executeUsdtMint(usdt.W, { to: target, data: '0xa0712d68' + word(1), need: 10n ** 18n });
+  for (const h of [native, usdt]) { assert.equal(h.events.reservationCalls.length, 1); assert.equal(h.events.reservationCalls[0].projectId, target); assert.equal(h.events.reservationCalls[0].projectLimitUsdMicros, '10000000'); assert.ok(BigInt(h.events.reservationCalls[0].amountUsdMicros) > 0n); }
+  assert.equal(calls.filter(args => args[1] === 'execute').length, 1);
+});
+
+test('NFT paid recharge refuses unknown quantity before a swap, approval or preview', async () => {
+  const h = harness({ nft: true, usdtBalance: 0n });
+  await assert.rejects(h.api.executeUsdtMint(h.W, { to: target, data: '0x12345678', need: 10n ** 18n }), /数量未知/);
+  assert.equal(h.events.previews.length, 0); assert.equal(h.events.swaps.length, 0); assert.equal(h.events.reservationCalls?.length || 0, 0);
+});
+
+test('a social project cannot prove Agent ID eligibility just by embedding its registry address in bytecode', async () => {
+  const h = harness(); h.context.fullCode = async () => '0x' + h.sandbox.REGISTRY;
+  assert.equal(await h.api.verifyAgentProject(target), false);
+  assert.equal(h.events.previews.length, 0); assert.equal(h.events.swaps.length, 0);
+});
+
+test('social project admission verifies five successful transaction senders and at least sixty percent Agent ID holders', async () => {
+  for (const [registered, expected] of [[2, false], [3, true], [5, true]]) {
+    const h = harness(); mockPaidHistory(h); let index = 0;
+    h.context.call = async (address, data) => { assert.equal(address, '0x' + h.sandbox.REGISTRY); assert.ok(data.startsWith('0x70a08231')); return '0x' + word(index++ < registered ? 1 : 0); };
+    assert.equal(await h.api.verifyAgentProject(target), expected, String(registered));
+  }
+});
+
+test('social project admission refuses short RPC results, unrelated targets, duplicate senders and missing receipt or registry evidence', async () => {
+  for (const options of [{ broken: 'batch' }, { broken: 'transaction' }, { broken: 'receipt' }, { broken: 'hash' }, { reverted: true }, { wrongTarget: true }, { duplicateSender: true }, { registryUnknown: true }, { wrongTransactionHash: true }]) {
+    const h = harness(); mockPaidHistory(h, options);
+    h.context.call = async () => options.registryUnknown ? null : '0x' + word(1);
+    if (options.wrongTransactionHash) { const base = h.context.rpcBatch; h.context.rpcBatch = async requests => (await base(requests)).map(tx => ({ ...tx, hash: '0x' + 'ff'.repeat(32) })); }
+    assert.equal(await h.api.verifyAgentProject(target), false, JSON.stringify(options));
+    assert.equal(h.events.previews.length, 0); assert.equal(h.events.swaps.length, 0);
+  }
+});
+
+test('an interrupted paid mint persists its free-token cost correction and applies it once after confirmed recovery', async () => {
+  const h = harness({ trackBasis: true }), hash = '0x' + 'ab'.repeat(32);
+  h.S.dyn.push({ sym: 'mock-existing-free', addr: reward, only: walletAddress, cost: 0 });
+  const calls = attachMintWallet(h, { rewardType: 'Erc20', executeResult: { j: { success: false, data: { txHash: hash }, error: { name: 'TIMEOUT', message: 'mock confirmed response interrupted' } } } });
+  assert.match(await h.api.autoMint(target, 'mint-test', h.W, 10n ** 14n), /不明/);
+  const pending = structuredClone(h.S.walletPending.test);
+  assert.equal(pending.mintTracking.version, 1); assert.equal(pending.mintTracking.walletAddress, walletAddress); assert.equal(pending.mintTracking.costUsdMicros, '100000'); assert.deepEqual(Array.from(pending.mintTracking.receivedTokens), [reward]);
+  assert.equal(h.S.dyn[0].cost, 0, 'unconfirmed outcome cannot prematurely record a completed purchase');
+  assert.equal((await h.api.recoverScannerWallet(h.W)).status, 'confirmed');
+  assert.equal(h.S.dyn[0].cost, 0.1); assert.equal(h.S.dyn[0].costUnknown, false); assert.equal(h.S.walletPending.test, undefined);
+  h.S.walletPending.test = pending; await h.api.recoverScannerWallet(h.W);
+  assert.equal(h.S.dyn[0].cost, 0.1, 'recovery after a second restart must not double-count the same tx hash');
+  assert.equal(calls.filter(args => args[1] === 'execute').length, 1);
+});
+
+test('replay price retries reserve the entire increase and never compound above the original twenty-percent ceiling', async () => {
+  const original = 10n ** 15n, attempts = []; let minimum = original * 110n / 100n;
+  const h = harness({ realPreview: true, rpc(method, _events, params) {
+    if (method === 'eth_call' && params?.[0]?.to === target && params[0].value) { const value = BigInt(params[0].value); attempts.push(value); if (value < minimum) throw new Error('mock MAX_COST requires a refreshed price'); return '0x'; }
+  } });
+  h.P.replay = { data: '0x12345678' + word(original), value: original.toString(), sampleData: '0x12345678' + word(original), sampleValue: original.toString(), learned: 1, learnedAt: h.sandbox.Date.now() };
+  const calls = attachMintWallet(h); await h.api.paidLoop();
+  assert.equal(h.P.done.test, 'minted'); assert.equal(calls.filter(args => args[1] === 'execute').length, 1);
+  assert.equal(h.events.reservationCalls.length, 1); assert.ok(BigInt(h.events.reservationCalls[0].amountUsdMicros) >= 1100000n); assert.ok(Math.abs(h.S.paidSpend.test - 0.0011) < 1e-12);
+  minimum = original * 121n / 100n; h.P.done = {}; attempts.length = 0;
+  await h.api.paidLoop();
+  assert.equal(calls.filter(args => args[1] === 'execute').length, 1, 'a later scan cannot compound a previous price increase');
+  assert.ok(attempts.every(value => value <= original * 120n / 100n));
+});
+
+test('a replay price increase cannot escape the saved project spend cap', async () => {
+  const original = 10n ** 15n;
+  const h = harness({ realPreview: true, maxUsd: 1.05, rpc(method, _events, params) {
+    if (method === 'eth_call' && params?.[0]?.to === target && params[0].value) { if (BigInt(params[0].value) < original * 110n / 100n) throw new Error('mock MAX_COST'); return '0x'; }
+  } });
+  h.P.replay = { data: '0x12345678' + word(original), value: original.toString(), sampleData: '0x12345678' + word(original), sampleValue: original.toString(), learned: 1, learnedAt: h.sandbox.Date.now() };
+  const calls = attachMintWallet(h); await h.api.paidLoop();
+  assert.equal(calls.length, 0); assert.equal(h.events.reservationCalls?.length || 0, 0); assert.equal(h.P.done.test, undefined);
 });

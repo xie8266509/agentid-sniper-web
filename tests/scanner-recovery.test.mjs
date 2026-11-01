@@ -24,7 +24,7 @@ function harness({ tx = {}, receipt = {}, order, pending = {} } = {}) {
   const seen = { settled: [], cleared: [], commands: [] };
   const rpc = async method => method === 'eth_chainId' ? '0x38' : method === 'eth_getTransactionByHash' ? transaction : method === 'eth_getTransactionReceipt' ? proof : Promise.reject(new Error('Unexpected RPC'));
   const args = { wallet, pending: intent, root: '/never-used', rpc,
-    budget: { async settle(id, result) { seen.settled.push({ id, spentWei: result.spentWei.toString() }); } },
+    budget: { async settle(id, result) { seen.settled.push({ id, spentWei: result.spentWei.toString(), ...(result.spentUsdMicros === undefined ? {} : { spentUsdMicros: result.spentUsdMicros.toString() }) }); } },
     async clearBlocked(profile, options) { seen.cleared.push({ walletId: profile.id, ...options }); },
     async runWallet(command, options) { seen.commands.push({ command, options }); return { success: true, data: { list: order ? [order] : [] } }; },
   };
@@ -127,4 +127,33 @@ test('permit2 nonzero grants, extra asset/spender pairs and altered revoke targe
     assert.equal((await reconcileScannerPending(h.args)).status, 'review');
     assert.equal(h.seen.cleared.length, 0);
   }
+});
+
+
+test('confirmed and reverted scanner intents settle the exact saved USD reservation with the original transaction evidence', async () => {
+  for (const [status, expected] of [['0x1', '20000000'], ['0x0', '7000000']]) {
+    const h = harness({ receipt: { status }, pending: { reservedAmountUsdMicros: '20000000', settlement: { successSpentWei: '100', failureSpentWei: '25', successSpentUsdMicros: '20000000', failureSpentUsdMicros: '7000000' } } });
+    const result = await reconcileScannerPending(h.args);
+    assert.equal(result.resolved, true);
+    assert.equal(h.seen.settled[0].spentUsdMicros, expected);
+    assert.equal(h.seen.cleared[0].reference, txHash);
+  }
+});
+
+test('incomplete, overspent or malformed USD recovery metadata cannot release an unknown intent', async () => {
+  for (const patch of [
+    { reservedAmountUsdMicros: '20000000' },
+    { settlement: { successSpentWei: '100', failureSpentWei: '0', successSpentUsdMicros: '20000000' } },
+    { reservedAmountUsdMicros: '20000000', settlement: { successSpentWei: '100', failureSpentWei: '0', successSpentUsdMicros: '21000000', failureSpentUsdMicros: '0' } },
+    { reservedAmountUsdMicros: '20000000', settlement: { successSpentWei: '100', failureSpentWei: '0', successSpentUsdMicros: '10000000', failureSpentUsdMicros: '11000000' } },
+    { reservedAmountUsdMicros: '-1', settlement: { successSpentWei: '100', failureSpentWei: '0', successSpentUsdMicros: '0', failureSpentUsdMicros: '0' } },
+  ]) {
+    const h = harness({ pending: patch });
+    const result = await reconcileScannerPending(h.args);
+    assert.equal(result.resolved, false); assert.equal(result.status, 'review');
+    assert.equal(h.seen.settled.length, 0); assert.equal(h.seen.cleared.length, 0);
+  }
+  const unrelated = harness({ tx: { from: target }, pending: { reservedAmountUsdMicros: '20000000', settlement: { successSpentWei: '100', failureSpentWei: '0', successSpentUsdMicros: '20000000', failureSpentUsdMicros: '0' } } });
+  assert.equal((await reconcileScannerPending(unrelated.args)).resolved, false);
+  assert.equal(unrelated.seen.settled.length, 0);
 });

@@ -12,14 +12,15 @@
   },
   "timeZone": "Asia/Shanghai",
   "paid": {
-    "goPct": 0.8,
-    "earlyPct": 0.8,
+    "goPct": 0.6,
+    "earlyPct": 0.6,
     "riseDelta": 0.02,
     "maxUsd": 20,
     "maxBnbPerDay": 0,
     "keepBnb": 0.006,
     "minSold": 30,
-    "maxAgeH": 168
+    "maxAgeH": 168,
+    "dayUsd": 60
   },
   "rules": {
     "strategy": "steps",
@@ -58,5 +59,9 @@
   "watchVault": "",
   "forceMint": [],
   "notifyAll": false,
-  "rpcs": []
+  "rpcs": [],
+  "telegramUser": {
+    "enabled": false,
+    "groupIds": []
+  }
 }

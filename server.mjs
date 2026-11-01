@@ -8,6 +8,7 @@ import { runWallet, getCliInfo } from './lib/wallet-cli.mjs';
 import { ROOT, dashboardStatus, controlService, holdingsData, readLogs, redact } from './lib/control.mjs';
 import { createLocalNftTrading } from './lib/nft-local.mjs';
 import { createLocalUpdater } from './lib/local-updater.mjs';
+import { createTelegramMonitor } from './lib/telegram-monitor.mjs';
 import { readRestartHealth, scannerIsActive, spawnWebRestart } from './lib/update-runtime.mjs';
 import { normalizeWalletConfig, getWalletId, resolveWallet, effectiveWalletConfig, walletCanAutomate } from './lib/wallet-model.mjs';
 import { withWalletExecution, walletExecutionView, markWalletBlocked, clearWalletBlocked } from './lib/wallet-executor.mjs';
@@ -76,6 +77,8 @@ export function createApp(overrides = {}) {
   };
   let localUpdater = overrides.localUpdater;
   const getUpdater = () => localUpdater ||= createLocalUpdater({ root: ROOT, beforeApply: assertUpdateReady });
+  let telegramMonitor;
+  const getTelegramMonitor = () => telegramMonitor ||= createTelegramMonitor({ root: appRoot, readConfig: deps.readConfig });
   let nftTrading = overrides.nftTrading;
   const getNftTrading = () => nftTrading ||= createLocalNftTrading({
     root: appRoot, readConfig: config, runWallet: deps.runWallet,
@@ -468,6 +471,7 @@ export function createApp(overrides = {}) {
             data = patch.archived === true && !wallet.archived ? await executor(wallet, apply, { kind: 'status', allowBlocked: true }) : await apply();
           } finally { busy.delete(wallet.id); }
         } else if (req.method === 'GET' && path === '/api/updates') data = await updateView();
+        else if (req.method === 'GET' && path === '/api/telegram/status') data = getTelegramMonitor().view();
         else if (req.method === 'POST' && path === '/api/updates/check') { await getUpdater().check(); data = await updateView(); }
         else if (req.method === 'POST' && ['/api/updates/apply', '/api/updates/rollback'].includes(path)) {
           data = await admitUpdate(path.endsWith('/apply') ? 'update' : 'rollback', body, res, port);
@@ -648,16 +652,17 @@ export function createApp(overrides = {}) {
       send(error.status || 500, { ok: false, error: { message: error.status ? error.message : '服务处理失败，请检查本地配置或重试', details: error.details || error.errors } });
     }
   });
-  server.on('close', () => { clearInterval(clean); clearInterval(restartPoll); nftTrading?.stop?.(); localUpdater?.stop?.(); for (const job of logins.values()) job.controller?.abort(); });
+  server.on('close', () => { clearInterval(clean); clearInterval(restartPoll); nftTrading?.stop?.(); localUpdater?.stop?.(); void telegramMonitor?.stop?.(); for (const job of logins.values()) job.controller?.abort(); });
   if (overrides.startNftWorker === true) server.once('listening', () => getNftTrading().start());
   if (overrides.startUpdateChecker === true) server.once('listening', () => getUpdater().start());
+  if (overrides.startTelegramMonitor === true) server.once('listening', () => getTelegramMonitor().start());
   return server;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const port = Number(process.env.PORT || 4317);
   if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('PORT 必须介于 1024 与 65535');
-  const server = createApp({ startNftWorker: true, startUpdateChecker: true });
+  const server = createApp({ startNftWorker: true, startUpdateChecker: true, startTelegramMonitor: true });
   server.listen(port, '127.0.0.1', () => console.log(`Agent ID Sniper 控制台：http://127.0.0.1:${port}`));
   server.on('error', (e) => { console.error(e.code === 'EADDRINUSE' ? `端口 ${port} 已占用` : e.message); process.exitCode = 1; });
   for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => server.close(() => process.exit(0)));

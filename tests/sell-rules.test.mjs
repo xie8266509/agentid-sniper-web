@@ -170,10 +170,10 @@ test('refund parsing preserves precision and distinguishes absent or malformed i
 const watch = readFileSync(new URL('../watch.mjs', import.meta.url), 'utf8');
 const executionSource = watch.slice(watch.indexOf('function positionFor('), watch.indexOf('// ---------- 新的 Agent ID'));
 const word = (value) => BigInt(value).toString(16).padStart(64, '0');
-function executionHarness({ decimals = 6, status = 'PENDING', after, submit, refund, receiptOut, missingReceipt = false, storageFail = false, missingDecimals = false, ruleOverrides = {}, cost = 10, value = 30, seed = {} } = {}) {
+function executionHarness({ decimals = 6, status = 'PENDING', after, submit, refund, receiptOut, missingReceipt = false, storageFail = false, missingDecimals = false, ruleOverrides = {}, cost = 10, value = 30, seed = {}, tokenOverrides = {}, bnbPrice = 1000 } = {}) {
   let balance = 100n * 10n ** BigInt(decimals), statusValue = status;
   const seen = { swaps: [], lists: [], saved: [], messages: [], walletLocks: [], blocked: [] };
-  const token = { sym: 'TEST', addr: tokenAddress, cost };
+  const token = { sym: 'TEST', addr: tokenAddress, cost, ...tokenOverrides };
   const S = { tokens: {}, trades: [], dyn: [], costWalletAddress: wallet };
   const W = { id: 'test-wallet', profile: { id: 'test-wallet', address: wallet }, addr: wallet, name: 'test', legacyName: 'test', async baw(args) {
     if (args[1] === 'swap') {
@@ -218,7 +218,7 @@ function executionHarness({ decimals = 6, status = 'PENDING', after, submit, ref
       if (data === '0x0902f1ac') return '0x' + word(1) + word(1);
       throw new Error('Unexpected mocked call ' + data);
     },
-    async bnbUsd() { return 1000; }, async tg(message) { seen.messages.push(message); }, ts: () => 'mock-time',
+    async bnbUsd() { return bnbPrice; }, async tg(message) { seen.messages.push(message); }, ts: () => 'mock-time',
     async rpc(method) {
       assert.equal(method, 'eth_getTransactionReceipt');
       if (missingReceipt) return null;
@@ -233,6 +233,32 @@ function executionHarness({ decimals = 6, status = 'PENDING', after, submit, ref
   S.tokens[positionStateKey(wallet, tokenAddress)] = st;
   return { api: context.api, context, token, W, st, S, seen, balance: () => balance, setBalance(value) { balance = value; }, setStatus(value) { statusValue = value; } };
 }
+
+test('paid positions without a verifiable exchange rate cannot enter free-token automatic drawdown selling', async () => {
+  for (const tokenOverrides of [{ costUnknown: true }, { paidBnbWei: (10n ** 16n).toString() }, { costUnknown: true, paidBnbWei: (10n ** 16n).toString() }]) {
+    const h = executionHarness({ cost: 0, value: 0.4, bnbPrice: 0, tokenOverrides, seed: { freePricePeak: 1, openAt: Date.now() - 600000, drawdownHits: 2 } });
+    await h.api.holdW(h.W, 100, false);
+    assert.equal(h.st.eligibility, 'unknown-cost'); assert.equal(h.st.costUnknown, true); assert.equal(h.seen.swaps.length, 0); assert.equal(h.st.pendingSell, undefined); assert.equal(h.st.done, undefined);
+  }
+});
+
+test('a recovered exchange rate restores paid cost rather than using free-token drop rules', async () => {
+  for (const knownCostUsd of [0, 3]) {
+    const h = executionHarness({ cost: knownCostUsd, value: 0.4, bnbPrice: 1000, tokenOverrides: { costUnknown: true, knownCostUsd, unpricedPaidBnbWei: (10n ** 16n).toString(), paidBnbWei: (10n ** 16n).toString() }, seed: { freePricePeak: 1, openAt: Date.now() - 600000, drawdownHits: 2 } });
+    await h.api.holdW(h.W, 100, false);
+    assert.equal(h.token.cost, knownCostUsd + 10); assert.equal(h.token.costUnknown, false); assert.notEqual(h.st.eligibility, 'unknown-cost'); assert.equal(h.seen.swaps.length, 0);
+  }
+});
+
+test('an unresolved paid mint temporarily blocks a matching free position without permanently changing its free basis', async () => {
+  const h = executionHarness({ cost: 0, value: 0.4, seed: { freePricePeak: 1, openAt: Date.now() - 600000, drawdownHits: 2 } });
+  h.S.walletPending = { [h.W.id]: { mintTracking: { version: 1, walletAddress: wallet, receivedTokens: [tokenAddress], costUsdMicros: '1000000', paidBnbWei: '1000000000000000', paidUsdtWei: '0' } } };
+  await h.api.holdW(h.W, 100, false);
+  assert.equal(h.seen.swaps.length, 0); assert.equal(h.st.eligibility, 'unknown-cost'); assert.equal(h.token.cost, 0); assert.notEqual(h.token.costUnknown, true);
+  delete h.S.walletPending[h.W.id];
+  await h.api.holdW(h.W, 100, false);
+  assert.notEqual(h.st.eligibility, 'unknown-cost'); assert.equal(h.token.cost, 0); assert.notEqual(h.token.costUnknown, true);
+});
 
 test('actual sell persists an intent before swap and never resubmits a pending order', async () => {
   const h = executionHarness();

@@ -55,6 +55,9 @@ globalThis.api = {
     reconcileScannerPending: async () => { throw new Error('Unexpected recovery in monitor fixture'); },
     markWalletBlocked: async () => {}, clearWalletBlocked: async () => {},
     createWalletBudget: () => { throw new Error('Monitor fixture must not create a real execution ledger'); },
+    createMintMedia: () => ({ check: async () => ({ verified: true }) }),
+    createSafeWeb: () => async () => { throw new Error('Unexpected social or metadata web request in scanner fixture'); },
+    processSocialCandidates: async () => [],
     getRuleConfig: input => getRuleConfig(JSON.parse(JSON.stringify(input))),
     // Validation uses host-realm records; clone the VM config without reading any
     // real configuration or changing the validation behavior under test.

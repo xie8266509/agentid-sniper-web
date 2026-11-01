@@ -1,6 +1,6 @@
 {
   "name": "agentid-sniper-web",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -18,7 +18,8 @@
     "monitor:status": "node local-service.mjs status",
     "test": "node --test tests/*.test.mjs",
     "release:prepare": "node scripts/prepare-release.mjs",
-    "release:check": "node scripts/check-release.mjs"
+    "release:check": "node scripts/check-release.mjs",
+    "setup:telegram": "node scripts/setup-telegram.mjs"
   },
   "dependencies": {
     "ethers": "6.17.0"

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { runBoundWalletTransaction } from '../lib/wallet-cli.mjs';
 import { isolatedWatch, target, word } from './watch-scanner-fixture.mjs';
+import { id as signatureHash } from 'ethers';
 
 const addressA = '0x1111111111111111111111111111111111111111';
 const addressB = '0x2222222222222222222222222222222222222222';
@@ -37,9 +38,9 @@ test('a lower-threshold wallet never opens the higher-threshold peer mint gate',
   const wallets = profiles().slice(0, 2).map((profile, index) => ({ ...profile, mode: 'auto', agentId: index ? 'second.ai' : 'first.ai', agentIdVerified: true, paid: { maxBnbPerDay: 0.1, goPct: index ? 0.95 : 0.8 } }));
   const h = isolatedWatch({
     monitorOnly: false, wallets, configOverrides: { forceMint: [] },
-    state: { agentsV: 2, entryPolicy: { goPct: 0.85, minAgents: 175 }, migrated2: 1, refundReset: 1, paid: { [target]: {
-      at: Date.now(), name: 'TEST', done: {}, agents: 175, wallets: 1000,
-      replay: { data: '0x12345678', value: String(10n ** 15n), learned: 1, learnedAt: Date.now() },
+    state: { agentsV: 2, entryPolicy: { version: 3, goPct: 0.65, minAgents: 115 }, migrated2: 1, refundReset: 1, paid: { [target]: {
+      at: Date.now(), name: 'TEST', done: {}, agents: 175, wallets: 1000, old: false,
+      replay: { data: '0x12345678', value: String(10n ** 15n), sampleData: '0x12345678', sampleValue: String(10n ** 15n), learned: 1, learnedAt: Date.now() },
     } } },
     cliFactory(profile) {
       return async args => {
@@ -49,13 +50,14 @@ test('a lower-threshold wallet never opens the higher-threshold peer mint gate',
       };
     },
     rpcResponse({ method, params }) {
-      if (method === 'eth_getCode') return '0x63590e1ae3';
+      if (method === 'eth_getCode') return '0x63590e1ae3' + signatureHash('maxPerWallet()').slice(2, 10);
       if (method === 'eth_getBalance') return '0x' + (10n ** 18n).toString(16);
       if (method === 'eth_getStorageAt') return '0x' + word(0);
       if (method === 'eth_estimateGas') return '0x5208';
       if (method === 'eth_gasPrice') return '0x3b9aca00';
       if (method === 'eth_call') {
         const data = params[0].data;
+        if (data === signatureHash('maxPerWallet()').slice(0, 10)) return '0x' + word(10);
         if (data.startsWith('0xe6a43905')) return '0x' + addressC.slice(2).padStart(64, '0');
         if (data === '0x0902f1ac') return '0x' + word(10n ** 18n) + word(1000n * 10n ** 18n) + word(1);
         if (data === '0x0dfe1681') return '0x' + 'bb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c'.padStart(64, '0');

@@ -180,7 +180,7 @@ async function serviceAction(action) {
   const isAuto = state.config?.monitorOnly === false;
   let confirmAutoTrading = false;
   if (isAuto && action !== 'stop') {
-    confirmAutoTrading = await confirmAction('启动自动交易', '启动后，程序会按当前策略自动铸造、兑换和卖出。请先核对交易预算。', '确认并启动', { checkbox: '我已核对预算，同意按当前配置自动交易', details: [`单项目上限：${usd(state.config.paid?.maxUsd)}`, `每日付费上限：${state.config.paid?.maxBnbPerDay ?? 0} BNB`] });
+    confirmAutoTrading = await confirmAction('启动自动交易', '启动后，程序会按当前策略自动铸造、兑换和卖出。请先核对交易预算。', '确认并启动', { checkbox: '我已核对预算，同意按当前配置自动交易', details: [`单项目上限：${usd(state.config.paid?.maxUsd)}`, `每日上限：${usd(state.config.paid?.dayUsd ?? 60)} / ${state.config.paid?.maxBnbPerDay ?? 0} BNB`] });
     if (!confirmAutoTrading) return;
   }
   await api('/api/service/' + action, { method: 'POST', body: { confirmAutoTrading } });
@@ -243,7 +243,7 @@ function renderWallets() {
   }, 'small'); batchPause.disabled = true;
   const batchTemplate = button('复制策略模板', 'copy', async () => {
     if (!selected.size) return;
-    if (!await confirmAction('复制全局策略模板', '将全局的铸造预算与 ERC20 止盈规则复制到所选钱包。钱包模式和暂停状态保持不变。', '复制到所选钱包', { checkbox: '我已核对所选钱包和模板规则', details: [...[...selected].map(id => `${walletById(id)?.name || id} · ${walletById(id)?.address || '尚未绑定'}`), `模板单项目预算：${usd(state.config.paid?.maxUsd)}`, `模板每日付费上限：${state.config.paid?.maxBnbPerDay ?? 0} BNB`, `卖出策略：${ruleStrategyName(state.config.rules || {})}`, '保存后按各钱包当前运行状态应用。'] })) return;
+    if (!await confirmAction('复制全局策略模板', '将全局的铸造预算与 ERC20 止盈规则复制到所选钱包。钱包模式和暂停状态保持不变。', '复制到所选钱包', { checkbox: '我已核对所选钱包和模板规则', details: [...[...selected].map(id => `${walletById(id)?.name || id} · ${walletById(id)?.address || '尚未绑定'}`), `模板单项目预算：${usd(state.config.paid?.maxUsd)}`, `模板每日上限：${usd(state.config.paid?.dayUsd ?? 60)} / ${state.config.paid?.maxBnbPerDay ?? 0} BNB`, `卖出策略：${ruleStrategyName(state.config.rules || {})}`, '保存后按各钱包当前运行状态应用。'] })) return;
     const outcomes = await Promise.allSettled([...selected].map(id => api(`/api/wallets/${encodeURIComponent(id)}/settings`, { method: 'POST', body: { patch: { paid: { ...state.config.paid }, rules: { ...state.config.rules } }, confirmed: true } })));
     await loadConfig(); const failures = outcomes.filter(x => x.status === 'rejected'); toast(failures.length ? `${outcomes.length - failures.length} 个钱包已更新，${failures.length} 个未成功；请逐一核对。` : '策略已复制，钱包运行模式未改变', failures.length > 0); renderWallets();
   }, 'small'); batchTemplate.disabled = true;
@@ -304,17 +304,17 @@ async function openWalletSettings(id) {
     el('div', { class: 'wallet-mode-summary' }, el('label', { class: 'checkbox-row' }, paused, '暂停此钱包的新自动操作'), el('p', { class: 'help' }, state.config.monitorOnly !== false ? '全局为只读模式。即使选择自动交易，也不会发送自动交易。' : '仅卖出模式不参与铸造或买入；已提交订单会继续核对。')),
     el('fieldset', { class: 'feature-switches' }, el('legend', {}, '允许的自动操作'), features),
     el('div', { class: 'section-heading-inline' }, el('h3', {}, '钱包预算'), button('使用全局模板', 'copy', async () => { closeModal(); await copyTemplateToWallet(id); }, 'small ghost')),
-    el('div', { class: 'form-grid three' }, field('单项目上限', 'wallet-maxUsd', p.maxUsd ?? 20, { type: 'number', min: 0, step: 'any', suffix: 'USD', required: true }), field('每日付费上限', 'wallet-maxBnb', p.maxBnbPerDay ?? 0, { type: 'number', min: 0, step: 'any', suffix: 'BNB', required: true }), field('保留 Gas 余额', 'wallet-keepBnb', p.keepBnb ?? .006, { type: 'number', min: 0, step: 'any', suffix: 'BNB', required: true }), field('最低进场进度', 'wallet-goPct', (p.goPct ?? .8) * 100, { type: 'number', min: 0, max: 100, step: .1, suffix: '%', help: '与安装随机门槛取较高者。', required: true })),
-    el('p', { class: 'help' }, '每日付费上限设为 0 可禁止付费铸造；同时受全局总额度与币安侧额度限制。'), mintEntryNotice(p),
+    el('div', { class: 'form-grid three' }, field('单项目上限', 'wallet-maxUsd', p.maxUsd ?? 20, { type: 'number', min: 0, step: 'any', suffix: 'USD', required: true }), field('每日美元上限', 'wallet-dayUsd', p.dayUsd ?? 60, { type: 'number', min: 0, max: 60, step: .01, suffix: 'USD', required: true }), field('每日 BNB 上限', 'wallet-maxBnb', p.maxBnbPerDay ?? 0, { type: 'number', min: 0, step: 'any', suffix: 'BNB', required: true }), field('保留 Gas 余额', 'wallet-keepBnb', p.keepBnb ?? .006, { type: 'number', min: 0, step: 'any', suffix: 'BNB', required: true }), field('最低进场进度', 'wallet-goPct', (p.goPct ?? .6) * 100, { type: 'number', min: 0, max: 100, step: .1, suffix: '%', help: '与安装随机门槛取较高者。', required: true })),
+    el('p', { class: 'help' }, '美元或 BNB 日预算设为 0 可禁止付费铸造；加价部分一并计入，同时受全部钱包总额度限制。'), mintEntryNotice(p),
     el('details', { class: 'wallet-rule-details' }, el('summary', {}, 'ERC20 卖出与止盈规则'), editor.body),
     el('p', { class: 'page-footnote' }, 'NFT 的价格、数量和成交规则在持仓页按资产单独配置。'));
   const save = button('保存钱包设置', 'save', async () => {
     if (!form.reportValidity()) return;
-    const fd = new FormData(form), patch = { name: String(fd.get('wallet-name')).trim(), mode: mode.value, paused: paused.checked, paid: { ...p, maxUsd: Number(fd.get('wallet-maxUsd')), maxBnbPerDay: Number(fd.get('wallet-maxBnb')), keepBnb: Number(fd.get('wallet-keepBnb')), goPct: Number(fd.get('wallet-goPct')) / 100, earlyPct: Math.min(p.earlyPct ?? .8, Number(fd.get('wallet-goPct')) / 100) }, rules: editor.read(fd) };
+    const fd = new FormData(form), patch = { name: String(fd.get('wallet-name')).trim(), mode: mode.value, paused: paused.checked, paid: { ...p, maxUsd: Number(fd.get('wallet-maxUsd')), dayUsd: Number(fd.get('wallet-dayUsd')), maxBnbPerDay: Number(fd.get('wallet-maxBnb')), keepBnb: Number(fd.get('wallet-keepBnb')), goPct: Number(fd.get('wallet-goPct')) / 100, earlyPct: Math.min(p.earlyPct ?? .6, Number(fd.get('wallet-goPct')) / 100) }, rules: editor.read(fd) };
     for (const key of ['autoMint', 'autoSellTokens', 'autoSellNfts']) patch[key] = fd.get(key) === 'on';
     let confirmed = false;
     if (!patch.paused && patch.mode !== 'monitor') {
-      confirmed = await confirmAction('应用钱包执行规则', '此钱包将按下列范围执行。请核对钱包地址、预算和功能开关。', '确认并应用', { checkbox: '我已核对该钱包的地址、权限及规则', details: [w.name, w.address || '尚未绑定地址', `执行模式：${walletModes[patch.mode]}`, `每日付费上限：${patch.paid.maxBnbPerDay} BNB`, `自动操作：${[['autoMint','铸造'],['autoSellTokens','代币卖出'],['autoSellNfts','NFT 卖出']].filter(([key]) => patch[key]).map(([,label]) => label).join('、') || '全部关闭'}`, `止盈策略：${ruleStrategyName(patch.rules)}`, ...(state.config.monitorOnly !== false ? ['全局只读仍在生效，自动操作暂不执行。'] : [])] });
+      confirmed = await confirmAction('应用钱包执行规则', '此钱包将按下列范围执行。请核对钱包地址、预算和功能开关。', '确认并应用', { checkbox: '我已核对该钱包的地址、权限及规则', details: [w.name, w.address || '尚未绑定地址', `执行模式：${walletModes[patch.mode]}`, `每日上限：${usd(patch.paid.dayUsd)} / ${patch.paid.maxBnbPerDay} BNB`, `自动操作：${[['autoMint','铸造'],['autoSellTokens','代币卖出'],['autoSellNfts','NFT 卖出']].filter(([key]) => patch[key]).map(([,label]) => label).join('、') || '全部关闭'}`, `止盈策略：${ruleStrategyName(patch.rules)}`, ...(state.config.monitorOnly !== false ? ['全局只读仍在生效，自动操作暂不执行。'] : [])] });
       if (!confirmed) { openModal('钱包设置', form, [archive, button('取消', null, async () => closeModal()), save]); modal.classList.add('wallet-settings-dialog'); return; }
     }
     const data = await api(`/api/wallets/${encodeURIComponent(id)}/settings`, { method: 'POST', body: { patch, confirmed } });
@@ -328,7 +328,7 @@ async function openWalletSettings(id) {
 }
 async function copyTemplateToWallet(id) {
   const w = walletById(id); if (!w) return;
-  if (!await confirmAction('复制全局策略模板', '替换此钱包的铸造预算和 ERC20 止盈规则，保留当前模式及暂停状态。', '复制模板', { checkbox: '我已核对此钱包和模板规则', details: [w.name, w.address || '尚未绑定地址', `模板单项目预算：${usd(state.config.paid?.maxUsd)}`, `模板每日付费上限：${state.config.paid?.maxBnbPerDay ?? 0} BNB`, `卖出策略：${ruleStrategyName(state.config.rules || {})}`] })) return;
+  if (!await confirmAction('复制全局策略模板', '替换此钱包的铸造预算和 ERC20 止盈规则，保留当前模式及暂停状态。', '复制模板', { checkbox: '我已核对此钱包和模板规则', details: [w.name, w.address || '尚未绑定地址', `模板单项目预算：${usd(state.config.paid?.maxUsd)}`, `模板每日上限：${usd(state.config.paid?.dayUsd ?? 60)} / ${state.config.paid?.maxBnbPerDay ?? 0} BNB`, `卖出策略：${ruleStrategyName(state.config.rules || {})}`] })) return;
   await api(`/api/wallets/${encodeURIComponent(id)}/settings`, { method: 'POST', body: { patch: { paid: { ...state.config.paid }, rules: { ...state.config.rules } }, confirmed: true } }); await loadConfig(); toast('策略模板已复制'); await openWalletSettings(id);
 }
 async function importWallet(input) {
@@ -427,8 +427,8 @@ function configRulesEditor(rules) {
 function mintEntryNotice(paid = {}) {
   const policy = state.status?.scan?.mintPolicy;
   const progress = policy ? Math.max(policy.goPct, Number(paid.goPct) || 0) : null;
-  const threshold = policy ? `此配置进场条件：进度至少 ${Number((progress * 100).toFixed(1))}%，且至少 ${policy.minAgents} 个 Agent ID 钱包实际发送交易。` : '首次启动监控时生成并保存安装门槛：进度 80–90%、150–200 个实际发送交易的 Agent ID 钱包；配置的更高进度仍有效。';
-  return el('div', { class: 'section-spacer' }, el('p', { class: 'help' }, threshold), el('p', { class: 'help' }, '免费项目达到条件后只通知，不自动铸造。已有持仓的 ERC20 与 NFT 卖出规则独立执行。'));
+  const threshold = policy ? `此配置进场条件：进度至少 ${Number((progress * 100).toFixed(1))}%，且至少 ${policy.minAgents} 个 Agent ID 钱包实际发送交易。` : '首次启动监控时生成并保存安装门槛：进度 60–70%、100–130 个实际发送交易的 Agent ID 钱包；配置的更高进度仍有效。';
+  return el('div', { class: 'section-spacer' }, el('p', { class: 'help' }, threshold), el('p', { class: 'help' }, 'NFT 须进度至少 70%、150 个参与钱包且存在可读取的每钱包限额声明并核对模拟铸造数量；单项目累计不超过 10 USD 与配置预算的较小值。完全免费项目只通知；首份免费、后续付费须核验真实付款并按付费规则检查。已有持仓卖出规则独立执行。'));
 }
 function renderConfig() {
   if (state.walletId) return renderWalletStrategy();
@@ -439,13 +439,22 @@ function renderConfig() {
   const mode = configSection('config-mode', '运行模式', '选择监控方式，保存后需重启监控才能生效。', el('div', { class: 'segmented' }, el('label', { class: 'mode-option' }, monitorRadio, el('strong', {}, '只读监控'), el('span', {}, '发现项目、追踪持仓，不发送交易。')), el('label', { class: 'mode-option' }, autoRadio, el('strong', {}, '自动交易'), el('span', {}, '按策略执行铸造、兑换和卖出。'))));
   const walletSection = configSection('config-wallets', '通知与钱包', '钱包连接和独立策略在钱包页管理。', [el('div', { class: 'section-heading-inline' }, el('span', { class: 'table-muted' }, `${(c.wallets || []).filter(w => !w.archived).length} 个可用钱包`), button('管理钱包', 'wallet', () => go('wallets'), 'small')), el('div', { class: 'form-grid section-spacer' }, field('Telegram Bot Token', 'telegram.botToken', '', { type: 'password', placeholder: c.telegram?.botTokenConfigured ? '已配置 · 留空保留' : '尚未配置', help: '保存在本机，不回显。', full: true }), field('个人 Chat ID', 'telegram.chatId', c.telegram?.chatId), field('群组 Chat ID', 'telegram.groupChatId', c.telegram?.groupChatId)), c.telegram?.botTokenConfigured && el('label', { class: 'checkbox-row section-spacer' }, el('input', { type: 'checkbox', name: 'telegram.clearBotToken' }), '清除已保存的 Bot Token')]);
   const portfolioSection = configSection('config-portfolio', '所有钱包总额度', '单钱包额度与总额度同时约束，提交前预占额度，未知结果保留预占。', field('每日付费总上限', 'portfolioBudget.maxBnbPerDay', c.portfolioBudget?.maxBnbPerDay ?? '', { type: 'number', min: 0, step: 'any', suffix: 'BNB', placeholder: '留空不设置总上限', help: '留空不设总上限；0 禁止所有钱包的付费铸造。各钱包仍受自己的额度及币安侧额度限制。' }));
-  const paidSection = configSection('config-paid', '铸造预算与进场', '付费铸造须同时满足进度、参与钱包数和预算要求，并检查退款函数及可升级代理。检测到退款函数不保证可退款。提前进场、短时增幅、最少已售为旧参数。任一付费预算为 0 时禁止付费铸造。', el('div', { class: 'form-grid three' }, field('单项目预算上限', 'paid.maxUsd', p.maxUsd ?? 20, { type: 'number', min: 0, max: 100000, step: .01, suffix: 'USD', required: true }), field('每日付费上限', 'paid.maxBnbPerDay', p.maxBnbPerDay ?? 0, { type: 'number', min: 0, max: 10000, step: .0001, suffix: 'BNB', required: true }), field('保留 Gas 余额', 'paid.keepBnb', p.keepBnb ?? .006, { type: 'number', min: 0, max: 100, step: .0001, suffix: 'BNB', required: true }), field('最低进场进度', 'paid.goPct', (p.goPct ?? .8) * 100, { type: 'number', min: 0, max: 100, step: .1, suffix: '%', help: '实际门槛取此值与安装时随机门槛中的较大值；保留已有保存值。', required: true }), field('提前进场进度 · 旧参数', 'paid.earlyPct', (p.earlyPct ?? .8) * 100, { type: 'number', min: 0, max: 100, step: .1, suffix: '%', required: true }), field('短时进度增幅 · 旧参数', 'paid.riseDelta', (p.riseDelta ?? .02) * 100, { type: 'number', min: 0, max: 100, step: .1, suffix: '%', required: true }), field('最少已售份数 · 旧参数', 'paid.minSold', p.minSold ?? 30, { type: 'number', min: 0, max: 100000, step: 1, required: true }), field('最长追踪时间', 'paid.maxAgeH', p.maxAgeH ?? 168, { type: 'number', min: 1, max: 8760, step: 1, suffix: '小时', required: true })));
+  const paidSection = configSection('config-paid', '铸造预算与进场', '付费铸造同时核对进度、参与人数、限额声明、模拟数量、资金留存、代理风险和预算。每日最多 60 USD，跟单加价最高 20% 且计入额度；任一预算为 0 时关闭付费铸造。旧参数不再决定入场。', el('div', { class: 'form-grid three' }, field('单项目预算上限', 'paid.maxUsd', p.maxUsd ?? 20, { type: 'number', min: 0, max: 100000, step: .01, suffix: 'USD', required: true }), field('每日美元上限', 'paid.dayUsd', p.dayUsd ?? 60, { type: 'number', min: 0, max: 60, step: .01, suffix: 'USD', help: '每钱包最多 60 USD，已有钱包可设置更低额度。', required: true }), field('每日 BNB 上限', 'paid.maxBnbPerDay', p.maxBnbPerDay ?? 0, { type: 'number', min: 0, max: 10000, step: .0001, suffix: 'BNB', required: true }), field('保留 Gas 余额', 'paid.keepBnb', p.keepBnb ?? .006, { type: 'number', min: 0, max: 100, step: .0001, suffix: 'BNB', required: true }), field('最低进场进度', 'paid.goPct', (p.goPct ?? .6) * 100, { type: 'number', min: 0, max: 100, step: .1, suffix: '%', help: '实际门槛取此值与安装时随机门槛中的较大值；保留已有保存值。', required: true }), field('提前进场进度 · 旧参数', 'paid.earlyPct', (p.earlyPct ?? .6) * 100, { type: 'number', min: 0, max: 100, step: .1, suffix: '%', required: true }), field('短时进度增幅 · 旧参数', 'paid.riseDelta', (p.riseDelta ?? .02) * 100, { type: 'number', min: 0, max: 100, step: .1, suffix: '%', required: true }), field('最少已售份数 · 旧参数', 'paid.minSold', p.minSold ?? 30, { type: 'number', min: 0, max: 100000, step: 1, required: true }), field('最长追踪时间', 'paid.maxAgeH', p.maxAgeH ?? 168, { type: 'number', min: 1, max: 8760, step: 1, suffix: '小时', required: true })));
+  const tgStatus = el('p', { class: 'help', role: 'status' }, '正在读取本机 TG 监控状态…');
+  const tgRefresh = button('刷新状态', 'refresh', async () => {
+    tgRefresh.disabled = true;
+    try { const t = await api('/api/telegram/status'); const labels = { disabled: '未启用', ready: '就绪', listening: '监控中', reloading: '切换选择中', 'setup-required': '需要本机登录或配置', error: '读取失败' }; tgStatus.textContent = `${labels[t.state] || t.state || '待检查'} · 已选 ${t.allowedGroups ?? 0} 个群 · ${t.configured ? '已有本机会话' : '尚无本机会话'}${t.error ? ' · ' + t.error : ''}`; }
+    catch (e) { tgStatus.textContent = e.message; }
+    finally { tgRefresh.disabled = false; }
+  }, 'small');
+  const tgSection = configSection('config-telegram-user', 'TG 群项目线索 · 可选', '使用你在本机明确选定的群发现候选项目；群消息不能直接触发交易。默认关闭。', [el('label', { class: 'checkbox-row' }, el('input', { type: 'checkbox', name: 'telegramUser.enabled', checked: c.telegramUser?.enabled === true }), '启用已选群监控'), field('已选群 ID', 'telegramUser.groupIds', (c.telegramUser?.groupIds || []).join(', '), { placeholder: '逗号分隔，最多 12 个', help: '只填写手动登录时选择的群 ID。会话和凭证不经网页提交。', full: true }), tgStatus, tgRefresh, el('details', { class: 'section-spacer' }, el('summary', {}, '首次设置'), el('p', { class: 'help' }, '在本机项目目录运行 npm run setup:telegram -- --install，再运行 npm run setup:telegram -- --login。终端完成登录并选择已加入的群后，将输出的 ID 填在上方保存。首次仅读最新 1 条定位，不收集历史消息。仅保存规范化候选地址、网址和匿名计数，不保存消息正文或群名。'))]);
+  queueMicrotask(() => { if (tgStatus.isConnected) tgRefresh.click(); });
   const ruleEditor = configRulesEditor(r);
   paidSection.append(mintEntryNotice(p));
   const rulesSection = configSection('config-rules', 'ERC20 卖出与止盈规则', '可选择旧版半仓或新版阶梯策略，保存并重启后生效；只读模式不会卖出。', ruleEditor.body);
   const tokens = field('手动追踪持仓', 'tokens', JSON.stringify(c.tokens || [], null, 2), { full: true }); const tokenInput = el('textarea', { id: 'tokens-json', name: 'tokens-json', rows: 7, 'aria-label': '手动追踪持仓 JSON' }, JSON.stringify(c.tokens || [], null, 2)); $('input', tokens).replaceWith(tokenInput); $('label', tokens).htmlFor = 'tokens-json'; tokens.append(el('p', { class: 'help' }, 'JSON 数组。示例字段：sym、addr、cost；hold: true 只追踪不自动卖出。'));
   const otherSection = configSection('config-other', '高级设置', '手动追踪项目与通知设置。', [el('div', { class: 'form-grid' }, field('时区', 'timeZone', c.timeZone || 'Asia/Shanghai', { required: true }), field('观察金库地址', 'watchVault', c.watchVault || '', { placeholder: '可选 · 0x…' }), tokens), el('label', { class: 'checkbox-row section-spacer' }, el('input', { type: 'checkbox', name: 'notifyAll', checked: c.notifyAll === true }), 'Telegram 接收全部发现通知')]);
-  form.append(mode, portfolioSection, walletSection, paidSection, rulesSection, otherSection);
+  form.append(mode, portfolioSection, walletSection, paidSection, rulesSection, tgSection, otherSection);
   form.addEventListener('input', () => { form.dataset.dirty = 'true'; const n = $('#config-dirty'); if (n) n.textContent = '有未保存的修改'; });
   const save = button('保存配置', 'save', async () => {
     if (!form.reportValidity()) return;
@@ -453,16 +462,17 @@ function renderConfig() {
     const fd = new FormData(form), get = (n) => fd.get(n), num = (n) => Number(get(n));
     let ruleData; try { ruleData = ruleEditor.read(fd); } catch (error) { toast(error.message, true); return; }
     const next = { ...c, monitorOnly: get('monitorOnly') !== 'false', wallets: c.wallets, telegram: { ...c.telegram, botToken: String(get('telegram.botToken') || '').trim(), chatId: String(get('telegram.chatId') || '').trim(), groupChatId: String(get('telegram.groupChatId') || '').trim(), clearBotToken: get('telegram.clearBotToken') === 'on' }, paid: { ...p }, rules: { ...r, ...ruleData }, tokens: tokenData, timeZone: String(get('timeZone')).trim(), watchVault: String(get('watchVault') || '').trim(), notifyAll: get('notifyAll') === 'on' };
+    next.telegramUser = { enabled: get('telegramUser.enabled') === 'on', groupIds: String(get('telegramUser.groupIds') || '').split(/[,，\s]+/).filter(Boolean) };
     next.portfolioBudget = { maxBnbPerDay: String(get('portfolioBudget.maxBnbPerDay') ?? '').trim() === '' ? null : num('portfolioBudget.maxBnbPerDay') };
-    for (const key of ['maxUsd', 'maxBnbPerDay', 'keepBnb', 'minSold', 'maxAgeH']) next.paid[key] = num('paid.' + key);
+    for (const key of ['maxUsd', 'dayUsd', 'maxBnbPerDay', 'keepBnb', 'minSold', 'maxAgeH']) next.paid[key] = num('paid.' + key);
     for (const key of ['goPct', 'earlyPct', 'riseDelta']) next.paid[key] = num('paid.' + key) / 100;
 
     let confirmAutoTrading = false;
-    if (!next.monitorOnly) { confirmAutoTrading = await confirmAction('保存自动交易配置', '重启应用此配置后，监控服务会按策略自动铸造、兑换和卖出。', '确认并保存', { checkbox: '我已核对钱包与预算，同意保存自动交易配置', details: [`钱包数量：${next.wallets.length}`, `单项目预算：${usd(next.paid.maxUsd)}`, `每日付费上限：${next.paid.maxBnbPerDay} BNB`] }); if (!confirmAutoTrading) return; }
+    if (!next.monitorOnly) { confirmAutoTrading = await confirmAction('保存自动交易配置', '重启应用此配置后，监控服务会按策略自动铸造、兑换和卖出。', '确认并保存', { checkbox: '我已核对钱包与预算，同意保存自动交易配置', details: [`钱包数量：${next.wallets.length}`, `单项目预算：${usd(next.paid.maxUsd)}`, `每日上限：${usd(next.paid.dayUsd)} / ${next.paid.maxBnbPerDay} BNB`] }); if (!confirmAutoTrading) return; }
     const result = await api('/api/config', { method: 'POST', body: { config: next, confirmAutoTrading } });
     state.config = result.config || result; toast('配置已保存，重启监控后生效'); updateChrome(); renderConfig(); await refreshStatus();
   }, 'primary wide');
-  const aside = panel('配置导航', null, el('div', { class: 'panel-content' }, el('div', {}, [['config-mode', '运行总闸'], ['config-portfolio', '所有钱包总额度'], ['config-wallets', '钱包与通知'], ['config-paid', '铸造预算与进场'], ['config-rules', 'ERC20 止盈规则'], ['config-other', '高级设置'], ['config-nft-automation', 'NFT 自动卖出']].map(([id, text]) => el('a', { href: '#' + id, onclick: (e) => { e.preventDefault(); $('#' + id)?.scrollIntoView({ behavior: 'smooth', block: 'start' }); } }, text))), save, el('p', { class: 'save-note' }, '上方配置保存后需重启监控。NFT 规则在其独立面板单独保存和启用。'))); aside.classList.add('config-sidebar');
+  const aside = panel('配置导航', null, el('div', { class: 'panel-content' }, el('div', {}, [['config-mode', '运行总闸'], ['config-portfolio', '所有钱包总额度'], ['config-wallets', '钱包与通知'], ['config-paid', '铸造预算与进场'], ['config-rules', 'ERC20 止盈规则'], ['config-telegram-user', 'TG 群线索'], ['config-other', '高级设置'], ['config-nft-automation', 'NFT 自动卖出']].map(([id, text]) => el('a', { href: '#' + id, onclick: (e) => { e.preventDefault(); $('#' + id)?.scrollIntoView({ behavior: 'smooth', block: 'start' }); } }, text))), save, el('p', { class: 'save-note' }, '上方配置保存后需重启监控。NFT 规则在其独立面板单独保存和启用。'))); aside.classList.add('config-sidebar');
   const mobileSave = save.cloneNode(true); mobileSave.style.marginTop = '3px'; mobileSave.classList.add('mobile-save'); mobileSave.addEventListener('click', () => save.click());
   replace(content, title('策略', '全局执行总闸、共享模板与资产规则。切换单个钱包可查看独立策略。'), state.status?.service?.needsRestart && modeBanner(), el('div', { class: 'form-layout' }, el('div', {}, el('p', { class: 'form-dirty', id: 'config-dirty', role: 'status' }, '修改后请保存配置'), form, mobileSave, nftManagerPanel()), aside));
 }
@@ -758,7 +768,7 @@ function tokenHoldingInfo(token) {
   return el('div', { class: 'token-cell' }, el('div', { class: 'token-avatar' }, String(token.sym || token.symbol || '?').slice(0, 1)),
     el('div', { class: 'erc20-token-info' }, el('div', { class: 'token-name' }, token.sym || token.symbol || '未命名代币'), el('div', { class: 'address' }, token.addr || token.address || ''),
       el('div', { class: 'erc20-token-meta' }, el('span', {}, '钱包：' + (token.walletName || token.wallet || (token.both ? '所有钱包' : '默认钱包'))), shortWallet && el('span', { class: 'mono', title: walletAddress }, shortWallet)),
-      el('div', { class: 'erc20-token-meta' }, '成本：' + usd(token.cost))));
+      el('div', { class: 'erc20-token-meta' }, token.costUnknown ? '成本待核验（已有付款）' : '成本：' + usd(token.cost))));
 }
 function renderMarketSync(view, marketSync) {
   if (!view.marketSync) return;
@@ -1127,7 +1137,7 @@ function renderWalletStrategy() {
   const w = walletById(state.walletId); if (!w) return;
   const p = { ...state.config.paid, ...w.paid }, r = { ...state.config.rules, ...w.rules };
   const limits = el('div', { class: 'panel-content' }, el('div', { class: 'detail-grid' }, dataDetail('执行模式', walletModes[walletMode(w)]), dataDetail('当前执行状态', walletRunState(w)), dataDetail('自动铸造', w.autoMint === false ? '已关闭' : '允许'), dataDetail('代币自动卖出', w.autoSellTokens === false ? '已关闭' : '允许'), dataDetail('NFT 自动卖出', w.autoSellNfts === false ? '已关闭' : '允许'), dataDetail('所有钱包每日总上限', state.config.portfolioBudget?.maxBnbPerDay == null ? '未设置' : `${state.config.portfolioBudget.maxBnbPerDay} BNB`)),
-    el('div', { class: 'strategy-budget-grid' }, dataDetail('单项目预算', usd(p.maxUsd)), dataDetail('每日付费上限', `${p.maxBnbPerDay ?? 0} BNB`), dataDetail('保留 Gas 余额', `${p.keepBnb ?? 0} BNB`)), mintEntryNotice(p));
+    el('div', { class: 'strategy-budget-grid' }, dataDetail('单项目预算', usd(p.maxUsd)), dataDetail('每日美元上限', usd(p.dayUsd ?? 60)), dataDetail('每日 BNB 上限', `${p.maxBnbPerDay ?? 0} BNB`), dataDetail('保留 Gas 余额', `${p.keepBnb ?? 0} BNB`)), mintEntryNotice(p));
   const ruleRows = [['策略', ruleStrategyName(r)], ['回本倍数', ruleSummary('backX', r.backX)], ['阶梯止盈', ruleSummary('steps', r.steps)], ['回本前回撤', ruleSummary('crash', r.crash)], ['回本后回撤', ruleSummary('crashAfterBack', r.crashAfterBack)], ['回本后长抱', ruleSummary('moonPct', r.moonPct)], ['免费币回撤', ruleSummary('drop', r.drop)]];
   replace(content, title('钱包策略', `配置「${w.name}」的预算和执行规则。`, [button('复制全局模板', 'copy', () => copyTemplateToWallet(w.id)), button('编辑钱包策略', 'sliders', () => openWalletSettings(w.id), 'primary')]),
     el('div', { class: 'wallet-scope-heading' }, walletLabel(w), badge(walletRunState(w), w.paused ? 'muted' : '')), modeBanner(),

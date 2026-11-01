@@ -9,6 +9,7 @@ import { marketOrderRecord, marketOrderState } from '../lib/sell-rules.mjs';
 import { scannerRuntimeDouble } from './watch-runtime-fixture.mjs';
 import { createMintRisk, effectiveEntryPolicy, entryGate } from '../lib/mint-policy.mjs';
 import { decodeAbiUint } from '../lib/nft-codec.mjs';
+import { id as signatureHash } from 'ethers';
 
 const raw = readFileSync(new URL('../watch.mjs', import.meta.url), 'utf8');
 const extract = (start, end) => { const a = raw.indexOf(start), b = raw.indexOf(end, a); assert.ok(a >= 0 && b > a, `missing scanner markers: ${start}`); return raw.slice(a, b); };
@@ -18,11 +19,12 @@ const target = '0x2222222222222222222222222222222222222222';
 const addr = '0x1111111111111111111111111111111111111111';
 const word = (value) => BigInt(value).toString(16).padStart(64, '0');
 const today = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai' }).format(new Date());
+const limitSelector = signatureHash('maxPerWallet()').slice(0, 10);
 
 function isolatedLoop(kind, { maxUsd = 20, maxBnbPerDay = 0.05, spent = 0, topUpNeverArrives = false } = {}) {
-  const seen = { previews: [], swaps: 0, saves: 0 };
-  const P = { at: Date.now(), name: 'TEST', done: {}, agents: 175 };
-  if (kind === 'replay') P.replay = { value: (10n ** 16n).toString(), data: '0x12345678' };
+  const seen = { previews: [], swaps: 0, saves: 0, logs: [] };
+  const P = { at: Date.now(), name: 'TEST', done: {}, agents: 175, old: false };
+  if (kind === 'replay') P.replay = { value: (10n ** 16n).toString(), data: '0x12345678', sampleValue: (10n ** 16n).toString(), sampleData: '0x12345678' };
   if (kind === 'recv') P.recvValue = (10n ** 16n).toString();
   const codes = { replay: '0x', recv: '0x', gen: '0xa0712d688d859f3e', bnb: '0xe38fd34968bce8cd', usdt: '0x725c405894bf804d' };
   const W = { id: 'test-wallet', name: 'test-wallet', profile: { id: 'test-wallet', address: addr }, addr, async baw(args) {
@@ -34,12 +36,12 @@ function isolatedLoop(kind, { maxUsd = 20, maxBnbPerDay = 0.05, spent = 0, topUp
   const sandbox = {
     DIR: '/isolated', MONITOR_ONLY: false, CONFIG: { timeZone: 'Asia/Shanghai' }, S,
     PAID: getPaidConfig({ paid: { maxUsd, maxBnbPerDay, keepBnb: 0.006 } }),
-    ENTRY_POLICY: { goPct: 0.85, minAgents: 175 }, effectiveEntryPolicy, entryGate, decodeAbiUint,
+    ENTRY_POLICY: { version: 3, goPct: 0.65, minAgents: 115 }, effectiveEntryPolicy, entryGate, decodeAbiUint,
     WALLETS: [W], FORCE: new Set([target]), HOT: new Map(),
     INFRA: new Set(), CLAIM: new Set(), REGISTRY: '60b9262456de011f7d15a54cdd8c48baaa8b022f',
     memoC: new Map(), fpCache: new Map(),
     trackFromSim() {}, noteFree() {},
-    async serialDev() { return ''; }, async fullCode(_c, code) { return code + '63590e1ae3'; }, REFUND_SELS: ['590e1ae3'],
+    async serialDev() { return ''; }, async fullCode(_c, code) { return code + '63590e1ae3' + limitSelector.slice(2); }, REFUND_SELS: ['590e1ae3'],
     scaleV(_d0, _d1, value) { return value; },
     async progressOf() { return { progress: 0.9 }; }, async deployerOf() { return ''; },
     isRepeatDev() { return false; }, isSerial() { return false; }, async freshWallet() { return false; },
@@ -50,7 +52,7 @@ function isolatedLoop(kind, { maxUsd = 20, maxBnbPerDay = 0.05, spent = 0, topUp
     async prepareUsdtReplay() { return null; },
     mintSimulationCheck: () => null, approvalSimulationCheck: () => null,
     async honeypotCheck() { return null; },
-    USDT: '0x55d398326f99059ff775485246999027b3197955', WBNB: 'wrapped', NATIVE_BNB: 'native',
+    USDT: '0x55d398326f99059ff775485246999027b3197955', WBNB: target, NATIVE_BNB: 'native', FACTORY: target,
     getPaidConfig, marketOrderRecord, marketOrderState, withinPaidBudget, w: word, wa: (value) => value.slice(2).padStart(64, '0'),
     badSel: () => false, async learnReplay() { return null; },
     async safeAddrs(W, c, data) { return data; }, async revokeOnFail(W, token, spender, fn) { return fn(); },
@@ -74,17 +76,18 @@ function isolatedLoop(kind, { maxUsd = 20, maxBnbPerDay = 0.05, spent = 0, topUp
       if (method === 'eth_getStorageAt') return '0x' + word(0);
       if (method === 'eth_getCode') return '0x6000';
       if (method === 'eth_call' && params?.[0]?.data?.startsWith('0x70a08231')) return '0x' + word(1000n * 10n ** 18n);
+      if (method === 'eth_call' && params?.[0]?.data === limitSelector) return '0x' + word(10);
       if (method === 'eth_call') return '0x';
       throw new Error('Unexpected isolated RPC ' + method);
     },
     async previewExec(wallet, to, data, value) { seen.previews.push({ to, data, value }); return { tx: 'mock-transaction' }; },
-    async tg() {}, async groupProgress() {}, log() {}, ts: () => 'mock-time', save() { seen.saves++; }, async sleep() {},
+    async tg() {}, async groupProgress() {}, log(text) { seen.logs.push(text); }, ts: () => 'mock-time', save() { seen.saves++; }, async sleep() {},
   };
   sandbox.cc = async (c, data) => sandbox.call(c, data);
   Object.assign(sandbox, scannerRuntimeDouble({ sandbox, wallet: W, state: S, events: seen }));
   sandbox.MINT_RISK = createMintRisk({ state: S, rpc: (...args) => sandbox.rpc(...args), fullCode: (...args) => sandbox.fullCode(...args), save: (...args) => sandbox.save(...args), timeZone: 'Asia/Shanghai' });
   sandbox.mintUint = value => BigInt(value || 0); sandbox.validMintAddress = value => /^0x[0-9a-f]{40}$/i.test(value); sandbox.validMintCalldata = value => /^0x[0-9a-f]+$/i.test(value);
-  vm.runInNewContext(loopSource + usdtSource + '\nglobalThis.run = paidLoop;', sandbox);
+  vm.runInNewContext(extract('function mintTrackingPlan(', 'function positionFor(') + extract('function mintQuantity(', 'async function previewExec(') + loopSource + usdtSource + '\nglobalThis.run = paidLoop;', sandbox);
   return { run: sandbox.run, S, seen, P, W };
 }
 
@@ -101,7 +104,7 @@ for (const kind of ['replay', 'recv', 'gen', 'bnb', 'usdt']) {
   test(`${kind}: allowed acquisition consumes per-wallet daily budget`, async () => {
     const isolated = isolatedLoop(kind);
     await isolated.run();
-    assert.ok(isolated.seen.previews.length > 0);
+    assert.ok(isolated.seen.previews.length > 0, JSON.stringify(isolated.seen.logs));
     assert.equal(isolated.P.done[isolated.W.name], 'minted');
     assert.ok(isolated.S.paidSpend[isolated.W.name] > 0);
     assert.ok(isolated.S.paidSpend[isolated.W.name] <= 0.05);
