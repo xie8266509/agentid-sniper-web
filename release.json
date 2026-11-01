@@ -32,6 +32,7 @@
     "docs/upstream-reviews/v2.7.9-38fb270fea2c.md": "0119b2bb78277405efee5a0df0634edb2c8f814fc4ebcd99876c57db325d1a37",
     "docs/upstream-reviews/v2.8.1-c11d8ef8342f.md": "2e41744c4dbc457faeebada5996b2324df8e23499a4212924ee4e48668f4abaa",
     "docs/upstream-reviews/v2.8.2-ef741211780b.md": "88e63ff1fc0a7c24b39ed30c366a74c8cb87e66007cc918df7deeefe885bb167",
+    "docs/upstream-reviews/v3.0.0-1c21d24b513c.md": "fb2e19a21b5a460d22866af33fa040986ab7f38862312fc8b22bec3b45df770a",
     "lib/agent-maturity.mjs": "0561900da7095e279321e1c15a6d040489e09bbe72d70f7300fc068773613a3f",
     "lib/config.mjs": "863787240b06b20314c50baacf1d90688392e28cbedd90b67aa4a4649fb19c1f",
     "lib/control.mjs": "394cf6bf519346d8f7d5f144e3d4cf252bbb5315f57372362b7829320a011633",
