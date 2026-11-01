@@ -1,0 +1,17 @@
+name: Feature request / 功能建议
+description: Suggest an improvement to the local Web console.
+title: '[Feature] '
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 希望解决的问题
+      description: 请勿填写钱包凭证、API Key 或真实交易配置。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议的行为
+    validations:
+      required: true

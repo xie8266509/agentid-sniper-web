@@ -1,0 +1,50 @@
+name: Review a release candidate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-review-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm test
+      - run: npm run release:prepare -- --check
+      - run: npm run release:check
+      - name: Collect only verified manifest files
+        run: |
+          node --input-type=module <<'JS'
+          import { readFileSync, mkdirSync, copyFileSync } from 'node:fs';
+          import { dirname, join } from 'node:path';
+          import { validateReleaseManifest } from './lib/release-info.mjs';
+          const manifest = validateReleaseManifest(readFileSync('release.json', 'utf8'));
+          for (const file of [...Object.keys(manifest.files), 'release.json']) {
+            const target = join('.release-artifact', file);
+            mkdirSync(dirname(target), { recursive: true });
+            copyFileSync(file, target);
+          }
+          JS
+      - name: Upload a review artifact only
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: agentid-sniper-web-release-review
+          path: .release-artifact/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7

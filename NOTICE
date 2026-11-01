@@ -1,0 +1,23 @@
+Agent ID Sniper Web
+Community Web enhancement maintained by @supra_bnb
+https://x.com/supra_bnb
+
+Based on Agent ID Sniper by Nancy / @nancy_c813
+https://github.com/nancyc0813-maker/agentid-sniper
+https://x.com/nancy_c813
+Upstream baseline: v2.5.8, commit 5bd5049877ef5e846bf114cc9c4e6844cdb02983
+Copyright (c) 2026 nancy_c813
+The original MIT License is retained in LICENSE.
+
+Third-party code:
+lib/vendor/element-v3-abi.mjs contains minimal unmodified ABI entries from
+https://github.com/element-market/element-js-sdk
+Source commit: 538b1bb613b45989a308d0d95cb68804bb2dc47b
+Copyright (c) 2022 element-market
+MIT License: lib/vendor/element-sdk-LICENSE
+
+Binance Agentic Wallet CLI is an external dependency installed from its
+verified official npm package by scripts/setup-wallet.mjs. Its runtime,
+wallet sessions and generated data are not bundled into this repository.
+
+This community project does not represent Binance or Element.

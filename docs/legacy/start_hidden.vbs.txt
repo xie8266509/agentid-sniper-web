@@ -1,0 +1,9 @@
+Historical installer/launcher snapshot — NOT AN EXECUTABLE ENTRY POINT.
+Source: https://github.com/nancyc0813-maker/agentid-sniper
+Upstream baseline: v2.5.8 / 5bd5049877ef5e846bf114cc9c4e6844cdb02983
+Archived for provenance; text line endings are normalized to LF.
+Use the root README for Agent ID Sniper Web installation.
+
+Set sh = CreateObject("WScript.Shell")
+sh.CurrentDirectory = CreateObject("Scripting.FileSystemObject").GetParentFolderName(WScript.ScriptFullName)
+sh.Run "cmd /c start_loop.bat", 0, False

@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "repository": "xie8266509/agentid-sniper-web",
+  "channel": "stable",
+  "upstream": {
+    "repository": "nancyc0813-maker/agentid-sniper",
+    "version": "2.5.8",
+    "commit": "5bd5049877ef5e846bf114cc9c4e6844cdb02983"
+  }
+}

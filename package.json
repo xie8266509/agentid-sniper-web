@@ -1,0 +1,27 @@
+{
+  "name": "agentid-sniper-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.15.0"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "setup": "node scripts/setup-local.mjs",
+    "setup:wallet": "node scripts/setup-wallet.mjs",
+    "web:start": "node local-service.mjs start web",
+    "web:stop": "node local-service.mjs stop web",
+    "web:status": "node local-service.mjs status web",
+    "monitor:start": "node local-service.mjs start",
+    "monitor:stop": "node local-service.mjs stop",
+    "monitor:status": "node local-service.mjs status",
+    "test": "node --test tests/*.test.mjs",
+    "release:prepare": "node scripts/prepare-release.mjs",
+    "release:check": "node scripts/check-release.mjs"
+  },
+  "dependencies": {
+    "ethers": "6.17.0"
+  },
+  "license": "MIT"
+}

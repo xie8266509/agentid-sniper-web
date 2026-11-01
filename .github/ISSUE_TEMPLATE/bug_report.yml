@@ -1,0 +1,48 @@
+name: Bug report / 问题反馈
+description: Report a reproducible problem without sharing wallet credentials.
+title: '[Bug] '
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请勿公开 config.json、data/、钱包会话、配对码、API Key、Telegram Token、私钥或完整交易日志。
+        安全漏洞请先阅读 SECURITY.md，不要在公开 Issue 中粘贴利用细节或敏感数据。
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 信息检查
+      options:
+        - label: 我已移除凭证、钱包会话、个人配置与敏感日志。
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: 增强版版本 / App version
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: 系统和 Node.js 版本
+      placeholder: macOS / Node.js 24.x
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 描述页面、按钮和操作顺序；不需要上传真实钱包或会话数据。
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: 预期结果与实际结果
+    validations:
+      required: true
+  - type: textarea
+    id: redacted_error
+    attributes:
+      label: 脱敏错误摘要（可选）
+      description: 仅粘贴已核对的错误摘要；不要上传完整日志文件。
