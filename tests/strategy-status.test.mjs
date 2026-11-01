@@ -10,6 +10,11 @@ test('canonical position state wins and ambiguous symbols are not mixed', () => 
   assert.equal(positionState(state, token, wallet, 0, [token]).lastBal, '222');
   assert.deepEqual(positionState({ tokens: { SAME: { lastBal: '111' } } }, token, wallet, 0, [token, { ...token, addr: C }]), {});
 });
+test('renamed legacy wallets retain their positions and a new namesake cannot claim them', () => {
+  const state = { tokens: { 'old-name:SAME': { lastBal: '222' } } };
+  assert.equal(positionState(state, token, { ...wallet, name: 'new-name', legacyNames: ['old-name'] }, 1, [token]).lastBal, '222');
+  assert.deepEqual(positionState(state, token, { ...wallet, name: 'old-name', legacyNames: [] }, 1, [token]), {});
+});
 test('unknown effective rules stay unknown and stopped mode never promises execution', () => {
   const result = buildStrategyStatus({}, { rules: { drop: 0.4 }, monitorOnly: false }, [{ token, wallet, st: { last: { v: 2 } } }]);
   assert.equal(result.effectiveRules, null);

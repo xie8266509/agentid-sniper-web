@@ -53,8 +53,9 @@ function harness(options = {}) {
     async verifyFill() { return { confirmed: true, filledQuantity: '1', netWei: wei('1'), currency: 'WBNB' }; },
     async cancelTransaction() { return { to: exchange, data: '0xabcd1234', value: '0' }; },
   };
-  const runWallet = async (args) => {
+  const runWallet = async (args, walletOptions) => {
     seen.wallet.push(args);
+    (seen.walletOptions ||= []).push(walletOptions);
     if (args[0] === 'wallet') {
       if (args[1] === 'status') return { success: true, data: { status: 'CONNECTED' } };
       if (args[1] === 'settings') return { success: true, data: { devMode: { enabled: true, expiresAt: clock + 3600000 } } };
@@ -66,6 +67,9 @@ function harness(options = {}) {
       return { success: true, data: { requestId: 'mock-request', expiresAt: clock + 60000, parsedTx: { test: true }, ...(risks === undefined ? {} : { risks }), simulationResult: simulation(), requireConfirmation: options.requireConfirmation === true } };
     }
     if (args[1] === 'execute') {
+      if (options.beforeWalletSend) await options.beforeWalletSend({ store, seen });
+      try { walletOptions.beforeSend?.(); }
+      catch (error) { return { success: false, error: { name: 'CONFIG_ERROR', message: error.message } }; }
       seen.executes.push(args);
       if (options.executeResult) return options.executeResult(args);
       return { success: true, data: args[0] === 'sign-message' ? options.signaturePending ? { orderId: 'signature-1', status: 'PENDING_CONFIRMATION' } : { signature: signer.signingKey.sign(currentPlan.hash).serialized } : { orderId: 'wallet-order-1', txHash: hash, status: 'SUBMITTED' } };
@@ -82,7 +86,7 @@ function harness(options = {}) {
     if (method === 'eth_getLogs') return [];
     throw new Error('Unexpected mocked RPC ' + method);
   };
-  const config = { monitorOnly: options.monitorOnly === true, wallets: [{ name: 'mock-wallet', address: walletAddress }] };
+  const config = options.config || { monitorOnly: options.monitorOnly === true, wallets: [{ name: 'mock-wallet', address: walletAddress }] };
   const dependencies = {
     store, market, runWallet, rpc, readConfig: () => config, serviceInfo: async () => ({ running: options.running !== false }), stateFile, now: () => clock,
     write(path, value) { seen.writes.push(structuredClone(value)); if (options.failWrite?.(value)) throw new Error('simulated disk failure'); writePrivateJson(path, value); },
@@ -95,6 +99,64 @@ test('disabled, monitor-only or stopped NFT automation never broadcasts', async 
   for (const options of [{ enabled: false }, { monitorOnly: true }, { running: false }]) {
     const h = harness(options); try { await h.engine.tick(); assert.equal(h.seen.executes.length, 0); assert.equal(h.seen.publications.length, 0); } finally { h.cleanup(); }
   }
+});
+
+test('wallet pause and NFT feature switches stop new NFT orders independently of the scanner', async () => {
+  for (const patch of [{ paused: true }, { mode: 'monitor' }, { autoSellNfts: false }]) {
+    const h = harness({ config: { monitorOnly: false, wallets: [{ id: 'a', name: 'mock-wallet', address: walletAddress, mode: 'auto', ...patch }] } });
+    try { await h.engine.tick(); assert.equal(h.seen.executes.length, 0); assert.match(h.state().reason, /此钱包/); } finally { h.cleanup(); }
+  }
+});
+
+test('NFT preview keeps the same wallet identity after profile reordering', async () => {
+  const config = { monitorOnly: false, wallets: [{ id: 'a', name: 'A', address: walletAddress, mode: 'auto' }, { id: 'b', name: 'B', address: '0x' + '5'.repeat(40), mode: 'monitor' }] };
+  const h = harness({ config });
+  try {
+    const p = await h.engine.preview(h.key, 'browser');
+    assert.equal(p.wallet.id, 'a');
+    config.wallets.reverse();
+    await h.engine.confirm(p.actionId, 'browser', true);
+    assert.equal(h.seen.executes.length, 1);
+    const executeIndex = h.seen.wallet.findIndex(args => args[0] === 'contract-call' && args[1] === 'execute');
+    assert.equal(h.seen.walletOptions[executeIndex].walletId, 'a');
+    assert.equal(h.seen.walletOptions[executeIndex].walletIndex, 1);
+  } finally { h.cleanup(); }
+});
+
+test('disabling a rule during the final wallet address check never submits or leaves an unknown intent', async () => {
+  const h = harness({ beforeWalletSend: ({ store }) => { const rule = store.readRules()[0]; store.setEnabled(rule.key, false); } });
+  try {
+    await h.engine.tick();
+    assert.equal(h.seen.executes.length, 0);
+    assert.equal(h.state().effectIntent, undefined);
+    assert.notEqual(h.state().phase, 'review');
+    assert.match(h.state().reason, /未发送/);
+  } finally { h.cleanup(); }
+});
+
+test('a slow NFT wallet does not prevent another wallet from starting its next scheduler check', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'nft-wallet-scheduler-'));
+  let clock = 1800000000000, release, started;
+  const gate = new Promise(resolve => { release = resolve; }), entered = new Promise(resolve => { started = resolve; });
+  const second = '0x' + '6'.repeat(40), counts = new Map();
+  const store = createNftTradingStore({ rulesFile: join(directory, 'rules.json'), settingsFile: join(directory, 'settings.json'), now: () => clock, env: { ELEMENT_API_KEY: 'fake-test-api-key' } });
+  for (const address of [walletAddress, second]) {
+    const rule = store.saveRule({ walletAddress: address, addr, standard: 'ERC721', tokenId: '7', quantity: '1', mode: 'fixed-listing', listingUnitPriceBnb: '1', minNetBnb: '0.5', maxFeesBnb: '0.02', expirySec: 300, cooldownSec: 5 });
+    store.setEnabled(rule.key, true, rule.policyHash);
+  }
+  const worker = createNftAutomation({ store, stateFile: join(directory, 'state.json'), now: () => clock,
+    readConfig: () => ({ monitorOnly: false, wallets: [{ id: 'a', name: 'A', address: walletAddress, mode: 'auto' }, { id: 'b', name: 'B', address: second, mode: 'auto' }] }), serviceInfo: async () => ({ running: true }),
+    market: { async position(rule) { counts.set(rule.walletAddress, (counts.get(rule.walletAddress) || 0) + 1); if (rule.walletAddress === walletAddress) { started(); await gate; } return { approved: false }; } },
+    runWallet: async () => { throw new Error('No signing expected'); }, rpc: async () => { throw new Error('No RPC expected'); },
+  });
+  const first = worker.tick();
+  try {
+    await entered;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(counts.get(second), 1);
+    clock += 16000; await worker.tick();
+    assert.equal(counts.get(second), 2); assert.equal(counts.get(walletAddress), 1);
+  } finally { release(); await first; worker.stop(); rmSync(directory, { recursive: true, force: true }); }
 });
 
 test('a durable intent precedes a mocked offer broadcast and an uncertain result blocks restart retries', async () => {

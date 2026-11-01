@@ -5,10 +5,13 @@ import { test } from 'node:test';
 import vm from 'node:vm';
 import { readFileSync } from 'node:fs';
 import { getPaidConfig, withinPaidBudget } from '../lib/config.mjs';
+import { marketOrderRecord, marketOrderState } from '../lib/sell-rules.mjs';
+import { scannerRuntimeDouble } from './watch-runtime-fixture.mjs';
 
 const raw = readFileSync(new URL('../watch.mjs', import.meta.url), 'utf8');
 const extract = (start, end) => { const a = raw.indexOf(start), b = raw.indexOf(end, a); assert.ok(a >= 0 && b > a, `missing scanner markers: ${start}`); return raw.slice(a, b); };
-const loopSource = extract('const MINT_WALLET_QUEUE =', 'function prepareUsdtReplay(') + extract('const heatTier =', '\nasync function loginCheck()');
+const usdtSource = extract('async function executeUsdtMint(W,', '// 鑄造進度：');
+const loopSource = extract('let SCANNER_BUDGET;', 'function prepareUsdtReplay(') + extract('const heatTier =', '\nasync function loginCheck()');
 const target = '0x2222222222222222222222222222222222222222';
 const addr = '0x1111111111111111111111111111111111111111';
 const word = (value) => BigInt(value).toString(16).padStart(64, '0');
@@ -20,14 +23,14 @@ function isolatedLoop(kind, { maxUsd = 20, maxBnbPerDay = 0.05, spent = 0, topUp
   if (kind === 'replay') P.replay = { value: (10n ** 16n).toString(), data: '0x12345678' };
   if (kind === 'recv') P.recvValue = (10n ** 16n).toString();
   const codes = { replay: '0x', recv: '0x', gen: '0xa0712d688d859f3e', bnb: '0xe38fd34968bce8cd', usdt: '0x725c405894bf804d' };
-  const W = { name: 'test-wallet', addr, async baw(args) {
+  const W = { id: 'test-wallet', name: 'test-wallet', profile: { id: 'test-wallet', address: addr }, addr, async baw(args) {
     assert.equal(args[0], 'market-order'); assert.equal(args[1], 'swap');
     seen.swaps++;
-    return { j: { success: true, data: {} } };
+    return { j: { success: true, data: { txHash: '0x' + 'ab'.repeat(32) } } };
   } };
   const S = { paid: { [target]: P }, dyn: [], migrated2: 1, paidSpend: { day: today(), [W.name]: spent } };
   const sandbox = {
-    MONITOR_ONLY: false, CONFIG: { timeZone: 'Asia/Shanghai' }, S,
+    DIR: '/isolated', MONITOR_ONLY: false, CONFIG: { timeZone: 'Asia/Shanghai' }, S,
     PAID: getPaidConfig({ paid: { maxUsd, maxBnbPerDay, keepBnb: 0.006 } }),
     WALLETS: [W], FORCE: new Set([target]), HOT: new Map(),
     INFRA: new Set(), CLAIM: new Set(), REGISTRY: '60b9262456de011f7d15a54cdd8c48baaa8b022f',
@@ -45,7 +48,7 @@ function isolatedLoop(kind, { maxUsd = 20, maxBnbPerDay = 0.05, spent = 0, topUp
     mintSimulationCheck: () => null, approvalSimulationCheck: () => null,
     async honeypotCheck() { return null; },
     USDT: '0x55d398326f99059ff775485246999027b3197955', WBNB: 'wrapped', NATIVE_BNB: 'native',
-    withinPaidBudget, w: word, wa: (value) => value.slice(2).padStart(64, '0'),
+    getPaidConfig, marketOrderRecord, marketOrderState, withinPaidBudget, w: word, wa: (value) => value.slice(2).padStart(64, '0'),
     badSel: () => false, async learnReplay() { return null; },
     async safeAddrs(W, c, data) { return data; }, async revokeOnFail(W, token, spender, fn) { return fn(); },
     big: (value) => value && value !== '0x' ? BigInt(value) : 0n,
@@ -61,6 +64,7 @@ function isolatedLoop(kind, { maxUsd = 20, maxBnbPerDay = 0.05, spent = 0, topUp
       return '0x';
     },
     async rpc(method) {
+      if (method === 'eth_getTransactionReceipt') return { status: '0x1', blockNumber: '0x10' };
       if (method === 'eth_getBalance') return '0x' + word(10n ** 18n);
       if (method === 'eth_call') return '0x';
       throw new Error('Unexpected isolated RPC ' + method);
@@ -69,7 +73,9 @@ function isolatedLoop(kind, { maxUsd = 20, maxBnbPerDay = 0.05, spent = 0, topUp
     async tg() {}, async groupProgress() {}, log() {}, ts: () => 'mock-time', save() { seen.saves++; }, async sleep() {},
   };
   sandbox.cc = async (c, data) => sandbox.call(c, data);
-  vm.runInNewContext(loopSource + '\nglobalThis.run = paidLoop;', sandbox);
+  Object.assign(sandbox, scannerRuntimeDouble({ sandbox, wallet: W, state: S, events: seen }));
+  sandbox.mintUint = value => BigInt(value || 0); sandbox.validMintAddress = value => /^0x[0-9a-f]{40}$/i.test(value); sandbox.validMintCalldata = value => /^0x[0-9a-f]+$/i.test(value);
+  vm.runInNewContext(loopSource + usdtSource + '\nglobalThis.run = paidLoop;', sandbox);
   return { run: sandbox.run, S, seen, P, W };
 }
 

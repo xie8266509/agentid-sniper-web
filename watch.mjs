@@ -7,6 +7,10 @@ import { fileURLToPath } from 'node:url';
 import { makeWatchBaw } from './lib/wallet-cli.mjs';
 import { getPaidConfig, getRuleConfig, withinPaidBudget } from './lib/config.mjs';
 import { decodeAbiUint } from './lib/nft-codec.mjs';
+import { normalizeWalletConfig, getWalletId, effectiveWalletConfig, walletCanAutomate } from './lib/wallet-model.mjs';
+import { withWalletExecution, markWalletBlocked, clearWalletBlocked } from './lib/wallet-executor.mjs';
+import { createWalletBudget } from './lib/wallet-budget.mjs';
+import { reconcileScannerPending } from './lib/scanner-recovery.mjs';
 import { FREE_PEAK_DELAY_MS, FREE_SELL_MIN_USD, applyConfirmedSell, formatTokenAmount, marketOrderRecord, marketOrderState, normalizedPositionValue, parseTokenAmount, planPositionSell, positionStateKey, receiptTokenOutflow, refundedTokenUnits, samplePositionDrawdown } from './lib/sell-rules.mjs';
 
 const DIR = dirname(fileURLToPath(import.meta.url));
@@ -18,7 +22,7 @@ const ts = () => new Date().toLocaleString('zh-TW', { hour12: false, timeZone: C
 const log = (s) => { try { appendFileSync(LOG, `[${ts()}] ${s}\n`); } catch {} };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const CONFIG = JSON.parse(readFileSync(join(DIR, 'config.json'), 'utf8'));
+const CONFIG = normalizeWalletConfig(JSON.parse(readFileSync(join(DIR, 'config.json'), 'utf8')));
 const MONITOR_ONLY = CONFIG.monitorOnly === true;
 const FILE_COMMANDS_ENABLED = CONFIG.enableFileCommands === true;
 const CONFIG_LOADED_AT = Date.now();
@@ -101,16 +105,39 @@ async function honeypotCheck(W, t, st, bal) { /* 新功能：開池時模擬「�
   try { await rpc('eth_call', [{ from: W.addr, to: t.addr, data: '0xa9059cbb' + wa(st.pair) + w(bal / 100n || 1n) }, 'latest']); }
   catch (e) { await tg(`⚠️ [${W.name}] ${t.sym} 開池了，但模擬賣出失敗，可能是貔貅（只能買不能賣），自動賣出可能會失敗\n${t.addr}`); }
 }
-async function flapApprovalWatch() { if (!FLAP_BAN) return; /* 每 10 分鐘查一次錢包授權：有授權給 Flap 就立刻取消並通知（換幣路由可能自己產生授權） */
-  for (const W of WALLETS) { const r = await W.baw(['approvals', 'list', '--limit', '100']); const L = r.j?.data?.list || [];
-    for (const x of L) { const sp = String(x.spender || '').toLowerCase(); if (!FLAP_BLOCK.has(sp) && !/flap/i.test(String(x.spenderName || ''))) continue;
-      const rv = await W.baw(['approvals', 'revoke', '--binanceChainId', '56', '--tokenContract', x.tokenContract, '--spender', x.spender, '--type', x.type || 'approve']);
-      await tg(`⚠️ [${W.name}] 發現授權給 Flap（${x.tokenSymbol || x.tokenContract}），${rv.j?.success ? '已自動取消' : '自動取消失敗，請手動取消：' + (rv.j?.error?.message || rv.t).slice(0, 80)}`); } }
+async function revokeWalletApproval(W, token, spender, type = 'approve') {
+  const kind = canWallet(W, 'mint') ? 'mint' : 'token-sell';
+  if (!canWallet(W, kind) || !validMintAddress(token) || !validMintAddress(spender) || !['approve', 'permit2'].includes(type)) throw new Error('此钱包或授权撤销参数不可用');
+  return withWalletExecution(W.profile, async () => {
+    const previous = W.operationKind; W.operationKind = kind;
+    try {
+      const result = await W.baw(['approvals', 'detail', '--binanceChainId', '56', '--tokenContract', token, '--spender', spender, '--type', type]);
+      const detail = result.j?.success ? result.j.data?.detail : null;
+      if (!detail || String(detail.binanceChainId) !== '56' || detail.tokenContract?.toLowerCase() !== token.toLowerCase() || detail.spender?.toLowerCase() !== spender.toLowerCase() || detail.type !== type) throw new Error('授权详情与原钱包、资产或对象不一致，未撤销');
+      if (type === 'permit2' && !validMintAddress(detail.permit2ContractAddress)) throw new Error('无法核验 Permit2 撤销合约，未撤销');
+      return await runPaidCommand(W, ['approvals', 'revoke', '--binanceChainId', '56', '--tokenContract', token, '--spender', spender, '--type', type], 0n, { token, spender, type, ...(type === 'permit2' ? { permit2ContractAddress: detail.permit2ContractAddress } : {}) });
+    } finally { W.operationKind = previous; }
+  }, { root: DIR, kind: 'scanner-approval' });
+}
+async function flapApprovalWatch() {
+  if (!FLAP_BAN || MONITOR_ONLY) return;
+  await Promise.allSettled(WALLETS.map(async W => {
+    if (!canWallet(W, 'mint') && !canWallet(W, 'token-sell')) return;
+    const r = await W.baw(['approvals', 'list', '--limit', '100']);
+    for (const approval of r.j?.data?.list || []) {
+      const spender = String(approval.spender || '').toLowerCase();
+      if (!FLAP_BLOCK.has(spender) && !/flap/i.test(String(approval.spenderName || ''))) continue;
+      try {
+        const rv = await revokeWalletApproval(W, approval.tokenContract, approval.spender, approval.type || 'approve');
+        await tg(`⚠️ [${W.name}] Flap 授权${rv.j?.success ? '已核验撤销' : '未完成撤销，请到钱包管理核对'}`);
+      } catch (error) { logWallet(W, '授权撤销待核对 ' + error.message); }
+    }
+  }));
 }
 async function lowBnbWatch() { /* 新功能：BNB 快不夠付 gas 時提醒（每個錢包 6 小時最多一次） */
   S.lowBnbAt = S.lowBnbAt || {};
-  for (const W of WALLETS) { const b = Number(BigInt((await rpc('eth_getBalance', [W.addr, 'latest'])) || '0x0')) / 1e18;
-    if (b < PAID.keepBnb + 0.02 && Date.now() - (S.lowBnbAt[W.name] || 0) > 6 * 3600e3) { S.lowBnbAt[W.name] = Date.now(); await tg(`⚠️ [${W.name}] BNB 快不夠了：剩 ${b.toFixed(4)} BNB，可能付不出 gas，免費項目也會打不了，請補一點 BNB`); } }
+  for (const W of WALLETS) { const PAID = paidFor(W); const b = Number(BigInt((await rpc('eth_getBalance', [W.addr, 'latest'])) || '0x0')) / 1e18;
+    if (b < PAID.keepBnb + 0.02 && Date.now() - (S.lowBnbAt[W.id] || 0) > 6 * 3600e3) { S.lowBnbAt[W.id] = Date.now(); await tg(`⚠️ [${W.name}] BNB 快不夠了：剩 ${b.toFixed(4)} BNB，可能付不出 gas，免費項目也會打不了，請補一點 BNB`); } }
 }
 function pruneState() { /* 審查修正：狀態檔定期瘦身，避免越來越大、越存越慢 */
   const cut = (o, max) => { const k = Object.keys(o || {}); if (k.length > max) for (const x of k.slice(0, k.length - max)) delete o[x]; };
@@ -149,9 +176,87 @@ const big = (h) => (h && h !== '0x' ? BigInt(h.slice(0, 66)) : 0n);
 function makeBaw(wc, index) {
   // 兜底：监控模式下不启动任何钱包 CLI，包括登录和预演。
   if (MONITOR_ONLY) return async () => ({ t: MONITOR_NOTE, j: { success: false, error: { message: MONITOR_NOTE } } });
-  return makeWatchBaw(wc, index);
+  const adapter = makeWatchBaw(wc, index);
+  return async (args, timeout) => {
+    const config = currentRuntimeConfig(), current = (config.wallets || []).find((entry, i) => getWalletId(entry, i) === wc.id);
+    const write = args[0] === 'auth' || args[0] === 'approvals' && args[1] === 'revoke' || ['contract-call', 'sign-message'].includes(args[0]) && args[1] === 'execute' || ['market-order', 'limit-order'].includes(args[0]) && ['swap', 'buy', 'sell', 'cancel'].includes(args[1]);
+    const fromToken = args[args.indexOf('--fromToken') + 1];
+    const kind = walletProfiles.get(wc.id)?.operationKind || (args[0] === 'market-order' && args[1] === 'swap' && String(fromToken).toLowerCase() !== NATIVE_BNB.toLowerCase() ? 'token-sell' : 'mint');
+    if (!current || current.address?.toLowerCase() !== wc.address.toLowerCase() || current.bawDir !== wc.bawDir || current.instanceId !== wc.instanceId) return { t: MONITOR_NOTE, j: { success: false, error: { name: 'CONFIG_ERROR', message: '钱包身份或会话配置已变化，请重启后核对' } } };
+    if (write && (config.monitorOnly || !(walletCanAutomate(config, current, kind) || args[0] === 'auth' && walletCanAutomate(config, current, 'token-sell')))) return { t: MONITOR_NOTE, j: { success: false, error: { name: 'CONFIG_ERROR', message: '此钱包已暂停或未授权此操作' } } };
+    if (!write) return adapter(args, timeout);
+    const scopeOf = (source, profile) => {
+      const effective = effectiveWalletConfig(source, profile);
+      return JSON.stringify([profile.id, profile.address.toLowerCase(), profile.bawDir, profile.instanceId, profile.agentId, profile.agentIdVerified, profile.legacyNames, profile.name, profile.mode, profile.paused, profile.archived, profile.draft, profile.autoMint, profile.autoSellTokens, profile.autoSellNfts, effective.paid, effective.rules, source.portfolioBudget?.maxBnbPerDay ?? null, source.monitorOnly, source.enableFileCommands]);
+    };
+    const scope = scopeOf(config, current);
+    return adapter(args, timeout, { beforeSend: () => {
+      // The CLI address preflight awaits I/O. Re-read policy synchronously after
+      // it, immediately before the write process is spawned.
+      const latest = currentRuntimeConfig(), selected = runtimeWallet(walletProfiles.get(wc.id), latest);
+      if (existsSync(join(DIR, 'WATCH_STOP')) || !selected || latest.monitorOnly || !(walletCanAutomate(latest, selected, kind) || args[0] === 'auth' && walletCanAutomate(latest, selected, 'token-sell')) || scopeOf(latest, selected) !== scope) throw new Error('钱包已暂停、配置已变化或扫描器已停止，未提交交易');
+    } });
+  };
 }
-const WALLETS = (CONFIG.wallets || []).map((wc, index) => ({ name: wc.name, addr: wc.address.toLowerCase(), baw: makeBaw(wc, index) }));
+const walletProfiles = new Map();
+let WALLETS = (CONFIG.wallets || []).filter(wc => /^0x[a-fA-F0-9]{40}$/.test(wc.address || '')).map((wc, index) => createWatchWallet(wc, index));
+function createWatchWallet(wc, index) {
+  const profile = { ...wc }, id = getWalletId(wc, index);
+  const legacyNames = Object.hasOwn(wc, 'legacyNames') ? (Array.isArray(wc.legacyNames) ? [...wc.legacyNames] : []) : [...new Set([wc.agentId, wc.name].filter(name => typeof name === 'string' && name))];
+  const W = { id, name: wc.name, legacyName: wc.agentId || wc.name, legacyNames, addr: wc.address.toLowerCase(), profile, index, baw: makeBaw(profile, index), agentId: wc.agentIdVerified === true && wc.agentId ? keccak256(wc.agentId.toLowerCase().replace(/\.ai$/, '')) : '' };
+  walletProfiles.set(id, W); return W;
+}
+function currentRuntimeConfig() {
+  // A malformed or partially written configuration closes the transaction gate.
+  try { return normalizeWalletConfig(JSON.parse(readFileSync(join(DIR, 'config.json'), 'utf8'))); }
+  catch { return { ...CONFIG, monitorOnly: true }; }
+}
+function runtimeWallet(W, config = currentRuntimeConfig()) {
+  if (!W) return null;
+  const wc = (config.wallets || []).find((entry, index) => getWalletId(entry, index) === W.id);
+  if (!wc || String(wc.address).toLowerCase() !== W.addr || wc.bawDir !== W.profile.bawDir || wc.instanceId !== W.profile.instanceId || wc.agentId !== W.profile.agentId || wc.agentIdVerified !== W.profile.agentIdVerified || JSON.stringify(wc.legacyNames) !== JSON.stringify(W.profile.legacyNames)) return null;
+  return wc;
+}
+function canWallet(W, kind = 'mint') {
+  if (MONITOR_ONLY || !W) return false;
+  const config = currentRuntimeConfig(), wc = runtimeWallet(W, config);
+  return Boolean(wc && walletCanAutomate(config, wc, kind));
+}
+function paidFor(W) {
+  const config = currentRuntimeConfig(), wc = runtimeWallet(W, config);
+  return getPaidConfig(wc ? effectiveWalletConfig(config, wc) : { paid: { maxUsd: 0, maxBnbPerDay: 0 } });
+}
+function rulesFor(W) {
+  const config = currentRuntimeConfig(), wc = runtimeWallet(W, config);
+  return getRuleConfig(wc ? effectiveWalletConfig(config, wc) : CONFIG);
+}
+function syncWalletProfiles() {
+  const config = currentRuntimeConfig(), next = [];
+  for (const [index, wc] of (config.wallets || []).entries()) {
+    if (!/^0x[a-fA-F0-9]{40}$/.test(wc.address || '')) continue;
+    const id = getWalletId(wc, index), old = walletProfiles.get(id);
+    const W = old || createWatchWallet(wc, index);
+    // Existing workers keep their original session binding until the process ends.
+    W.name = wc.name; next.push(W);
+  }
+  WALLETS = next;
+  if (!S.costWalletAddress && next[0]) S.costWalletAddress = next[0].addr;
+  return next;
+}
+function logWallet(W, text) { log(`[${W.id}][${W.name}] ${text}`); }
+function legacyAliases(W) {
+  // An explicit empty list identifies a new wallet, even if its display label
+  // happens to reuse an old wallet's name. Only pre-migration fixtures may lack it.
+  if (Object.hasOwn(W, 'legacyNames')) return Array.isArray(W.legacyNames) ? W.legacyNames : [];
+  return [...new Set([W.legacyName, W.name].filter(name => typeof name === 'string' && name))];
+}
+function tokenCostFor(W, token) {
+  if (token.only) return token.only.toLowerCase() === W.addr ? Number(token.cost) || 0 : 0;
+  if (token.both) return Number(token.cost) || 0;
+  const owner = token.costWalletAddress || S.costWalletAddress;
+  return owner?.toLowerCase() === W.addr ? Number(token.cost) || 0 : 0;
+}
+
 if (!WALLETS.length && !MONITOR_ONLY) { console.error('config.json 裡沒有 wallets'); process.exit(1); }
 const ME = WALLETS[0]?.addr || '';
 function keccak256(str) { /* 小型 keccak256（BigInt 版），算 Agent ID 編號用 */
@@ -174,10 +279,26 @@ function keccak256(str) { /* 小型 keccak256（BigInt 版），算 Agent ID 編
 }
 
 /* 每個錢包自己的 Agent ID 編號 = keccak256(名稱去掉 .ai)；有些項目鑄造時要帶這個編號（像 SYNAPE 的 mint(agentTokenId)）（使用者 10/30 21:44 要補的漏洞） */
-for (const W of WALLETS) W.agentId = keccak256(W.name.toLowerCase().replace(/\.ai$/, ''));
+// Agent ID names are pinned separately from editable display labels.
 
 let S = { tokens: {}, lastBlock: 0, seenMints: {}, lastLoginAlert: 0 };
 try { S = { ...S, ...JSON.parse(readFileSync(STATE, 'utf8')) }; } catch {}
+S.costWalletAddress ||= ME;
+S.walletRuntime ||= {};
+S.walletPending ||= {};
+if (S.walletIdentityVersion !== 2) {
+  const copy = (map, W, suffix = '') => {
+    if (!map || typeof map !== 'object') return;
+    const values = legacyAliases(W).filter(name => Object.hasOwn(map, name + suffix)).map(name => map[name + suffix]).filter(value => value !== undefined);
+    if (map[W.id + suffix] === undefined && values.length) map[W.id + suffix] = values.every(value => typeof value === 'number') ? Math.max(...values) : values[0];
+  };
+  for (const W of WALLETS) {
+    for (const map of [S.paidSpend, S.mintCnt, S.lowBnbAt, S.devAlert, S.lastLoginAlert]) copy(map, W);
+    copy(S.devAlert, W, ':off');
+    for (const project of Object.values(S.paid || {})) for (const map of [project.done, project.qAt, project.failW]) copy(map, W);
+  }
+  S.walletIdentityVersion = 2;
+}
 S.runtimeMode = MONITOR_ONLY ? 'monitor' : 'auto';
 S.configLoadedAt = CONFIG_LOADED_AT;
 S.effectiveRules = structuredClone(RULE);
@@ -251,13 +372,23 @@ function trackFromSim(W, sim, sym, costUsd) {
 function positionFor(W, token) {
   const key = positionStateKey(W.addr, token.addr);
   if (!S.tokens[key]) {
-    const oldKey = W.addr === ME ? token.sym : W.name + ':' + token.sym;
-    const old = S.tokens[oldKey];
+    const aliases = legacyAliases(W);
+    const oldKeys = [...new Set([...(aliases.length && W.addr === S.costWalletAddress ? [token.sym] : []), ...aliases.map(name => name + ':' + token.sym)])];
     const matching = new Set(TOKENS.concat(S.dyn || []).filter((item) => item.sym === token.sym && (!item.only || item.only.toLowerCase() === W.addr)).map((item) => item.addr.toLowerCase()));
-    if (old && matching.size === 1 && (!old.addr || old.addr.toLowerCase() === token.addr.toLowerCase()) && (!old.walletAddress || old.walletAddress.toLowerCase() === W.addr)) { S.tokens[key] = old; delete S.tokens[oldKey]; }
-    else S.tokens[key] = { hist: [], peak: 0, peakAt: 0, sold: 0 };
+    const candidates = matching.size === 1 ? oldKeys.map(oldKey => ({ oldKey, state: Object.hasOwn(S.tokens, oldKey) ? S.tokens[oldKey] : null })).filter(entry => entry.state && typeof entry.state === 'object' && !Array.isArray(entry.state) && (!entry.state.addr || typeof entry.state.addr === 'string' && entry.state.addr.toLowerCase() === token.addr.toLowerCase()) && (!entry.state.walletAddress || typeof entry.state.walletAddress === 'string' && entry.state.walletAddress.toLowerCase() === W.addr)) : [];
+    if (candidates.length && candidates.every(entry => JSON.stringify(entry.state) === JSON.stringify(candidates[0].state))) {
+      S.tokens[key] = candidates[0].state;
+      for (const entry of candidates) delete S.tokens[entry.oldKey];
+    } else {
+      S.tokens[key] = { hist: [], peak: 0, peakAt: 0, sold: 0 };
+      if (candidates.length > 1) {
+        const reason = '旧持仓记录存在多个冲突版本，请人工核对后再恢复自动卖出';
+        Object.assign(S.tokens[key], { sellReviewRequired: true, sellReview: { reason, legacyKeys: candidates.map(entry => entry.oldKey) }, sellStatus: 'manual-review', eligibility: 'blocked', reason });
+      }
+    }
   }
   const state = S.tokens[key];
+  state.walletId = W.id; state.effectiveRules = rulesFor(W);
   state.addr = token.addr.toLowerCase(); state.walletAddress = W.addr; state.sym = token.sym;
   state.hist ||= []; state.done2 ||= []; state.notified ||= [];
   return state;
@@ -272,6 +403,9 @@ function requireSellReview(st, pending, reason, details = {}) {
 }
 const SELL_BUSY = new Set();
 async function reconcileSell(t, st, W) {
+  return withWalletExecution(W.profile, () => reconcileSellInner(t, st, W), { root: DIR, kind: 'reconcile', allowBlocked: true });
+}
+async function reconcileSellInner(t, st, W) {
   const pending = st.pendingSell; if (!pending) return false;
   const response = await W.baw(['market-order', 'list', '--orderId', pending.orderId], 60000);
   // Another concurrent status check may have already resolved this order.
@@ -281,6 +415,7 @@ async function reconcileSell(t, st, W) {
   pending.status = status; pending.checkedAt = Date.now();
   if (status === 'pending') { st.sellStatus = 'pending'; st.eligibility = 'pending'; st.reason = '卖出订单已提交，等待最终成交确认'; st.nextTrigger = { type: 'pending', orderId: pending.orderId, since: pending.submittedAt }; save(); return false; }
   if (status === 'failed') {
+    await clearWalletBlocked(W.profile, { root: DIR, reference: pending.orderId });
     delete st.pendingSell; st.sellStatus = 'failed'; st.sellRetryAfter = Date.now() + 30000;
     if (pending.action.id === 'freeDrop') { st.freeFail = (st.freeFail || 0) + 1; st.freeFailAt = Date.now(); }
     save(); await tg(`⚠️ [${W.name}] ${t.sym} 卖出订单失败，未标记成交\n订单 ${pending.orderId}`); return false;
@@ -298,6 +433,7 @@ async function reconcileSell(t, st, W) {
   if (spent === null) { pending.status = 'finished-awaiting-receipt'; st.sellStatus = pending.status; st.eligibility = 'pending'; st.reason = '订单完成，仍待本笔交易转账凭证核验'; st.nextTrigger = { type: pending.status, orderId: pending.orderId }; save(); return false; }
   if (after === null || after >= before) { pending.status = 'finished-awaiting-balance'; st.sellStatus = pending.status; st.eligibility = 'pending'; st.reason = '本单转账已核验，仍待链上余额减少确认'; st.nextTrigger = { type: pending.status, orderId: pending.orderId }; save(); return false; }
   const action = pending.action;
+  await clearWalletBlocked(W.profile, { root: DIR, reference: pending.orderId });
   delete st.pendingSell; delete st.sellRetry;
   st.lastBal = after.toString(); st.sellStatus = 'finished';
   Object.assign(st, applyConfirmedSell(st, action)); if (action.full) st.closedOrderConfirmed = true;
@@ -306,7 +442,7 @@ async function reconcileSell(t, st, W) {
   const price = got === null ? 0 : await bnbUsd().catch(() => 0);
   const usd = got === null || !(price > 0) ? null : got * price;
   S.trades ||= [];
-  S.trades.push({ sym: t.sym, addr: t.addr, w: W.name, walletAddress: W.addr, orderId: pending.orderId, txHash: order.txHash || null, status: st.sellStatus, quantity: formatTokenAmount(spent, pending.decimals), bnb: got, usd, cost: t.cost || 0, at: ts(), why: pending.why });
+  S.trades.push({ sym: t.sym, addr: t.addr, w: W.name, walletId: W.id, walletAddress: W.addr, orderId: pending.orderId, txHash: order.txHash || null, status: st.sellStatus, quantity: formatTokenAmount(spent, pending.decimals), bnb: got, usd, cost: t.cost || 0, at: ts(), why: pending.why });
   st.nextTrigger = null;
   save();
   await tg(`💰 [${W.name}] 已确认卖出 ${t.sym}（${pending.why}）\n数量 ${formatTokenAmount(spent, pending.decimals)}${got !== null ? '\n实际收到 ' + formatTokenAmount(received, 18) + ' BNB' : '\n实际回款数量尚未提供'}\n订单 ${pending.orderId}${order.txHash ? '\n交易 ' + order.txHash : ''}`);
@@ -314,6 +450,12 @@ async function reconcileSell(t, st, W) {
 }
 async function sell(t, st, amt, why, W = WALLETS[0], action = { id: 'manual', full: false }) {
   if (MONITOR_ONLY) return false;
+  if (st?.pendingSell) return reconcileSell(t, st, W);
+  if (!canWallet(W, 'token-sell')) return false;
+  return withWalletExecution(W.profile, () => sellInner(t, st, amt, why, W, action), { root: DIR, kind: 'scanner-token-sell' });
+}
+async function sellInner(t, st, amt, why, W, action) {
+  if (!canWallet(W, 'token-sell')) return false;
   const key = positionStateKey(W.addr, t.addr);
   if (SELL_BUSY.has(key)) return false;
   SELL_BUSY.add(key);
@@ -340,10 +482,11 @@ async function sell(t, st, amt, why, W = WALLETS[0], action = { id: 'manual', fu
     st.submissionIntent = { schemaVersion: 1, addr: t.addr, walletAddress: W.addr, requestedUnits: amt.toString(), quantity, decimals: st.decimals, createdAt: Date.now(), why, action: { id: action.id, full: action.full === true, ...(typeof action.moonReserveUnits === 'string' ? { moonReserveUnits: action.moonReserveUnits } : {}), ...(action.moonOnlyAfter === true ? { moonOnlyAfter: true } : {}) } };
     st.sellStatus = 'submitting'; st.eligibility = 'pending'; st.reason = '正在提交卖出，等待订单号'; save(true);
     const result = await W.baw(['market-order', 'swap', '--binanceChainId', '56', '--fromTokenQty', quantity, '--fromToken', t.addr, '--toToken', NATIVE_BNB]);
-    log(`提交卖出 ${t.sym} ${quantity}: ${result.t.slice(0, 600)}`);
+    logWallet(W, `提交卖出 ${t.sym} ${quantity}: ${result.t.slice(0, 600)}`);
     const orderId = result.j?.success && result.j.data?.orderId;
     if (!orderId) {
       const rejected = ['INVALID_PARAMS', 'INVALID_AMOUNT', 'INVALID_ADDRESS', 'NOT_LOGGED_IN', 'INSUFFICIENT_BALANCE', 'CONFIG_ERROR', 'CLI_NOT_READY'].includes(result.j?.error?.name);
+      if (!rejected) await markWalletBlocked(W.profile, '代币卖出提交结果不明', { root: DIR });
       if (rejected) { delete st.submissionIntent; st.sellStatus = 'submit-rejected'; st.sellRetryAfter = Date.now() + 30000; }
       else { st.sellStatus = 'submission-unknown'; st.eligibility = 'blocked'; st.reason = '卖出提交结果不明，需人工对账，已阻止自动重发'; st.nextTrigger = { type: 'submission-unknown', since: st.submissionIntent.createdAt }; }
       save(); await tg(`⚠️ [${W.name}] ${t.sym} ${rejected ? '卖出已被明确拒绝' : '卖出提交结果不明，已阻止自动重发，请人工核对'}\n${(result.j?.error?.message || '未返回订单号').slice(0, 160)}`); return false;
@@ -353,25 +496,54 @@ async function sell(t, st, amt, why, W = WALLETS[0], action = { id: 'manual', fu
     st.sellStatus = 'pending'; st.nextTrigger = { type: 'pending', orderId: String(orderId) }; save(true);
     return await reconcileSell(t, st, W);
   } catch (error) {
-    if (st.submissionIntent && !st.pendingSell) { st.sellStatus = 'submission-unknown'; st.eligibility = 'blocked'; st.reason = '提交过程中响应中断，需人工对账，已阻止自动重发'; st.nextTrigger = { type: 'submission-unknown', since: st.submissionIntent.createdAt }; save(); return false; }
+    if (st.submissionIntent && !st.pendingSell) { await markWalletBlocked(W.profile, '代币卖出提交响应中断', { root: DIR }); st.sellStatus = 'submission-unknown'; st.eligibility = 'blocked'; st.reason = '提交过程中响应中断，需人工对账，已阻止自动重发'; st.nextTrigger = { type: 'submission-unknown', since: st.submissionIntent.createdAt }; save(); return false; }
     throw error;
   } finally { SELL_BUSY.delete(key); }
 }
 
+const HOLDINGS_WALLET_JOBS = new Map();
 async function holdings(head, onlyFast = false) {
-  const failed = [];
-  await Promise.all(WALLETS.map((W) => holdW(W, head, onlyFast).catch((e) => { failed.push(W.name); log('holdings ' + W.name + ' ' + e.message); })));
-  if (failed.length) throw new Error('持仓检查失败：' + failed.join('、'));
+  syncWalletProfiles();
+  const jobs = [];
+  S.walletRuntime ||= {};
+  for (const W of WALLETS) {
+    let job = HOLDINGS_WALLET_JOBS.get(W.id);
+    if (!job) {
+      const status = S.walletRuntime[W.id] ||= {};
+      Object.assign(status, { walletAddress: W.addr, name: W.name, checking: true, startedAt: Date.now() });
+      job = holdW(W, head, onlyFast).then(() => {
+        status.updatedAt = Date.now(); delete status.error; S.holdingsUpdatedAt = status.updatedAt;
+      }).catch(error => {
+        status.error = error.message; status.errorAt = Date.now(); logWallet(W, '持仓检查失败 ' + error.message); throw error;
+      }).finally(() => {
+        status.checking = false; HOLDINGS_WALLET_JOBS.delete(W.id);
+        S.holdingsInFlight = HOLDINGS_WALLET_JOBS.size > 0; save();
+      });
+      HOLDINGS_WALLET_JOBS.set(W.id, job);
+    }
+    jobs.push(job);
+  }
+  const completed = Promise.allSettled(jobs).then(results => {
+    const errors = results.filter(result => result.status === 'rejected');
+    if (errors.length) throw new Error('部分钱包持仓检查失败，请查看各钱包状态');
+    return { pending: false };
+  });
+  // A slow wallet keeps its own job while faster peers may enter the next round.
+  // Every promise is observed even after the bounded scheduler wait has elapsed.
+  return Promise.race([completed, sleep(1000).then(() => ({ pending: true }))]);
 }
 async function holdW(W, head, onlyFast) {
+  await recoverScannerWallet(W);
+  const RULE = rulesFor(W), sellingEnabled = canWallet(W, 'token-sell');
+  S.effectiveWalletRules ||= {}; S.effectiveWalletRules[W.id] = structuredClone(RULE);
   const seen = new Set();
   for (const t0 of TOKENS.concat(S.dyn || [])) {
     if (t0.only && t0.only.toLowerCase() !== W.addr) continue;
     if (seen.has(t0.addr.toLowerCase())) continue; seen.add(t0.addr.toLowerCase());
-    const t = { ...t0, addr: t0.addr.toLowerCase(), cost: (t0.only || t0.both || W.addr === ME) ? t0.cost : 0, ...(MONITOR_ONLY ? { hold: true, sellNow: false } : {}) };
+    const t = { ...t0, addr: t0.addr.toLowerCase(), cost: tokenCostFor(W, t0), ...(!sellingEnabled ? { hold: true, sellNow: false } : {}) };
     const st = positionFor(W, t); st.cost = Number(t.cost) || 0;
-    st.eligibility = MONITOR_ONLY ? 'monitor-only' : t.hold ? 'hold' : 'waiting-price';
-    st.reason = MONITOR_ONLY ? '只读监控，不执行卖出' : t.hold ? '配置为持有，仅通知' : '等待可用价格';
+    st.eligibility = !sellingEnabled ? 'monitor-only' : t.hold ? 'hold' : 'waiting-price';
+    st.reason = !sellingEnabled ? '此钱包只监控或已暂停，不执行新卖出' : t.hold ? '配置为持有，仅通知' : '等待可用价格';
     if ((st.pendingSell || st.submissionIntent || st.sellReviewRequired) && !MONITOR_ONLY) { await sell(t, st, 0n, '', W); if (st.pendingSell || st.submissionIntent || st.sellReviewRequired) continue; }
     if (onlyFast && !(st.openAt && Date.now() - st.openAt < RULE.fastMin * 60000 && st.stage !== 9 && !st.done)) continue;
     const bal = decodeAbiUint(await call(t.addr, '0x70a08231' + wa(W.addr)));
@@ -418,11 +590,11 @@ async function holdW(W, head, onlyFast) {
     if (t.hold && st.pricePeak > 0 && normalized < st.pricePeak * (1 - RULE.drop) && st.dropWarnedPeak !== st.pricePeak) { st.dropWarnedPeak = st.pricePeak; await tg(`⚠️ [${W.name}] ${t.sym} 从最高点回撤 ${Math.round(RULE.drop * 100)}%，当前仓位约 ${value.toFixed(2)}U\n仅通知，不自动卖出`); }
     if (st.stage == null) st.stage = st.sold >= 2 ? 9 : st.sold === 1 ? 1 : 0;
     if (st.moonOnly && !t.sellNow) { st.eligibility = 'moon'; st.reason = '长抱仓位仅通知，不自动卖出'; }
-    if (!MONITOR_ONLY && !t.hold && !st.moonOnly) {
+    if (sellingEnabled && !t.hold && !st.moonOnly) {
       st.eligibility = !Number.isInteger(st.decimals) ? 'unknown-decimals' : !(t.cost > 0) && value < FREE_SELL_MIN_USD ? 'below-free-minimum' : 'ready';
       st.reason = st.eligibility === 'unknown-decimals' ? '无法确认代币精度，未执行卖出' : st.eligibility === 'below-free-minimum' ? `免费币仓位低于 ${FREE_SELL_MIN_USD}U 最低自动卖出金额` : '按生效规则等待触发';
     }
-    const action = Number.isInteger(st.decimals) ? planPositionSell({ token: t, state: st, balance: bal, value, referenceValue: normalized, now, rules: RULE, monitorOnly: MONITOR_ONLY }) : null;
+    const action = Number.isInteger(st.decimals) ? planPositionSell({ token: t, state: st, balance: bal, value, referenceValue: normalized, now, rules: RULE, monitorOnly: !sellingEnabled }) : null;
     st.nextTrigger = action ? { type: 'sell', actionId: action.id, reason: action.reason, requestedUnits: action.amount.toString() } : { type: t.hold ? 'hold' : t.cost > 0 ? 'paid-rules' : value < FREE_SELL_MIN_USD ? 'below-free-minimum' : 'free-drop', nextBackX: RULE.backX, halfX: [...(RULE.halfX || [])], steps: RULE.steps, moonPct: RULE.moonPct, drop: t.cost > 0 ? RULE.crash : RULE.drop };
     st.last = { v: value, priceValue: normalized, at: ts() };
     if (action) { if (action.id === 'crash' && !st.done2.includes('back') && t0.deployer) blacklist(t0.deployer, `${t.sym} 还没回本就崩`); await sell(t, st, action.amount, action.reason, W, action); }
@@ -716,9 +888,11 @@ async function proxyScan(from, to) {
 const NEAR_FREE = [0n, 10n ** 14n, 22n * 10n ** 13n, 3n * 10n ** 14n, 5n * 10n ** 14n, 10n ** 15n];
 async function findFree(from, c, code) {
   if (!from) return null;
-  for (const [n, d] of CANDS) { if (n.includes('@') && !n.endsWith('@' + c.slice(2, 10))) continue; if (n.includes('#') && !n.includes('#' + (WALLETS.find((x) => x.addr === from)?.name || '?') + '@')) continue; if (d.length < 10 || badSel(d) || !code.includes(d.slice(2, 10))) continue; /* 空呼叫（直接轉 0 BNB）不算鑄造 */ const dd = /重播|熱門函式/.test(n) ? freshDeadline(d) : d; for (const v of NEAR_FREE) { try { await rpc('eth_call', [{ from, to: c, data: dd, value: '0x' + v.toString(16) }, 'latest']); return { n, v }; } catch {} } }
-  const W0 = WALLETS.find((x) => x.addr === from); /* 要帶自己 Agent ID 編號的鑄造：mint(編號)、claim(編號) */
-  if (W0?.agentId) for (const sel of ['a0712d68', '379607f5', '6a627842']) { if (!code.includes(sel)) continue; const d = '0x' + sel + W0.agentId, n = `帶Agent編號${sel}#${W0.name}@${c.slice(2, 10)}`; for (const v of NEAR_FREE) { try { await rpc('eth_call', [{ from, to: c, data: d, value: '0x' + v.toString(16) }, 'latest']); if (!CANDS.some((x) => x[0] === n)) CANDS.push([n, d]); return { n, v }; } catch {} } }
+  const W0 = WALLETS.find(x => x.addr === from);
+  if (!canWallet(W0, 'mint')) return null;
+  for (const [n, d] of CANDS) { if (n.includes('@') && !n.endsWith('@' + c.slice(2, 10))) continue; if (n.includes('#') && !n.includes('#' + (WALLETS.find((x) => x.addr === from)?.id || '?') + '@')) continue; if (d.length < 10 || badSel(d) || !code.includes(d.slice(2, 10))) continue; /* 空呼叫（直接轉 0 BNB）不算鑄造 */ const dd = /重播|熱門函式/.test(n) ? freshDeadline(d) : d; for (const v of NEAR_FREE) { try { await rpc('eth_call', [{ from, to: c, data: dd, value: '0x' + v.toString(16) }, 'latest']); return { n, v }; } catch {} } }
+  // Agent ID arguments are used only after the actual identity has been bound.
+  if (W0?.agentId) for (const sel of ['a0712d68', '379607f5', '6a627842']) { if (!code.includes(sel)) continue; const d = '0x' + sel + W0.agentId, n = `帶Agent編號${sel}#${W0.id}@${c.slice(2, 10)}`; for (const v of NEAR_FREE) { try { await rpc('eth_call', [{ from, to: c, data: d, value: '0x' + v.toString(16) }, 'latest']); if (!CANDS.some((x) => x[0] === n)) CANDS.push([n, d]); return { n, v }; } catch {} } }
   return null;
 }
 // 鑄造排隊：每個錢包一條隊伍在背景跑（交易要一筆一筆送），不卡住掃描
@@ -727,22 +901,22 @@ const MQ = new Map();
 const BAD_SEL = new Set(['0xa9059cbb', '0x095ea7b3', '0x23b872dd', '0x42842e0e', '0xb88d4fde', '0xa22cb465', '0x39509351', '0xd505accf', '0xf242432a', '0x2eb2c2d6']);
 const badSel = (d) => BAD_SEL.has(String(d || '').slice(0, 10).toLowerCase());
 const freeNoted = new Map(); // 免費 mint 通知：同一個項目等兩個錢包都打完，合成一則
-function noteFree(c, W, name = '') { const first = !freeNoted.has(c); if (first) freeNoted.set(c, new Set()); freeNoted.get(c).add(W.name); if (first) setTimeout(async () => { const ok = freeNoted.get(c) || new Set(); freeNoted.delete(c); const nm = name || tokStr(await call(c, '0x06fdde03')) || c.slice(0, 10); await tg(`🆓 打了免費項目：${nm}（${WALLETS.map((x) => x.name + (ok.has(x.name) ? ' ✅' : ' ❌')).join('、')}）\n${c}`).catch(() => {}); }, 150e3); }
+function noteFree(c, W, name = '') { const first = !freeNoted.has(c); if (first) freeNoted.set(c, new Set()); freeNoted.get(c).add(W.id); if (first) setTimeout(async () => { const ok = freeNoted.get(c) || new Set(); freeNoted.delete(c); const nm = name || tokStr(await call(c, '0x06fdde03')) || c.slice(0, 10); await tg(`🆓 打了免費項目：${nm}（${WALLETS.map((x) => x.name + (ok.has(x.id) ? ' ✅' : ' ❌')).join('、')}）\n${c}`).catch(() => {}); }, 150e3); }
 const MQK = new Set(); /* 審查修正：同一個合約＋錢包同時只排一個鑄造工作，避免重複打 */
 function queueMint(c, fname, W, v) {
-  if (MONITOR_ONLY) return MONITOR_NOTE;
-  const qk = c + '|' + W.name; if (MQK.has(qk)) return '⏳ 已在排隊中'; if (S.paid?.[c]?.done?.[W.name] && S.paid[c].done[W.name] !== 'pool-open') return '✅ 這個錢包已經打過';
+  if (MONITOR_ONLY || !canWallet(W, 'mint')) return MONITOR_NOTE;
+  const qk = c + '|' + W.id; if (MQK.has(qk)) return '⏳ 已在排隊中'; if (S.paid?.[c]?.done?.[W.id] && S.paid[c].done[W.id] !== 'pool-open') return '✅ 這個錢包已經打過';
   MQK.add(qk);
-  const prev = MQ.get(W.name) || Promise.resolve();
-  const job = prev.then(() => autoMintMax(c, fname, W, v)).finally(() => MQK.delete(qk)).then(async (m) => { if (m.startsWith('🤖') || m.includes('結果不明')) { S.paid = S.paid || {}; if (!S.paid[c]) S.paid[c] = { at: Date.now(), name: '', done: {} }; S.paid[c].done[W.name] = m.startsWith('🤖') ? 'free' : 'unknown'; save(true); } else if (!m.startsWith('⏸') && !m.startsWith('✅')) { S.paid = S.paid || {}; if (!S.paid[c]) S.paid[c] = { at: Date.now(), name: '', done: {}, waitHot: 1 }; } /* 審查 11/1：第一次就失敗（預演失敗、BNB 不夠…）的以前不會再追蹤 */ log(`[${W.name}] ${c} ${m.replace(/\n/g, ' | ')}`); if (m.startsWith('🤖')) { S.freeTrack = S.freeTrack || {}; S.freeTrack[c] = S.freeTrack[c] || { at: Date.now() }; } if (m.startsWith('🤖')) noteFree(c, W); }).catch((e) => log(`[${W.name}] 鑄造失敗 ${c} ${e.message}`));
-  MQ.set(W.name, job);
+  const prev = MQ.get(W.id) || Promise.resolve();
+  const job = prev.then(() => autoMintMax(c, fname, W, v)).finally(() => MQK.delete(qk)).then(async (m) => { if (m.startsWith('🤖') || m.includes('結果不明')) { S.paid = S.paid || {}; if (!S.paid[c]) S.paid[c] = { at: Date.now(), name: '', done: {} }; S.paid[c].done[W.id] = m.startsWith('🤖') ? 'free' : 'unknown'; save(true); } else if (!m.startsWith('⏸') && !m.startsWith('✅')) { S.paid = S.paid || {}; if (!S.paid[c]) S.paid[c] = { at: Date.now(), name: '', done: {}, waitHot: 1 }; } /* 審查 11/1：第一次就失敗（預演失敗、BNB 不夠…）的以前不會再追蹤 */ logWallet(W, `${c} ${m.replace(/\n/g, ' | ')}`); if (m.startsWith('🤖')) { S.freeTrack = S.freeTrack || {}; S.freeTrack[c] = S.freeTrack[c] || { at: Date.now() }; } if (m.startsWith('🤖')) noteFree(c, W); }).catch((e) => logWallet(W, `鑄造失敗 ${c} ${e.message}`));
+  MQ.set(W.id, job);
   return '⏳ 已排入自動鑄造（背景進行）';
 }
 
 // 每個錢包可以打多份的（每錢包上限 >1），模擬還能過就繼續打，最多 MAX_REPEAT 次
 const MAX_REPEAT = 10;
 async function autoMintMax(c, fname, W, val = 0n) {
-  if (MONITOR_ONLY) return MONITOR_NOTE;
+  if (MONITOR_ONLY || !canWallet(W, 'mint')) return MONITOR_NOTE;
   const d = Object.fromEntries(CANDS)[fname]; let first = await autoMint(c, fname, W, val), n = first.startsWith('🤖') ? 1 : 0;
   while (n > 0 && n < MAX_REPEAT) {
     await sleep(6000);
@@ -764,16 +938,18 @@ async function freeProgress(c) { /* 免費項目的進度：已鑄造／總量�
   fpCache.set(c, { t: Date.now(), p }); return p;
 }
 async function progressSweep() { /* 使用者 10/31 23:21 查 Pulsepanther 沒打到：追蹤名單 500 多個，一般檢查每輪只看 16 個、一個要 10~30 秒，低進度的項目要 2~3 小時才回頭看一次，10% 直接漲到 100% 都沒發現。改成每分鐘用輕量方式只讀進度（最多 80 個、6 個同時），進度過 45% 就會進快速名單，每 15 秒檢查 */
-  const now = Date.now(); const list = Object.entries(S.paid || {}).filter(([c, P]) => !P.unmintable && (P.progress || 0) < 0.999 && now - (P.at || 0) < 3 * 86400e3 && !WALLETS.every((W) => P.done?.[W.name])).sort((x, y) => (x[1].sweepAt || 0) - (y[1].sweepAt || 0)).slice(0, 80);
+  const now = Date.now(); const list = Object.entries(S.paid || {}).filter(([c, P]) => !P.unmintable && (P.progress || 0) < 0.999 && now - (P.at || 0) < 3 * 86400e3 && !WALLETS.every((W) => P.done?.[W.id])).sort((x, y) => (x[1].sweepAt || 0) - (y[1].sweepAt || 0)).slice(0, 80);
   let i = 0; await Promise.all(Array.from({ length: 6 }, async () => { while (i < list.length) { const [c, P] = list[i++]; try { if (P.progAt && Date.now() - P.progAt < 180e3) { P.sweepAt = Date.now(); continue; } /* 除錯：正式檢查 3 分鐘內剛讀過的不覆蓋（避免讀法不同把已賣完的又拉回快速名單、佔名額） */ let fp = null; if (P.soldSel) { /* 除錯 11/1：bibiai AGENT ID 用「已售／總量」才讀得到（已售 a2309ff8、總量 a0e23ebd），一般免費讀法讀不到 → 卡在 0% 兩小時沒回頭看，漲到 92% 都不知道 */ const sr = await call(c, P.soldSel); const sold = sr && sr.length >= 66 ? Number(BigInt(sr.slice(0, 66))) : null; if (sold > 0) { if (P.capSel === undefined) P.capSel = (await findCapSel(c, await fullCode(c, await codeOf(c)).catch(() => ''), sold).catch(() => '')) || ''; if (P.capSel) { const cr = await call(c, '0x' + P.capSel); const cap = cr && cr.length >= 66 ? Number(BigInt(cr.slice(0, 66))) : 0; if (cap >= sold && cap > 0) fp = sold / cap; } } }
       if (fp == null) fp = await freeProgress(c); P.sweepAt = Date.now(); if (fp != null && fp > 0) { if (fp >= 0.45 && (P.progress || 0) < 0.45 && !P.swLog) { P.swLog = 1; log(`進度掃描：${P.name || c} 進度 ${Math.round(fp * 100)}%，移到快速檢查`); } P.progress = fp >= 0.999 && !P.progAt ? 1 : Math.min(fp, 0.99); /* 審查 11/1：免費合約正式檢查不會讀進度，賣完的會永遠卡 99% 佔快速名單 → 直接記 100% */ /* 100% 交給快速檢查用正式讀法確認，避免讀錯就永遠不看 */ } } catch {} } }));
 }
 async function autoMint(c, fname, W = WALLETS[0], val = 0n) {
-  if (MONITOR_ONLY) return MONITOR_NOTE;
-  return withMintWalletLock(W, () => autoMintInner(c, fname, W, val));
+  if (MONITOR_ONLY || !canWallet(W, 'mint')) return MONITOR_NOTE;
+  try { return await withMintWalletLock(W, () => autoMintInner(c, fname, W, val)); }
+  catch (error) { if (String(error.message).includes('結果不明')) return '⚠️ ' + error.message; throw error; }
 }
 async function autoMintInner(c, fname, W, val) {
-  if (MONITOR_ONLY) return MONITOR_NOTE;
+  if (MONITOR_ONLY || !canWallet(W, 'mint')) return MONITOR_NOTE;
+  const PAID = paidFor(W);
   /* 使用者 10/31 19:21：新規則——不管免費還是付費，進度超過 50% 就打，之前的規矩（重複 DEV、黑名單、熱度、手續費上限…）全部不看；只保留貔貅類安全檢查（每筆都模擬、不能授權、不能扣到預期外的資產、Flap 禁止）。讀不到進度的才用熱度判斷 */
   { const sd = await serialDev(c); if (sd) return `⛔ ${sd}，照規則不打`; }
   if (val > 0n) { /* 使用者 11/1 14:16：「付手續費的免費」一律當付費——今天被這種小項目掏了約 0.195 BNB；要付錢就必須有保本（退款）機制才打 */
@@ -787,10 +963,10 @@ async function autoMintInner(c, fname, W, val) {
   if (fp == null && agentsN >= 100) { let tk = c; const tr0 = await call(c, '0xfc0c546a'); if (tr0 && tr0.length >= 66 && BigInt(tr0.slice(0, 66)) > 0n) tk = '0x' + tr0.slice(26, 66); if (await poolOpen(tk)) return '⏸ 讀不到進度、已經開池，不鑄造（鑄造通常比市價貴）'; }
   if (fp == null && agentsN < 100) { S.paid = S.paid || {}; if (!S.paid[c]) S.paid[c] = { at: Date.now(), name: '', done: {}, waitHot: 1 }; return `⏸ 讀不到進度，目前 ${agentsN} 個錢包在打，要 100 個以上才打，先追蹤`; }
   const feeBnb = Number(val) / 1e18, feePrice = val > 0n ? await bnbUsd().catch(() => 0) : 0;
-  const feeAllowed = (balance) => val === 0n || withinPaidBudget(PAID, { spentBnb: resetPaidBudgetDay()[W.name] || 0, costBnb: feeBnb, costUsd: feeBnb * feePrice, balanceBnb: balance });
+  const feeAllowed = (balance) => val === 0n || withinPaidBudget(PAID, { spentBnb: resetPaidBudgetDay()[W.id] || 0, costBnb: feeBnb, costUsd: feeBnb * feePrice, balanceBnb: balance });
   let d = Object.fromEntries(CANDS)[fname]; if (d && /重播|熱門函式/.test(fname)) d = freshDeadline(d); /* 照抄的免費鑄造也換新期限 */
   const today = new Date().toDateString(); if (S.mintDay !== today) { S.mintDay = today; S.mintCount = 0; }
-  S.mintCnt = S.mintCnt && S.mintCnt.d === today ? S.mintCnt : { d: today }; if ((S.mintCnt[W.name] || 0) >= 1000) return '⏸ 這個錢包今天自動鑄已達 1000 筆上限，沒有鑄';
+  S.mintCnt = S.mintCnt && S.mintCnt.d === today ? S.mintCnt : { d: today }; if ((S.mintCnt[W.id] || 0) >= 1000) return '⏸ 這個錢包今天自動鑄已達 1000 筆上限，沒有鑄';
   const bnb = BigInt((await rpc('eth_getBalance', [W.addr, 'latest']).catch(() => '0x0')) || '0x0');
   if (bnb < 5n * 10n ** 14n) return '⚠️ BNB 不夠付 gas（< 0.0005），沒有鑄';
   if (val > 0n && (!(feePrice > 0) || !feeAllowed(Number(bnb) / 1e18))) return '⏸ 超过单笔/每日付费预算，或 BNB 保留金额不足，没有铸';
@@ -804,13 +980,12 @@ async function autoMintInner(c, fname, W, val) {
   if (val > 0n) {
     const balance = Number(BigInt(await rpc('eth_getBalance', [W.addr, 'latest']))) / 1e18;
     if (!feeAllowed(balance)) return '⏸ 超过单笔/每日付费预算，没有铸';
-    // Reserve before send, including ambiguous or interrupted results.
-    S.paidSpend[W.name] = (S.paidSpend[W.name] || 0) + feeBnb; save(true);
+    // The shared ledger reserves before sending, including interrupted results.
   }
-  INFLIGHT++; let x; try { x = await W.baw(['contract-call', 'execute', '--requestId', rid]); } finally { INFLIGHT--; }
+  INFLIGHT++; let x; try { x = await runPaidCommand(W, ['contract-call', 'execute', '--requestId', rid], val, { from: W.addr, to: c, value: val.toString(), inputData: d }); } finally { INFLIGHT--; }
   if (mintExecutionUnknown(x)) return '⚠️ 送出結果不明（逾時或响应中断），先不重打';
   if (!x.j?.success) return '❌ 送出失敗：' + (x.j?.error?.message || x.t).slice(0, 120);
-  S.mintCount++; S.mintCnt[W.name] = (S.mintCnt[W.name] || 0) + 1;
+  S.mintCount++; S.mintCnt[W.id] = (S.mintCnt[W.id] || 0) + 1;
   // 免費鑄造拿到的代幣也加入持倉追蹤（成本 0 → 只通知 5／10 倍、回調，不自動賣）
   for (const b of sim?.balanceChanges || []) { if (String(b.owner).toLowerCase() !== W.addr || b.tokenType !== 'Erc20' || !(Number(b.change) > 0)) continue; const ta = String(b.contractAddress).toLowerCase(); S.dyn = S.dyn || []; if (!S.dyn.some((t) => t.addr === ta && t.only === W.addr)) { const sy = tokStr(await call(ta, '0x95d89b41')) || ta.slice(0, 8); S.dyn.push({ sym: sy, addr: ta, cost: val > 0n ? feeBnb * feePrice : 0, only: W.addr }); } }
   for (const b of sim?.balanceChanges || []) if (String(b.owner).toLowerCase() === W.addr && /Erc721|Erc1155/i.test(b.tokenType || '')) { S.nftCols = S.nftCols || {}; S.nftCols[String(b.contractAddress).toLowerCase()] = 1; } // 記下持有的 NFT 系列（12 小時看一次成交量）
@@ -953,8 +1128,8 @@ async function revokeOnFail(W, token, spender, operation) {
   catch (error) {
     try {
       await previewExec(W, token, '0x095ea7b3' + wa(spender) + w(0), 0n, (sim) => approvalSimulationCheck(sim, W, spender, token));
-      log(`[${W.name}] 铸造失败，已撤销对 ${spender} 的授权`);
-    } catch (revokeError) { log(`[${W.name}] 撤销授权失败 ${revokeError.message}`); }
+      logWallet(W, `铸造失败，已撤销对 ${spender} 的授权`);
+    } catch (revokeError) { logWallet(W, `撤销授权失败 ${revokeError.message}`); }
     throw error;
   }
 }
@@ -969,8 +1144,15 @@ function flapGuard(to, data, sim) {
   return '';
 }
 let INFLIGHT = 0; // 正在送出的交易數（重啟前要等它歸零，避免重打）
-async function previewExec(W, to, data, valueWei, check, recheck = null) {
-  if (MONITOR_ONLY) throw new Error(MONITOR_NOTE);
+async function previewExec(W, to, data, valueWei, check, recheck = null, kind = 'mint') {
+  if (MONITOR_ONLY || !canWallet(W, kind)) throw new Error(MONITOR_NOTE);
+  return withWalletExecution(W.profile, async () => {
+    const previousKind = W.operationKind; W.operationKind = kind;
+    try { return await previewExecInner(W, to, data, valueWei, check, recheck); } finally { W.operationKind = previousKind; }
+  }, { root: DIR, kind: 'scanner-contract' });
+}
+async function previewExecInner(W, to, data, valueWei, check, recheck) {
+  const PAID = paidFor(W);
   const p = await W.baw(['contract-call', 'preview', '--binanceChainId', '56', '--from', W.addr, '--to', to, '--value', valueWei.toString(), '--inputData', data]);
   const sim = p.j?.data?.simulationResult, rid = p.j?.data?.requestId;
   if (!p.j?.success || !rid) throw new Error('預演失敗 ' + (p.j?.error?.message || p.t).slice(0, 120));
@@ -979,12 +1161,11 @@ async function previewExec(W, to, data, valueWei, check, recheck = null) {
   if (recheck) { const r2 = await recheck(); if (r2) throw new Error('送出前再確認不通過：' + r2); } // 送出前再確認價格（審查建議 5）
   if (valueWei > 0n) {
     const price = await bnbUsd(), costBnb = Number(valueWei) / 1e18;
-    const spent = resetPaidBudgetDay()[W.name] || 0;
+    const spent = resetPaidBudgetDay()[W.id] || 0;
     const balanceBnb = Number(BigInt(await rpc('eth_getBalance', [W.addr, 'latest']))) / 1e18;
     if (!(price > 0) || !withinPaidBudget(PAID, { spentBnb: spent, costBnb, costUsd: costBnb * price, balanceBnb })) throw new Error('超过单笔/每日付费预算或 BNB 保留金额');
-    S.paidSpend[W.name] = spent + costBnb; save(true);
   }
-  INFLIGHT++; let x; try { x = await W.baw(['contract-call', 'execute', '--requestId', rid]); } finally { INFLIGHT--; }
+  INFLIGHT++; let x; try { x = await runPaidCommand(W, ['contract-call', 'execute', '--requestId', rid], valueWei, { from: W.addr, to, value: valueWei.toString(), inputData: data }); } finally { INFLIGHT--; }
   if (mintExecutionUnknown(x)) throw new Error('結果不明：送出逾時或响应中断，可能已上鏈，先不重打');
   if (!x.j?.success) throw new Error('送出失敗 ' + (x.j?.error?.message || x.t).slice(0, 120));
   await sleep(8000); return { tx: x.j.data?.txHash || '', sim };
@@ -1035,17 +1216,103 @@ function approvalSimulationCheck(sim, W, spender, token = USDT) {
   }
   return '';
 }
+let SCANNER_BUDGET;
+const scannerBudget = () => SCANNER_BUDGET ||= createWalletBudget({ root: DIR });
+function bnbBudgetWei(value) {
+  if (!Number.isFinite(value) || value < 0) throw new Error('预算金额无效');
+  // Round up at nanobnb precision, then use exact integer wei in the shared ledger.
+  return BigInt(Math.ceil(value * 1e9)) * 1000000000n;
+}
+async function confirmWalletResult(W, scope = null) {
+  const pending = S.walletPending?.[W.id];
+  if (!pending) throw new Error('結果不明：缺少已保存的交易意图');
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const result = await reconcileScannerPending({ wallet: W.profile, pending, runWallet: async (args) => (await W.baw(args, 30000)).j, rpc, budget: scope ? { settle: async () => {} } : scannerBudget(), root: DIR });
+    if (result.resolved) return result.status === 'confirmed';
+    if (result.status === 'review') break;
+    await sleep(2000);
+  }
+  await markWalletBlocked(W.profile, '交易已提交，链上结果尚未核对', { root: DIR, details: { source: 'scanner', ...(pending.orderId ? { orderId: pending.orderId } : {}), ...(pending.txHash ? { txHash: pending.txHash } : {}), ...(pending.reservationId ? { reservationId: pending.reservationId } : {}) } });
+  throw new Error('結果不明：等待链上核验，请在钱包管理中核对待处理交易');
+}
+const SCANNER_RECOVERY_JOBS = new Map();
+function recoverScannerWallet(W) {
+  if (!S.walletPending?.[W.id]) return Promise.resolve(null);
+  if (SCANNER_RECOVERY_JOBS.has(W.id)) return SCANNER_RECOVERY_JOBS.get(W.id);
+  const job = withWalletExecution(W.profile, async () => {
+    const pending = S.walletPending?.[W.id]; if (!pending) return null;
+    const result = await reconcileScannerPending({ wallet: W.profile, pending, runWallet: async args => (await W.baw(args, 30000)).j, rpc, budget: scannerBudget(), root: DIR });
+    if (result.resolved && S.walletPending[W.id] === pending) {
+      if (pending.reservationDay === S.paidSpend?.day) S.paidSpend[W.id] = Math.max(0, (S.paidSpend[W.id] || 0) - Number(pending.reservedAmountWei || 0) / 1e18 + Number(result.spentWei || 0) / 1e18);
+      delete S.walletPending[W.id];
+      S.walletRuntime ||= {}; S.walletRuntime[W.id] ||= {};
+      S.walletRuntime[W.id].recovery = { status: result.status, at: Date.now(), txHash: result.txHash || null };
+      save(true);
+    }
+    return result;
+  }, { root: DIR, kind: 'reconcile', allowBlocked: true }).finally(() => SCANNER_RECOVERY_JOBS.delete(W.id));
+  SCANNER_RECOVERY_JOBS.set(W.id, job); return job;
+}
+async function runPaidCommand(W, args, amountWei = 0n, expected = null) {
+  if (!canWallet(W, W.operationKind || 'mint')) throw new Error('此钱包已暂停或禁止此操作');
+  if (S.walletPending?.[W.id] && S.walletPending[W.id].phase !== 'verified') throw new Error('結果不明：此钱包仍有待核对的原始交易');
+  const scope = W.paidReservation;
+  const kind = args[0] === 'market-order' ? 'market-order' : args[0] === 'approvals' ? 'approval' : 'contract';
+  if (kind !== 'market-order' && !expected) throw new Error('缺少完整合约意图，未提交交易');
+  const reservation = amountWei > 0n && !scope ? await scannerBudget().reserve({ wallet: W.profile, config: currentRuntimeConfig(), amountWei, legacySpent: S.paidSpend }) : null;
+  const allocation = scope?.reservation || reservation;
+  const spent = resetPaidBudgetDay()[W.id] || 0;
+  const field = name => args[args.indexOf(name) + 1];
+  const isFinalMint = scope && expected?.to === scope.finalTarget && expected?.inputData === scope.finalData;
+  const successSpent = scope ? isFinalMint ? scope.totalWei : scope.spentWei + (kind === 'market-order' ? amountWei : 0n) : amountWei;
+  const failureSpent = scope ? scope.spentWei : 0n;
+  const pending = { version: 1, walletId: W.id, walletAddress: W.addr, walletIndex: W.index, kind, createdAt: Date.now(), amountWei: amountWei.toString(), expected: kind !== 'market-order' ? expected : { fromToken: field('--fromToken'), toToken: field('--toToken'), fromTokenQty: field('--fromTokenQty') }, ...(allocation ? { reservationId: allocation.id, reservationDay: allocation.day, reservedAmountWei: allocation.amountWei } : { reservedAmountWei: '0' }), settlement: { successSpentWei: successSpent.toString(), failureSpentWei: failureSpent.toString() } };
+  S.walletPending ||= {}; S.walletPending[W.id] = pending; save(true);
+  let result;
+  try {
+    result = await W.baw(args);
+    const data = result.j?.data;
+    if (typeof data?.txHash === 'string') pending.txHash = data.txHash;
+    if (typeof data?.orderId === 'string') pending.orderId = data.orderId;
+    if (args.includes('--requestId')) pending.requestId = field('--requestId');
+    save(true);
+    if (mintExecutionUnknown(result)) throw new Error('結果不明：钱包提交未返回明确结果');
+    if (!result.j?.success) {
+      pending.phase = 'rejected'; pending.rejection = result.j.error?.name; save(true);
+      if (reservation) await scannerBudget().settle(reservation.id, { spentWei: 0n });
+      delete S.walletPending[W.id]; save(true); return result;
+    }
+    const confirmed = await confirmWalletResult(W, scope);
+    if (!confirmed) { if (reservation) await scannerBudget().settle(reservation.id, { spentWei: 0n }); delete S.walletPending[W.id]; save(true); return { t: '交易已回滚', j: { success: false, error: { name: 'TRANSACTION_REVERTED', message: '链上交易失败，未计入买入支出' } } }; }
+    if (reservation) await scannerBudget().settle(reservation.id, { spentWei: amountWei });
+    if (scope) { scope.spentWei = successSpent; pending.phase = 'verified'; } else delete S.walletPending[W.id];
+    save(true);
+    if (amountWei > 0n && !scope) { S.paidSpend[W.id] = spent + Number(amountWei) / 1e18; save(); }
+    return result;
+  } catch (error) {
+    if (scope) scope.unknown = true;
+    if (amountWei > 0n && !scope) { S.paidSpend[W.id] = spent + Number(amountWei) / 1e18; save(true); }
+    await markWalletBlocked(W.profile, '钱包交易提交结果不明', { root: DIR, details: { source: 'scanner', ...(allocation ? { reservationId: allocation.id } : {}), ...(pending.orderId ? { orderId: pending.orderId } : {}), ...(pending.txHash ? { txHash: pending.txHash } : {}) } });
+    throw new Error('結果不明：' + String(error.message || '钱包响应中断').replace(/^結果不明：/, ''));
+  }
+}
 const MINT_WALLET_QUEUE = new Map();
-function withMintWalletLock(W, operation) {
+function withMintWalletLock(W, operation, kind = 'mint') {
   const key = W.addr.toLowerCase();
   const previous = MINT_WALLET_QUEUE.get(key) || Promise.resolve();
-  const running = previous.catch(() => {}).then(operation);
+  const running = previous.catch(() => {}).then(() => {
+    if (!canWallet(W, kind)) throw new Error('此钱包已暂停或禁止此操作');
+    return withWalletExecution(W.profile, async () => {
+      const previousKind = W.operationKind; W.operationKind = kind;
+      try { return await operation(); } finally { W.operationKind = previousKind; }
+    }, { root: DIR, kind: kind === 'mint' ? 'scanner-mint' : 'scanner-token-sell' });
+  });
   MINT_WALLET_QUEUE.set(key, running);
   return running.finally(() => { if (MINT_WALLET_QUEUE.get(key) === running) MINT_WALLET_QUEUE.delete(key); });
 }
 function mintExecutionUnknown(result) {
   if (result.j?.success) return false;
-  const explicitRejection = ['INVALID_PARAMS', 'INVALID_AMOUNT', 'INVALID_ADDRESS', 'NOT_LOGGED_IN', 'INSUFFICIENT_BALANCE', 'CONFIG_ERROR', 'CLI_NOT_READY'];
+  const explicitRejection = ['INVALID_PARAMS', 'INVALID_AMOUNT', 'INVALID_ADDRESS', 'NOT_LOGGED_IN', 'INSUFFICIENT_BALANCE', 'CONFIG_ERROR', 'CLI_NOT_READY', 'TRANSACTION_REVERTED'];
   return !result.j || !explicitRejection.includes(result.j?.error?.name);
 }
 function resetPaidBudgetDay() {
@@ -1071,40 +1338,56 @@ function prepareUsdtReplay(replay, maxUsd, price) {
   }
   return Number(originalNeed) / 1e18 + Number(value) / 1e18 * price <= maxUsd ? { data: replay.data, need: originalNeed, value } : null;
 }
-async function executeUsdtMint(W, { to, data, need, value = 0n }) {
-  if (MONITOR_ONLY) throw new Error(MONITOR_NOTE);
+async function executeUsdtMint(W, options) {
+  if (MONITOR_ONLY || !canWallet(W, 'mint')) throw new Error(MONITOR_NOTE);
+  return withWalletExecution(W.profile, () => executeUsdtMintInner(W, options), { root: DIR, kind: 'scanner-usdt-mint' });
+}
+async function executeUsdtMintInner(W, { to, data, need, value = 0n, recheck = null }) {
+  const PAID = paidFor(W);
   if (!validMintAddress(to) || !validMintCalldata(data) || badSel(data)) throw new Error('铸造地址或调用数据无效');
   need = mintUint(need); value = mintUint(value);
   if (need <= 0n || !(PAID.maxUsd > 0) || !(PAID.maxBnbPerDay > 0)) throw new Error('付费预算为零，未执行');
   const price = await bnbUsd(); if (!(price > 0) || !Number.isFinite(price)) throw new Error('无法取得 BNB 价格');
   const usd = Number(need) / 1e18, valueBnb = Number(value) / 1e18;
   if (usd + valueBnb * price > PAID.maxUsd) throw new Error('超过单笔预算');
-  const spent = resetPaidBudgetDay()[W.name] || 0;
+  const spent = resetPaidBudgetDay()[W.id] || 0;
   const balance = Number(BigInt(await rpc('eth_getBalance', [W.addr, 'latest']))) / 1e18;
   let usdtBalance = big(await call(USDT, '0x70a08231' + wa(W.addr)));
   const held = usdtBalance < need ? usdtBalance : need;
   const heldEquivalent = Number(held) / 1e18 / price;
   const missing = need - held;
-  // Round the actual swap quantity before checking budgets and recording spend.
   const swapBnb = missing > 0n ? Math.ceil(Number(missing) / 1e18 * 1.04 / price * 1e6) / 1e6 : 0;
-  const chargeBnb = heldEquivalent + swapBnb + valueBnb;
-  const chargeUsd = chargeBnb * price;
-  // Existing USDT uses daily acquisition quota, but does not spend native BNB.
+  const chargeBnb = heldEquivalent + swapBnb + valueBnb, chargeUsd = chargeBnb * price;
   if (!withinPaidBudget(PAID, { spentBnb: spent, costBnb: chargeBnb, costUsd: chargeUsd, balanceBnb: balance + heldEquivalent })) throw new Error('超过单笔/每日预算或 BNB 保留金额');
   data = await safeAddrs(W, to, data, value);
-  if (swapBnb > 0) {
-    S.paidSpend[W.name] = spent + swapBnb; save(true);
-    const swap = await W.baw(['market-order', 'swap', '--binanceChainId', '56', '--fromTokenQty', swapBnb.toFixed(6), '--fromToken', NATIVE_BNB, '--toToken', USDT]);
-    if (mintExecutionUnknown(swap)) throw new Error('結果不明：BNB 换 USDT 响应中断，先不重试');
-    if (!swap.j?.success) throw new Error('BNB 换 USDT 失败 ' + (swap.j?.error?.message || swap.t).slice(0, 100));
-    S.paidSpend[W.name] = spent + swapBnb; save();
-    for (let i = 0; i < 30 && usdtBalance < need; i++) { await sleep(3000); usdtBalance = big(await call(USDT, '0x70a08231' + wa(W.addr))); }
-    if (usdtBalance < need) throw new Error('USDT 未到账');
-  }
-  await previewExec(W, USDT, '0x095ea7b3' + wa(to) + w(need), 0n, (sim) => approvalSimulationCheck(sim, W, to));
-  const result = await revokeOnFail(W, USDT, to, () => previewExec(W, to, data, value, (sim) => mintSimulationCheck(sim, W, { bnbWei: value, usdtWei: need })));
-  S.paidSpend[W.name] = spent + chargeBnb; save();
-  return { ...result, usd: chargeUsd };
+  const reservation = await scannerBudget().reserve({ wallet: W.profile, config: currentRuntimeConfig(), amountWei: bnbBudgetWei(chargeBnb), legacySpent: S.paidSpend });
+  const scope = { reservation, totalWei: bnbBudgetWei(chargeBnb), finalTarget: to, finalData: data, spentWei: 0n, unknown: false }; W.paidReservation = scope;
+  try {
+    if (swapBnb > 0) {
+      const swap = await runPaidCommand(W, ['market-order', 'swap', '--binanceChainId', '56', '--fromTokenQty', swapBnb.toFixed(6), '--fromToken', NATIVE_BNB, '--toToken', USDT], bnbBudgetWei(swapBnb));
+      if (!swap.j?.success) throw new Error('BNB 换 USDT 失败 ' + (swap.j?.error?.message || swap.t).slice(0, 100));
+      S.paidSpend[W.id] = spent + swapBnb; save();
+      for (let i = 0; i < 30 && usdtBalance < need; i++) { await sleep(3000); usdtBalance = big(await call(USDT, '0x70a08231' + wa(W.addr))); }
+      if (usdtBalance < need) throw new Error('USDT 未到账');
+    }
+    await previewExec(W, USDT, '0x095ea7b3' + wa(to) + w(need), 0n, (sim) => approvalSimulationCheck(sim, W, to));
+    const result = await revokeOnFail(W, USDT, to, () => previewExec(W, to, data, value, (sim) => mintSimulationCheck(sim, W, { bnbWei: value, usdtWei: need }), recheck));
+    scope.spentWei = bnbBudgetWei(chargeBnb);
+    await scannerBudget().settle(reservation.id, { spentWei: scope.spentWei });
+    if (S.walletPending[W.id]?.reservationId === reservation.id && S.walletPending[W.id].phase === 'verified') delete S.walletPending[W.id];
+    S.paidSpend[W.id] = spent + chargeBnb; save();
+    return { ...result, usd: chargeUsd };
+  } catch (error) {
+    if (scope.unknown || String(error.message).includes('結果不明')) {
+      S.paidSpend[W.id] = spent + chargeBnb; save(true);
+      await markWalletBlocked(W.profile, 'USDT 铸造执行结果尚未核对', { root: DIR, details: { reservationId: reservation.id } });
+    } else {
+      await scannerBudget().settle(reservation.id, { spentWei: scope.spentWei });
+      if (S.walletPending[W.id]?.reservationId === reservation.id) delete S.walletPending[W.id];
+      save(true);
+    }
+    throw error;
+  } finally { delete W.paidReservation; }
 }
 // 鑄造進度：先找「已售／上限」這類函式；找不到就看「鑄造池剩多少幣」（合約剛部署時持有的幣 vs 現在）
 const SOLD_SELS = ['a2309ff8', 'f4514d2e', '505e05fd', 'cc84efea', '192fc516', '9106d7ba', '67153ab4', 'f3f8a4fd', '06ed0717', '9659867e', '4f02c420', '1f21bfbf'];
@@ -1177,7 +1460,7 @@ async function heatOf(c, P) { // 算熱度：最近約 2.5 小時有幾個不同
 }
 const hk = (P) => (P.heatAt || 0) + (heatTier(P) >= 1 || (P.progress || 0) >= 0.2 ? 0 : 540e3);
 async function heatWatch() { // 背景：替追蹤中的付費項目算熱度，看不懂的合約順便學別人的打法（不拖慢 15 秒的快速檢查）
-  const ents = Object.entries(S.paid || {}).filter(([c, P]) => !INFRA.has(c) && !P.unmintable && (P.progress || 0) < 0.999 && !WALLETS.every((W) => P.done?.[W.name]))
+  const ents = Object.entries(S.paid || {}).filter(([c, P]) => !INFRA.has(c) && !P.unmintable && (P.progress || 0) < 0.999 && !WALLETS.every((W) => P.done?.[W.id]))
     .sort((a, b) => ((b[1].needLearn && (b[1].progress || 0) >= 0.45) - (a[1].needLearn && (a[1].progress || 0) >= 0.45)) || hk(a[1]) - hk(b[1])).slice(0, 8); // 快滿或很熱的約每分鐘更新，其他約 10 分鐘；快到門檻又還不會打的排最前面（除錯 11/1：BNBCAT 57% 一直排不到）
   for (const [c, P] of ents) {
     try {
@@ -1234,6 +1517,12 @@ const memoC = new Map(); const cc = async (to, data, ttl = 600e3) => { const k =
 const busyP = new Set(); // 同一個項目同時只處理一次（快速檢查和一般檢查分開跑，避免重複打）
 async function paidLoop(mode = 'all', shard = null) {
   if (MONITOR_ONLY) return;
+  syncWalletProfiles();
+  for (const W of WALLETS) void recoverScannerWallet(W).catch(error => logWallet(W, '交易核对失败 ' + error.message));
+  const mintWallets = WALLETS.filter(W => canWallet(W, 'mint'));
+  if (!mintWallets.length) return;
+  const paidSettings = mintWallets.map(W => paidFor(W));
+  const PAID = { ...getPaidConfig(CONFIG), goPct: Math.min(...paidSettings.map(p => p.goPct)), maxAgeH: Math.max(...paidSettings.map(p => p.maxAgeH)) };
   if (S.umReset !== 3) { S.umReset = 3; for (const P of Object.values(S.paid || {})) { if (P.unmintable) { delete P.unmintable; P.fail = 0; P.cf = 0; if (P.replay?.learned) delete P.replay; } } } // 新版一次性：之前標記打不了的重新試
   S.paid = S.paid || {}; S.dyn = S.dyn || []; S.paidSpend = S.paidSpend || {};
   if (S.missed && !S.missedClean1) { S.missedClean1 = 1; for (const [k, m] of Object.entries(S.missed)) if (String(m.why || '').includes('保本')) delete S.missed[k]; } /* 照規則不打的不算錯過 */
@@ -1247,7 +1536,7 @@ async function paidLoop(mode = 'all', shard = null) {
   // 進度 ≥40% 的（快滿的）每輪都看，不跟其他一百多個排隊；其餘輪流，每輪補到 16 個
   const all = Object.entries(S.paid);
   
-  const hotP = all.filter(([c, P]) => FORCE.has(c) || (((P.progress || 0) >= 0.45 || (fpCache.get(c)?.p || 0) >= 0.45 || (!(P.progress > 0) && Math.max(P.agents || 0, HOT.get(c)?.from.size || 0) >= 70)) && (P.progress || 0) < 0.999 && !P.unmintable)).filter(([c, P]) => !WALLETS.every((W) => P.done[W.name])).sort((a, b) => (b[1].progress || 0) - (a[1].progress || 0) || (b[1].agents || 0) - (a[1].agents || 0)).slice(0, 12); /* 使用者 10/31 20:29：快速檢查只看快到門檻的（進度 ≥45%，或讀不到進度但已 70 個以上錢包），最多 12 個，避免越來越慢 */
+  const hotP = all.filter(([c, P]) => FORCE.has(c) || (((P.progress || 0) >= 0.45 || (fpCache.get(c)?.p || 0) >= 0.45 || (!(P.progress > 0) && Math.max(P.agents || 0, HOT.get(c)?.from.size || 0) >= 70)) && (P.progress || 0) < 0.999 && !P.unmintable)).filter(([c, P]) => !WALLETS.every((W) => P.done[W.id])).sort((a, b) => (b[1].progress || 0) - (a[1].progress || 0) || (b[1].agents || 0) - (a[1].agents || 0)).slice(0, 12); /* 使用者 10/31 20:29：快速檢查只看快到門檻的（進度 ≥45%，或讀不到進度但已 70 個以上錢包），最多 12 個，避免越來越慢 */
   // 快速檢查（mode='hot'）每 15 秒只看快滿／很熱的；一般檢查（mode='rest'）另外在背景約每分鐘輪流看其他的，互不拖慢
   const rest = mode === 'hot' ? [] : all.filter((e) => !hotP.includes(e)).sort((a, b) => (a[1].lastTry || 0) - (b[1].lastTry || 0)).slice(0, 16);
   const ents = mode === 'rest' ? rest : mode === 'hot' ? (shard == null ? hotP : hotP.filter((e, i) => i % 3 === shard)) : hotP.concat(rest); /* 快速檢查分 3 組同時跑（審查修正：一個一個查要 1 分多鐘） */
@@ -1255,12 +1544,12 @@ async function paidLoop(mode = 'all', shard = null) {
     if (INFRA.has(c)) { delete S.paid[c]; continue; } // Agent ID 登記合約本身不是項目（註冊 .ai 身份），不打
     if (busyP.has(c)) continue; busyP.add(c); const tE = Date.now();
     try {
-    P.lastTry = Date.now(); if (WALLETS.every((W) => P.done[W.name])) { if (FORCE.has(c)) { S.forceDone = S.forceDone || {}; S.forceDone[c] = 1; } delete S.paid[c]; continue; }
+    P.lastTry = Date.now(); if (WALLETS.every((W) => P.done[W.id])) { if (FORCE.has(c)) { S.forceDone = S.forceDone || {}; S.forceDone[c] = 1; } delete S.paid[c]; continue; }
     if (Date.now() - P.at > PAID.maxAgeH * 3600e3) { delete S.paid[c]; continue; }
     const code = await codeOf(c);
     // 發現時還沒開的「免費」鑄造：之後每分鐘重試，一開就自動打
     const fcd = (P.progress || 0) >= 0.58 || Math.max(P.agents || 0, HOT.get(c)?.from.size || 0) >= 70 ? 20e3 : 120e3; /* 除錯 11/1：快到 60% 的免費項目改成 20 秒重試一次（之前固定 2 分鐘，0xa69adf 在這 2 分鐘內從 63% 賣完） */
-    if (Date.now() - (P.freeTryAt || 0) > fcd && !((P.progress || 0) > 0 && P.progress < 0.58 && Date.now() - (P.freeTryAt || 0) < 600e3)) { /* 優化 11/1：進度讀得到且還沒到 58% 的免費項目，不用每 2 分鐘模擬一次（一晚 850 次白跑、還害節點限流）；改成 10 分鐘看一次，快到門檻才密集重試 */ P.freeTryAt = Date.now(); for (const W of WALLETS) { if (P.done[W.name]) continue; { const ff = await findFree(W.addr, c, code); if (!ff || P.qAt?.[W.name] > Date.now() - (fcd - 5e3)) continue; P.qAt = P.qAt || {}; P.qAt[W.name] = Date.now(); queueMint(c, ff.n, W, ff.v); log(`[${W.name}] 之前還沒開的 ${P.name || c} 現在開了（免費），排入鑄造`); } } }
+    if (Date.now() - (P.freeTryAt || 0) > fcd && !((P.progress || 0) > 0 && P.progress < 0.58 && Date.now() - (P.freeTryAt || 0) < 600e3)) { /* 優化 11/1：進度讀得到且還沒到 58% 的免費項目，不用每 2 分鐘模擬一次（一晚 850 次白跑、還害節點限流）；改成 10 分鐘看一次，快到門檻才密集重試 */ P.freeTryAt = Date.now(); for (const W of mintWallets) { if (P.done[W.id]) continue; { const ff = await findFree(W.addr, c, code); if (!ff || P.qAt?.[W.id] > Date.now() - (fcd - 5e3)) continue; P.qAt = P.qAt || {}; P.qAt[W.id] = Date.now(); queueMint(c, ff.n, W, ff.v); logWallet(W, `之前還沒開的 ${P.name || c} 現在開了（免費），排入鑄造`); } } }
     let kind = code.includes('e38fd349') && code.includes('68bce8cd') ? 'bnb' : code.includes('725c4058') && code.includes('94bf804d') ? 'usdt' : null;
     let unit = 0n; // 一般 NFT：mint(數量) 付「單價 × 數量」BNB（像 Sentient Syndicate 的 PRICE）
     if (!kind && code.includes('a0712d68')) for (const sel of ['8d859f3e', 'a035b1fe', '6817c76c', '13faede6', '817b1cd2']) { if (!code.includes(sel)) continue; const r = await cc(c, '0x' + sel); if (r && r.length >= 66 && BigInt(r.slice(0, 66)) > 0n) { unit = BigInt(r.slice(0, 66)); kind = 'gen'; break; } }
@@ -1290,7 +1579,7 @@ async function paidLoop(mode = 'all', shard = null) {
       else { if (!P.progBad) { P.progBad = 1; log(`進度看起來讀錯了：${c} 讀到 ${(progress * 100).toFixed(2)}% 但已有 ${P.agents || 0} 個代理人在打，改用熱度規則判斷`); } progress = 0; how = '讀不到（數字不合理）'; }
     }
     const prevProg = P.progress; P.progress = progress; P.progAt = Date.now();
-    if (progress >= 0.95 && !P.noRefundLog && !P.serialLog && !String(P.lastReason || '').includes('保本') && !WALLETS.some((W) => P.done[W.name] && !['pool-open', 'fail', 'unknown'].includes(P.done[W.name]))) { /* 照規則不打（沒有保本）的不算錯過 */ S.missed = S.missed || {}; if (!S.missed[c]) { S.missed[c] = { name: P.name || c.slice(0, 10), at: ts(), why: P.lastReason || (P.unmintable ? '打不了' : '還沒找到能打的方式') }; log(`錯過 ${c}（${S.missed[c].name}）：進度已 ${Math.round(progress * 100)}%，我們沒打到，原因：${S.missed[c].why}`); } } /* 讓自己更聰明：記下快賣完卻沒打到的項目和原因，每晚總結列出來，方便找出要補的漏洞 */
+    if (progress >= 0.95 && !P.noRefundLog && !P.serialLog && !String(P.lastReason || '').includes('保本') && !WALLETS.some((W) => P.done[W.id] && !['pool-open', 'fail', 'unknown'].includes(P.done[W.id]))) { /* 照規則不打（沒有保本）的不算錯過 */ S.missed = S.missed || {}; if (!S.missed[c]) { S.missed[c] = { name: P.name || c.slice(0, 10), at: ts(), why: P.lastReason || (P.unmintable ? '打不了' : '還沒找到能打的方式') }; log(`錯過 ${c}（${S.missed[c].name}）：進度已 ${Math.round(progress * 100)}%，我們沒打到，原因：${S.missed[c].why}`); } } /* 讓自己更聰明：記下快賣完卻沒打到的項目和原因，每晚總結列出來，方便找出要補的漏洞 */
     if (progress >= 0.7 && progress <= 1 && (prevProg != null ? prevProg < 0.7 : Date.now() - P.at < 6 * 3600e3)) groupProgress(c, P.name, progress).catch(() => {});
     { const now = Date.now(); P.ph = (P.ph || []).filter((x) => now - x.t < 15 * 60e3); if (!P.ph.length || now - P.ph[P.ph.length - 1].t > 10e3) P.ph.push({ t: now, p: progress }); }
     price = price || (await bnbUsd());
@@ -1324,7 +1613,7 @@ async function paidLoop(mode = 'all', shard = null) {
       }
     }
     // 使用者定：只打新的 → 兩天前就部署的老合約不打
-    if (!gate) { if (P.old == null) { const head = parseInt(await rpc('eth_blockNumber', []), 16); const o = await rpc('eth_getCode', [c, '0x' + (head - 400000).toString(16)]).catch(() => '0x'); P.old = !!o && o.length > 2; } if (P.old) { for (const W of WALLETS) P.done[W.name] = P.done[W.name] || 'old'; continue; } }
+    if (!gate) { if (P.old == null) { const head = parseInt(await rpc('eth_blockNumber', []), 16); const o = await rpc('eth_getCode', [c, '0x' + (head - 400000).toString(16)]).catch(() => '0x'); P.old = !!o && o.length > 2; } if (P.old) { for (const W of WALLETS) P.done[W.id] = P.done[W.id] || 'old'; continue; } }
     // 已經開池交易的項目不再自動鑄造（鑄造≈用市價買，不划算）
     if (!forced && !(progress >= 0.6)) { const tk = tokAddr0 || c; if (await poolOpen(tk)) { if (!P.poolSkipLog) { P.poolSkipLog = 1; log(`跳過 ${c}：已經開池交易，讀不到進度時不在開池後鑄（之後讀到進度 ≥60% 仍會打）`); } continue; } } /* 審查 11/1：以前會直接標記完成並刪掉，讀錯一次就永遠不打 */
     if (!gate && isSerial(code)) { if (!P.serialLogged) { P.serialLogged = 1; log(`跳過 ${c}：同款合約 24 小時內部署 3 次以上，疑似批量發盤`); } continue; }
@@ -1332,11 +1621,13 @@ async function paidLoop(mode = 'all', shard = null) {
     const limitUsd = Infinity;
     let tokAddr = ''; const tr = await cc(c, '0xfc0c546a', 3600e3); if (tr && tr.length >= 66) tokAddr = '0x' + tr.slice(26, 66);
     const sym = tokAddr ? tokStr(await cc(tokAddr, '0x95d89b41', 3600e3)) || P.name || c.slice(0, 8) : P.name || c.slice(0, 8);
-    await Promise.all(WALLETS.map((W) => withMintWalletLock(W, async () => {
-      if (P.done[W.name]) return;
+    await Promise.allSettled(mintWallets.map((W) => withMintWalletLock(W, async () => {
+      if (P.done[W.id] || !canWallet(W, 'mint')) return;
+      const PAID = paidFor(W);
+      if (Date.now() - P.at > PAID.maxAgeH * 3600e3 || !forced && !(progress >= Math.max(0.6, PAID.goPct) || crowdGo)) return;
       try {
         price = price || (await bnbUsd());
-        const spent = resetPaidBudgetDay()[W.name] || 0;
+        const spent = resetPaidBudgetDay()[W.id] || 0;
         const bal = Number(BigInt((await rpc('eth_getBalance', [W.addr, 'latest'])) || '0x0')) / 1e18;
         const fitsBudget = (bnb, usd = bnb * price) => withinPaidBudget(PAID, { spentBnb: spent, costBnb: bnb, costUsd: usd, balanceBnb: bal });
         let n = 10, costWei = 0n;
@@ -1346,7 +1637,7 @@ async function paidLoop(mode = 'all', shard = null) {
           const prepared = prepareUsdtReplay({ ...P.replay, data: freshDeadline(P.replay.data) }, PAID.maxUsd, price);
           if (!prepared) return;
           const r = await executeUsdtMint(W, { to: c, ...prepared });
-          P.done[W.name] = 'minted';
+          P.done[W.id] = 'minted';
           trackFromSim(W, r.sim, sym, r.usd);
           if (tokAddr && !S.dyn.some((token) => token.addr === tokAddr.toLowerCase() && token.only === W.addr)) S.dyn.push({ sym, addr: tokAddr.toLowerCase(), cost: r.usd, only: W.addr, deployer: P.deployer, boughtAt: Date.now() });
           await tg(`🛒 [${W.name}] 自动铸造付费 Agent ID 项目：${sym}（USDT）\n支出预算约 ${r.usd.toFixed(2)}U\n${c}\n交易 ${r.tx}`);
@@ -1360,7 +1651,7 @@ async function paidLoop(mode = 'all', shard = null) {
             if (n0 >= 2 && n0 <= 100) { const n1 = Math.floor((PAID.maxUsd / (vb * price)) * n0); if (n1 >= 1) { v = (v * BigInt(n1)) / BigInt(n0); vb = Number(v) / 1e18; P.replay = { ...P.replay, data: P.replay.data.slice(0, 10) + n1.toString(16).padStart(64, '0') + P.replay.data.slice(74), value: v.toString() }; log(`照抄金額超過預算，份數 ${n0}→${n1}：${c}`); } }
           }
           if (!price || !fitsBudget(vb) || vb * 1.005 > bal - PAID.keepBnb) return;
-          let rdata = freshDeadline(P.replay.data); try { rdata = await safeAddrs(W, c, rdata, v); const rd0 = rdata; rdata = await fitShares(W, c, rdata, v); v = scaleV(rd0, rdata, v); vb = Number(v) / 1e18; } catch (e) { if (/額度|quota|已打滿/.test(e?.message || '')) P.done[W.name] = 'full'; else noteFail(c, P, sym, progress); return; } /* 審查修正：付 BNB 的照抄也要換掉別人的地址、自動調份數 */
+          let rdata = freshDeadline(P.replay.data); try { rdata = await safeAddrs(W, c, rdata, v); const rd0 = rdata; rdata = await fitShares(W, c, rdata, v); v = scaleV(rd0, rdata, v); vb = Number(v) / 1e18; } catch (e) { if (/額度|quota|已打滿/.test(e?.message || '')) P.done[W.id] = 'full'; else noteFail(c, P, sym, progress); return; } /* 審查修正：付 BNB 的照抄也要換掉別人的地址、自動調份數 */
           { /* 使用者 10/31 19:16「用這種邏輯去優化」：照抄失敗時不馬上放棄——先換最新樣本再試，再試「價格上限 +2%」（只在交易內容裡有跟付款金額一樣的上限數字時） */
             const ok = async (d, val) => { try { await rpc('eth_call', [{ from: W.addr, to: c, data: d, value: '0x' + val.toString(16) }, 'latest']); return true; } catch { return false; } };
             let good = await ok(rdata, v);
@@ -1379,7 +1670,7 @@ async function paidLoop(mode = 'all', shard = null) {
             const out = mine.filter((b) => Number(b.change) < 0); if (out.some((b) => !String(b.contractAddress).toLowerCase().startsWith('0xeeee')) || out.reduce((a, b) => a - Number(b.change), 0) > Number(v) * 1.01) return '會扣到 BNB 以外或超過金額';
             if (!mine.some((b) => Number(b.change) > 0)) return '模擬沒拿到東西'; return '';
           });
-          S.paidSpend[W.name] = spent + vb; P.done[W.name] = 'minted';
+          S.paidSpend[W.id] = spent + vb; P.done[W.id] = 'minted';
           if (!(v > 0n)) { trackFromSim(W, r.sim, sym, 0); noteFree(c, W, sym); return; }
           trackFromSim(W, r.sim, sym, vb * price); 
           await tg(`🛒 [${W.name}] 自動打了付費 Agent ID 項目：${sym}（照別人的鑄造方式）\n花 ${vb.toFixed(4)} BNB（約 ${(vb * price).toFixed(1)}U）· 進度約 ${Math.round(progress * 100)}%\n${c}\n交易 ${r.tx}`);
@@ -1398,7 +1689,7 @@ async function paidLoop(mode = 'all', shard = null) {
             const out = mine.filter((b) => Number(b.change) < 0); if (out.some((b) => !String(b.contractAddress).toLowerCase().startsWith('0xeeee')) || out.reduce((a, b) => a - Number(b.change), 0) > Number(v) * 1.01) return '會扣到 BNB 以外或超過金額';
             if (!mine.some((b) => Number(b.change) > 0)) return '模擬沒拿到代幣'; return '';
           });
-          S.paidSpend[W.name] = spent + vb; P.done[W.name] = 'minted';
+          S.paidSpend[W.id] = spent + vb; P.done[W.id] = 'minted';
           const ta = tokAddr0 || c; if (!S.dyn.some((t) => t.addr === ta && t.only === W.addr)) S.dyn.push({ sym, addr: ta, cost: +(vb * price).toFixed(2), only: W.addr, deployer: P.deployer, boughtAt: Date.now() });
           await tg(`🛒 [${W.name}] 自動打了「轉 BNB 鑄造」項目：${sym}\n轉 ${vb} BNB（約 ${(vb * price).toFixed(1)}U，${P.recvSeen} 個錢包都轉這個金額）· 進度約 ${Math.round(progress * 100)}%（${how}）\n${c}\n交易 ${r.tx}`);
           return;
@@ -1413,7 +1704,7 @@ async function paidLoop(mode = 'all', shard = null) {
             const out = mine.filter((b) => Number(b.change) < 0); if (out.some((b) => !String(b.contractAddress).toLowerCase().startsWith('0xeeee')) || out.reduce((a, b) => a - Number(b.change), 0) > Number(costWei) * 1.01) return '會扣到 BNB 以外或超過價格';
             if (!mine.some((b) => Number(b.change) > 0)) return '模擬沒拿到東西'; return '';
           });
-          const vb = Number(costWei) / 1e18; S.paidSpend[W.name] = spent + vb; P.done[W.name] = 'minted';
+          const vb = Number(costWei) / 1e18; S.paidSpend[W.id] = spent + vb; P.done[W.id] = 'minted';
           trackFromSim(W, r.sim, sym, vb * price);
           await tg(`🛒 [${W.name}] 自動打了付費 Agent ID 項目：${sym}\n${n} 份，花 ${vb.toFixed(4)} BNB（約 ${(vb * price).toFixed(1)}U）· 進度約 ${Math.round(progress * 100)}%（${sold ?? '?'}／${cap ?? '?'}）\n${c}\n交易 ${r.tx}`);
           return;
@@ -1433,39 +1724,20 @@ async function paidLoop(mode = 'all', shard = null) {
             const out = mine.filter((b) => Number(b.change) < 0); if (out.some((b) => !String(b.contractAddress).toLowerCase().startsWith('0xeeee')) || out.reduce((a, b) => a - Number(b.change), 0) > Number(v) * 1.01) return '會扣到 BNB 以外的資產或超過報價';
             if (!mine.some((b) => Number(b.change) > 0)) return '模擬沒拿到代幣'; return '';
           }, async () => { const q2 = await call(c, '0x68bce8cd' + w(n)); const c2 = q2 ? BigInt(q2.slice(0, 66)) : 0n; return c2 > (costWei * 105n) / 100n ? '價格剛剛漲了超過 5%' : ''; }); /* 新功能：送出前再查一次價格 */
-          S.paidSpend[W.name] = spent + vb; P.done[W.name] = 'minted';
+          S.paidSpend[W.id] = spent + vb; P.done[W.id] = 'minted';
           const usd = vb * price; const tka = tokAddr && !/^0x0{40}$/i.test(tokAddr) ? tokAddr : tokAddr0; if (!tka) trackFromSim(W, r.sim, sym, usd); /* 審查 11/1：合約沒有 token() 時以前不會加入持倉，賣出規則都不會跑 */ if (tka && !S.dyn.some((x) => x.addr === tka.toLowerCase() && x.only === W.addr)) S.dyn.push({ sym, addr: tka.toLowerCase(), cost: +usd.toFixed(2), only: W.addr, deployer: P.deployer, boughtAt: Date.now(), ...(FORCE.has(c) ? { hold: true } : {}) }); // 使用者指定的項目照免費幣處理：只通知不自動賣
           await tg(`🛒 [${W.name}] 自動打了付費 Agent ID 項目：${sym}\n${n} 份，花 ${vb.toFixed(4)} BNB（約 ${usd.toFixed(1)}U）· 已售 ${sold ?? '?'} 份 · 進度約 ${Math.round(progress * 100)}%\n${c}\n交易 ${r.tx}\n已加入監控：${ruleTxt()}`);
         } else {
-          for (; n >= 1; n--) { const q = await call(c, '0x725c4058' + w(n)); costWei = q ? BigInt(q.slice(0, 66)) : 0n; if (costWei > 0n && price && fitsBudget(((Number(costWei) / 1e18) * 1.03) / price, Number(costWei) / 1e18)) break; }
-          if (n < 1) return; // 太貴：先不打（進度到 85% 後上限會放寬到 25U，會再檢查）
-          const cu = Number(costWei) / 1e18, needBnb = (cu * 1.03) / price;
-          if (!price || !fitsBudget(needBnb, cu)) return;
+          for (; n >= 1; n--) { const q = await call(c, '0x725c4058' + w(n)); costWei = q ? BigInt(q.slice(0, 66)) : 0n; if (costWei > 0n && price && fitsBudget(((Number(costWei) / 1e18) * 1.04) / price, Number(costWei) / 1e18)) break; }
+          if (n < 1) return;
+          const cu = Number(costWei) / 1e18;
           const data = '0x94bf804d' + w(n) + wa('0x0000000000000000000000000000000000000000');
-          let ub = big(await call(USDT, '0x70a08231' + wa(W.addr)));
-          if (ub < costWei) {
-            S.paidSpend[W.name] = spent + needBnb; save(true);
-            const sw = await W.baw(['market-order', 'swap', '--binanceChainId', '56', '--fromTokenQty', needBnb.toFixed(6), '--fromToken', NATIVE_BNB, '--toToken', USDT]);
-            if (mintExecutionUnknown(sw)) throw new Error('結果不明：BNB 换 USDT 响应中断，先不重试');
-            if (!sw.j?.success) throw new Error('BNB 換 USDT 失敗 ' + (sw.j?.error?.message || sw.t).slice(0, 100));
-            // A successful top-up has spent BNB even when the later mint fails.
-            S.paidSpend[W.name] = spent + needBnb; save();
-            for (let i = 0; i < 30 && ub < costWei; i++) { await sleep(3000); ub = big(await call(USDT, '0x70a08231' + wa(W.addr))); }
-            if (ub < costWei) throw new Error('USDT 沒到帳');
-          }
-          await previewExec(W, USDT, '0x095ea7b3' + wa(c) + w(costWei), 0n, (sim) => ((sim?.allowanceChanges || []).some((a) => String(a.spender).toLowerCase() !== c) ? '授權對象不對' : ''));
-          const pool = tokAddr ? Number(await poolOut(costWei, USDT, tokAddr)) : 0;
-          const r = await revokeOnFail(W, USDT, c, () => previewExec(W, c, data, 0n, (sim) => {
-            if (pool > 0 && gotTok(sim, W) < pool * 1.1) log(`注意：${c} 已開池，鑄造沒有比池子便宜（新規則：進度 ≥60% 照打）`);
-            const mine = (sim?.balanceChanges || []).filter((b) => String(b.owner).toLowerCase() === W.addr);
-            const out = mine.filter((b) => Number(b.change) < 0); if (out.some((b) => String(b.contractAddress).toLowerCase() !== USDT) || out.reduce((a, b) => a - Number(b.change), 0) > Number(costWei) * 1.01) return '會扣到 USDT 以外或超過報價';
-            if (!mine.some((b) => Number(b.change) > 0)) return '模擬沒拿到代幣'; return '';
-          }, async () => { const q2 = await call(c, '0x725c4058' + w(n)); const c2 = q2 ? BigInt(q2.slice(0, 66)) : 0n; return c2 > (costWei * 105n) / 100n ? '價格剛剛漲了超過 5%' : ''; })); /* 新功能：送出前再查一次價格 */
-          S.paidSpend[W.name] = spent + needBnb; P.done[W.name] = 'minted';
+          const r = await executeUsdtMint(W, { to: c, data, need: costWei, recheck: async () => { const q2 = await call(c, '0x725c4058' + w(n)); const c2 = q2 ? BigInt(q2.slice(0, 66)) : 0n; return c2 > (costWei * 105n) / 100n ? '價格剛剛漲了超過 5%' : ''; } });
+          P.done[W.id] = 'minted';
           const tku = tokAddr && !/^0x0{40}$/i.test(tokAddr) ? tokAddr : tokAddr0; if (!tku) trackFromSim(W, r.sim, sym, cu); if (tku && !S.dyn.some((x) => x.addr === tku.toLowerCase() && x.only === W.addr)) S.dyn.push({ sym, addr: tku.toLowerCase(), cost: +cu.toFixed(2), only: W.addr, deployer: P.deployer, boughtAt: Date.now() });
           await tg(`🛒 [${W.name}] 自動打了付費 Agent ID 項目：${sym}\n${n} 份，花 ${cu.toFixed(2)} USDT（由 BNB 換）· 已售 ${sold ?? '?'} 份 · 進度約 ${Math.round(progress * 100)}%\n${c}\n交易 ${r.tx}\n已加入監控：${ruleTxt()}`);
         }
-      } catch (e) { if (e.message.includes('結果不明')) { P.done[W.name] = 'unknown'; save(true); log(`paid ${c} ${W.name} ${e.message}`); await tg(`⚠️ [${W.name}] ${sym} 送出結果不明（逾時），為避免重打已停止，請到錢包確認有沒有打到\n${c}`); return; } if (e.message.includes('已開池')) { P.done[W.name] = 'pool-cheaper'; log(`paid ${c} ${W.name} ${e.message}`); return; } if (/價格剛剛漲了/.test(e.message)) { log(`paid ${c} ${W.name} ${e.message}（下一輪再打）`); return; } P.failW = P.failW || {}; P.failW[W.name] = (P.failW[W.name] || 0) + 1; P.fail = (P.fail || 0) + 1; log(`paid ${c} ${W.name} ${e.message}`); if (kind === 'replay' && P.fail >= 6) { markUnmintable(c, P, sym, progress, '照別人的方式預演一直失敗'); return; } /* 審查 11/1：照抄型 2 次失敗就放棄太快、價格變動不算失敗、失敗按錢包算 */ if (P.failW[W.name] >= 6) { P.done[W.name] = 'fail'; await tg(`⚠️ [${W.name}] 付費項目 ${sym} 自動打失敗，已放棄：${e.message.slice(0, 150)}\n${c}`); } }
+      } catch (e) { if (e.message.includes('結果不明')) { P.done[W.id] = 'unknown'; save(true); logWallet(W, `paid ${c} ${e.message}`); await tg(`⚠️ [${W.name}] ${sym} 送出結果不明（逾時），為避免重打已停止，請到錢包確認有沒有打到\n${c}`); return; } if (e.message.includes('已開池')) { P.done[W.id] = 'pool-cheaper'; logWallet(W, `paid ${c} ${e.message}`); return; } if (/價格剛剛漲了/.test(e.message)) { logWallet(W, `paid ${c} ${e.message}（下一輪再打）`); return; } P.failW = P.failW || {}; P.failW[W.id] = (P.failW[W.id] || 0) + 1; P.fail = (P.fail || 0) + 1; logWallet(W, `paid ${c} ${e.message}`); if (kind === 'replay' && P.fail >= 6) { markUnmintable(c, P, sym, progress, '照別人的方式預演一直失敗'); return; } /* 審查 11/1：照抄型 2 次失敗就放棄太快、價格變動不算失敗、失敗按錢包算 */ if (P.failW[W.id] >= 6) { P.done[W.id] = 'fail'; await tg(`⚠️ [${W.name}] 付費項目 ${sym} 自動打失敗，已放棄：${e.message.slice(0, 150)}\n${c}`); } }
     })));
     } finally { busyP.delete(c); const dt = Date.now() - tE; if (dt > 10e3) log(`檢查 ${c} 花了 ${Math.round(dt / 1000)} 秒（${mode}）`); }
   }
@@ -1473,25 +1745,25 @@ async function paidLoop(mode = 'all', shard = null) {
 
 async function loginCheck() {
   if (MONITOR_ONLY) return;
-  for (const W of WALLETS) {
-    const r = await W.baw(['wallet', 'status'], 60000);
+  syncWalletProfiles();
+  await Promise.allSettled(WALLETS.map(async W => {
+    if (!canWallet(W, 'mint') && !canWallet(W, 'token-sell')) return;
+    const r = await W.baw(['wallet', 'status'], 30000);
     if (r.j?.data?.status === 'CONNECTED') {
-      // 開發者模式到期提醒（到期前 24 小時內提醒一次）
-      const st = await W.baw(['wallet', 'settings'], 60000); const exp = Date.parse(st.j?.data?.devMode?.expiresAt || '');
-      S.devAlert = S.devAlert || {};
-      if (exp && exp - Date.now() < 24 * 3600e3 && S.devAlert[W.name] !== exp) { S.devAlert[W.name] = exp; await tg(`⏰ ${W.name} 的開發者模式將在 ${new Date(exp).toLocaleString('zh-TW', { hour12: false, timeZone: CONFIG.timeZone || 'Asia/Taipei' })} 到期\n到期後自動鑄造／自動賣出會停，請在那個帳號的幣安 App → Agentic Wallet → 設定 重新開啟開發者模式`); }
-      if (st.j?.data?.devMode && st.j.data.devMode.enabled === false && S.devAlert[W.name + ':off'] !== 1) { S.devAlert[W.name + ':off'] = 1; await tg(`⚠️ ${W.name} 的開發者模式已關閉，自動操作會失敗，請在 App 重新開啟`); }
-      if (st.j?.data?.devMode?.enabled) S.devAlert[W.name + ':off'] = 0;
-      continue;
+      const st = await W.baw(['wallet', 'settings'], 30000), exp = Date.parse(st.j?.data?.devMode?.expiresAt || '');
+      S.devAlert ||= {};
+      if (exp && exp - Date.now() < 24 * 3600e3 && S.devAlert[W.id] !== exp) { S.devAlert[W.id] = exp; await tg(`⏰ [${W.name}] 开发者模式即将到期，请在对应币安 App 中续期；其他钱包继续运行`); }
+      if (st.j?.data?.devMode && st.j.data.devMode.enabled === false && S.devAlert[W.id + ':off'] !== 1) { S.devAlert[W.id + ':off'] = 1; await tg(`⚠️ [${W.name}] 开发者模式已关闭，此钱包等待恢复`); }
+      if (st.j?.data?.devMode?.enabled) S.devAlert[W.id + ':off'] = 0;
+      return;
     }
     S.lastLoginAlert = S.lastLoginAlert && typeof S.lastLoginAlert === 'object' ? S.lastLoginAlert : {};
-    if (Date.now() - (S.lastLoginAlert[W.name] || 0) < 6 * 3600e3) continue;
-    S.lastLoginAlert[W.name] = Date.now();
-    const si = await W.baw(['auth', 'signin'], 60000); const url = si.j?.data?.urlForWeb, code = si.j?.data?.pairingCode, id = si.j?.data?.qrCodeId;
-    await tg(`🔑 ${W.name} 的 AI 錢包登入過期了，這個錢包的自動鑄造／自動賣出會暫停。\n${url ? '用「' + W.name + '」那個幣安帳號的手機點這個連結確認（約 5 分鐘內有效）：\n' + url + '\n配對碼 ' + code : '請執行 login 腳本重新登入'}`);
-    if (id) { const v = await W.baw(['auth', 'verify', '--qrCodeId', id], 330000); if (v.j?.data?.status === 'SUCCESS') await tg(`✅ ${W.name} 重新登入成功`); }
-  }
+    if (Date.now() - (S.lastLoginAlert[W.id] || 0) < 6 * 3600e3) return;
+    S.lastLoginAlert[W.id] = Date.now();
+    await tg(`🔑 [${W.name}] 钱包登录已失效，此钱包的自动操作暂停。请到 Web「钱包管理」重新配对；其他钱包继续运行。`);
+  }));
 }
+
 
 
 const ELEMENT_EX = '0xb3e3dfcb2d9f3dde16d78b9e6eb3538eb32b5ae1';
@@ -1562,24 +1834,28 @@ async function manualMints() {
   } catch (e) { log('文件任务未消费：' + e.message); return; }
   writeFileSync(f, '[]');
   for (const J of jobs) {
-    const res = await Promise.all(WALLETS.map((W) => withMintWalletLock(W, async () => {
+    const res = await Promise.all(WALLETS.filter(W => canWallet(W, J.swapBack ? 'token-sell' : 'mint')).map((W) => withMintWalletLock(W, async () => {
+      const PAID = paidFor(W);
       let ok = 0, err = '';
       if (J.approvals) { /* 列出錢包所有授權，存到 data/approvals_錢包.json（使用者 10/31 10:34：Flap 出事，要取消授權） */
-        const r = await W.baw(['approvals', 'list', '--limit', '100']); writeFileSync(join(DIR, 'data', `approvals_${W.name}.json`), r.t || ''); return `[${W.name}] 已列出授權`;
+        const r = await W.baw(['approvals', 'list', '--limit', '100']); writeFileSync(join(DIR, 'data', `approvals_${W.id}.json`), r.t || ''); return `[${W.name}] 已列出授權`;
       }
       if (J.revokeAll) { /* 取消指定的授權：[{token, spender, type}] */
-        const out = []; for (const x of J.revokeAll) { const r = await W.baw(['approvals', 'revoke', '--binanceChainId', '56', '--tokenContract', x.token, '--spender', x.spender, '--type', x.type || 'approve']); out.push(`${x.token.slice(0, 8)}→${x.spender.slice(0, 8)} ${r.j?.success ? '✅' : '❌ ' + (r.j?.error?.message || r.t).slice(0, 80)}`); }
-        writeFileSync(join(DIR, 'data', `revoke_${W.name}.txt`), out.join('\n')); return `[${W.name}] 取消授權：${out.join('；')}`;
+        const out = []; for (const x of J.revokeAll) { const r = await revokeWalletApproval(W, x.token, x.spender, x.type || 'approve'); out.push(`${x.token.slice(0, 8)}→${x.spender.slice(0, 8)} ${r.j?.success ? '✅' : '❌ ' + (r.j?.error?.message || r.t).slice(0, 80)}`); }
+        writeFileSync(join(DIR, 'data', `revoke_${W.id}.txt`), out.join('\n')); return `[${W.name}] 取消授權：${out.join('；')}`;
       }
       if (J.swapBack) { // 把代幣換回 BNB，並（可選）取消授權
         try {
           const out = [];
-          if (J.revoke) { await previewExec(W, J.swapBack, '0x095ea7b3' + wa(J.revoke) + w(0), 0n, (sim) => approvalSimulationCheck(sim, W, J.revoke, J.swapBack)); out.push('已取消授权'); }
+          if (J.revoke) { await previewExec(W, J.swapBack, '0x095ea7b3' + wa(J.revoke) + w(0), 0n, (sim) => approvalSimulationCheck(sim, W, J.revoke, J.swapBack), null, 'token-sell'); out.push('已取消授权'); }
           const balance = big(await call(J.swapBack, '0x70a08231' + wa(W.addr)));
           if (balance > 10n ** 16n) {
-            const qty = (Number(balance / 10n ** 14n) / 1e4).toFixed(4);
-            const swap = await W.baw(['market-order', 'swap', '--binanceChainId', '56', '--fromTokenQty', qty, '--fromToken', J.swapBack, '--toToken', NATIVE_BNB]);
-            out.push(swap.j?.success ? `已把 ${qty} 换回 BNB` : '换 BNB 失败 ' + (swap.j?.error?.message || swap.t).slice(0, 80));
+            const token = TOKENS.concat(S.dyn || []).find(entry => entry.addr.toLowerCase() === J.swapBack && (!entry.only || entry.only === W.addr)) || { sym: J.name || 'TOKEN', addr: J.swapBack, cost: 0, only: W.addr };
+            S.dyn ||= [];
+            if (!TOKENS.concat(S.dyn).some(entry => entry.addr.toLowerCase() === J.swapBack && (!entry.only || entry.only === W.addr))) S.dyn.push(token);
+            const position = positionFor(W, token);
+            const confirmed = await sell(token, position, balance, '本地文件指定换回 BNB', W, { id: 'manualFull', full: true });
+            out.push(confirmed ? '已核验换回 BNB' : position.pendingSell ? '换回 BNB 已提交，继续核对成交' : '换回 BNB 尚未完成，请核对钱包状态');
           }
           return `[${W.name}] ${out.join('，') || '没有需要处理的'}`;
         } catch (e) { return `[${W.name}] ❌ ${e.message.slice(0, 100)}`; }
@@ -1594,20 +1870,20 @@ async function manualMints() {
       }
       try {
         const price = await bnbUsd(), value = mintUint(J.value), totalBnb = Number(value) / 1e18 * J.n;
-        const spent = resetPaidBudgetDay()[W.name] || 0;
+        const spent = resetPaidBudgetDay()[W.id] || 0;
         const balance = Number(BigInt(await rpc('eth_getBalance', [W.addr, 'latest']))) / 1e18;
         if (!(price > 0) || !withinPaidBudget(PAID, { spentBnb: spent, costBnb: totalBnb, costUsd: totalBnb * price, balanceBnb: balance })) throw new Error('超过单笔/每日预算或 BNB 保留金额');
         for (let i = 0; i < J.n; i++) {
           const data = J.randArg ? J.sel + w(BigInt(Math.floor(Math.random() * 65536))) : J.data;
           try {
             await previewExec(W, J.c, data, value, (sim) => mintSimulationCheck(sim, W, { bnbWei: value }));
-            ok++; S.paidSpend[W.name] = spent + Number(value) / 1e18 * ok; save();
+            ok++; S.paidSpend[W.id] = spent + Number(value) / 1e18 * ok; save();
           } catch (e) { err = e.message.slice(0, 80); break; }
         }
       } catch (e) { err = e.message.slice(0, 80); }
       if (ok) { S.nftCols = S.nftCols || {}; S.nftCols[J.c] = 1; S.freeTrack = S.freeTrack || {}; S.freeTrack[J.c] = S.freeTrack[J.c] || { at: Date.now() }; }
       return ok ? `[${W.name}] ✅ 打到 ${ok} 份${err ? '（后续未执行：' + err + '）' : ''}` : `[${W.name}] ❌ 没打到（${err}）`;
-    })));
+    }, J.swapBack ? 'token-sell' : 'mint')));
     log(`手动补打 ${J.name || J.c || J.swapBack}：${res.join('；')}`);
     await tgSay(`🛠 ${J.swapBack ? '换回 BNB' : '补打'} ${J.name || J.c || ''}\n${res.join('\n')}`);
   }
@@ -1643,7 +1919,7 @@ function findTok(q, W) {
 async function cmdSell(q, half) {
   if (MONITOR_ONLY) { await tgSay(MONITOR_NOTE); return; }
   const head = parseInt(await rpc('eth_blockNumber', []), 16);
-  const jobs = WALLETS.map(async (W) => {
+  const jobs = WALLETS.filter(W => canWallet(W, 'token-sell')).map(async (W) => {
     const t0 = findTok(q, W); if (!t0) return `[${W.name}] 找不到 ${q}`;
     const bal = big(await call(t0.addr, '0x70a08231' + wa(W.addr))); if (bal === 0n) return `[${W.name}] 沒有 ${t0.sym}`;
     const st = positionFor(W, t0);
@@ -1673,15 +1949,16 @@ async function holdReport(title = '📦 持倉總結') { /* 使用者 11/1 03:19
   for (const W of WALLETS) for (const t0 of TOKENS.concat(S.dyn || [])) {
     if (t0.only && t0.only !== W.addr) continue;
     const bal = big(await call(t0.addr, '0x70a08231' + wa(W.addr)).catch(() => null)); if (!(bal > 0n)) continue;
-    const v = await valueUsd(t0, bal).catch(() => null); const wn = W === WALLETS[0] ? 'A' : 'B';
+    const RULE = rulesFor(W);
+    const v = await valueUsd(t0, bal).catch(() => null); const wn = W.name;
     if (v == null) { if (!noPool.includes(t0.sym)) noPool.push(t0.sym); continue; }
     if (v < 0.3) { if (!dust.includes(t0.sym)) dust.push(t0.sym); continue; }
-    const st = positionFor(W, t0); const cost = Number(t0.cost) || 0; const x = cost > 0 ? v / cost : 0;
+    const st = positionFor(W, t0); const cost = tokenCostFor(W, t0); const x = cost > 0 ? v / cost : 0;
     const status = t0.hold ? '只通知' : t0.custom ? '特殊規則' : (st.done2 || []).includes('back') ? (st.moon ? `已回本，含 ${RULE.moonPct}% 長抱` : '已回本，照策略持有') : cost > 0 ? '照策略持有' : '免費幣';
     tc += cost; tv += v; rows.push({ v, line: `${t0.sym}（錢包${wn}）${cost > 0 ? `成本 ${cost.toFixed(1)}U → ` : ''}約 ${v.toFixed(2)}U${x ? `（${x.toFixed(2)} 倍）` : ''} · ${status}` });
   }
   rows.sort((a, b) => b.v - a.v);
-  const msg = `${title}（錢包A＝${WALLETS[0]?.name || ''}${WALLETS[1] ? '、錢包B＝' + WALLETS[1].name : ''}）\n${rows.length ? rows.map((r) => '· ' + r.line).join('\n') : '目前沒有有價格的持倉'}\n\n有價格的合計：約 ${tv.toFixed(2)}U${tc ? `（付費成本合計 ${tc.toFixed(1)}U）` : ''}${noPool.length ? `\n還沒開池（${noPool.length} 個）：${noPool.slice(0, 20).join('、')}${noPool.length > 20 ? '…' : ''}` : ''}${dust.length ? `\n不到 0.3U 的零頭：${dust.join('、')}` : ''}`;
+  const msg = `${title}（${WALLETS.map(W => W.name).join('、')}）\n${rows.length ? rows.map((r) => '· ' + r.line).join('\n') : '目前沒有有價格的持倉'}\n\n有價格的合計：約 ${tv.toFixed(2)}U${tc ? `（付費成本合計 ${tc.toFixed(1)}U）` : ''}${noPool.length ? `\n還沒開池（${noPool.length} 個）：${noPool.slice(0, 20).join('、')}${noPool.length > 20 ? '…' : ''}` : ''}${dust.length ? `\n不到 0.3U 的零頭：${dust.join('、')}` : ''}`;
   await tgSay(msg);
 }
 setInterval(() => { const tp = new Date(Date.now() + 8 * 3600e3), h = tp.getUTCHours(), k = tp.toISOString().slice(0, 10) + '-' + h; if ((h === 1 || h === 13) && S.holdRepAt !== k) { S.holdRepAt = k; save(); holdReport().catch((e) => log('holdReport ' + e.message)); } }, 60e3).unref();
@@ -1745,18 +2022,20 @@ function startHoldingsScheduler() {
     if (stopped || busy) return;
     if (existsSync(join(DIR, 'WATCH_STOP'))) { stop(); return; }
     const now = Date.now();
-    const activeFast = Object.values(S.tokens).some((state) => state.openAt && now - state.openAt < RULE.fastMin * 60000 && state.stage !== 9 && !state.done);
+    const activeFast = Object.values(S.tokens).some((state) => state.openAt && now - state.openAt < (state.effectiveRules?.fastMin ?? RULE.fastMin) * 60000 && state.stage !== 9 && !state.done);
     const fullDue = lastFullStarted === null || now - lastFullStarted >= 5000;
     const fastDue = activeFast && (lastFastStarted === null || now - lastFastStarted >= 1000);
     if (!fullDue && !fastDue) return;
     const onlyFast = !fullDue;
     busy = true; S.holdingsInFlight = true; S.holdingsStartedAt = now;
     if (fullDue) { lastFullStarted = now; lastFastStarted = now; } else lastFastStarted = now;
+    let partial = false;
     try {
       const head = Number.parseInt(await rpc('eth_blockNumber', []), 16);
       if (!Number.isSafeInteger(head) || head < 0) throw new Error('持仓检查无法取得有效区块高度');
       if (stopped) return;
-      await holdings(head, onlyFast);
+      const result = await holdings(head, onlyFast);
+      if (result?.pending) { S.holdingsScope = 'partial'; partial = true; return; }
       if (stopped || existsSync(join(DIR, 'WATCH_STOP'))) return;
       S.holdingsUpdatedAt = Date.now();
       S.holdingsScope = onlyFast ? 'fast' : 'all';
@@ -1766,7 +2045,7 @@ function startHoldingsScheduler() {
     } catch (error) {
       if (!stopped) { S.holdingsError = error.message; S.holdingsErrorAt = Date.now(); log('独立持仓检查失败：' + error.message); }
     } finally {
-      busy = false; S.holdingsInFlight = false;
+      busy = false; S.holdingsInFlight = partial;
       if (!stopped) save();
     }
   };

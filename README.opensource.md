@@ -1,13 +1,13 @@
-# v0.1.0 发布与维护
+# v0.2.0 发布与维护
 
-目标发行仓库：[xie8266509/agentid-sniper-web](https://github.com/xie8266509/agentid-sniper-web)。Fork 已创建；安装、发布清单及更新/回退已在隔离临时仓库验证。线上提交、CI 和发行结果分别以仓库页面为准。
+发行仓库：[xie8266509/agentid-sniper-web](https://github.com/xie8266509/agentid-sniper-web)。当前正式发行 **v0.2.0（2026-11-01）**，增加多钱包工作台；v0.1.0 历史保留在 [变更记录](CHANGELOG.md)。线上提交、CI 和发行结果分别以仓库页面为准。
 
 ## 归属与发行方式
 
 - 原项目：[Nancy / Agent ID Sniper](https://github.com/nancyc0813-maker/agentid-sniper)，原作者 [@nancy_c813](https://x.com/nancy_c813)。
 - 社区 Web 增强版维护：[@supra_bnb](https://x.com/supra_bnb)。Web 页脚、README 和 NOTICE 已标注双方来源。
 - 保留 `LICENSE` 中 Nancy 的 MIT 版权与完整许可；保留 `lib/vendor/element-sdk-LICENSE` 和 ABI 来源提交。不替换原作者版权。
-- 首个增强版版本为 `v0.1.0`；上游基线单独记录为 `v2.5.8 / 5bd5049`。
+- 首个增强版版本为 `v0.1.0`，当前正式版为 `v0.2.0`；上游基线单独记录为 `v2.5.8 / 5bd5049`。
 - 发行目标是 GitHub，`package.json` 的 `private: true` 可保留。
 
 ## 执行清单
@@ -19,20 +19,21 @@
 | 更新渠道与完整发行清单 | 本地验证通过 | 用户只跟随增强版正式发布标签与 `release.json`；校验 Web、钱包、NFT 等完整发行内容，更新与回退不覆盖数据。 |
 | 源码收齐、忽略规则与敏感信息检查 | 已知模式检查通过 | 首个提交包括增强版完整源码；完整历史和发布候选检查通过，不含配置、会话、Key 或日志。 |
 | CI、干净安装与升级/回退回归 | 本地验证通过 | Node.js 24 离线测试及 macOS 安装验证通过，不使用真实钱包或交易权限。 |
-| 发行提交与标签 | [查看正式发行](https://github.com/xie8266509/agentid-sniper-web/releases) | 代码审查、发行清单及 CI 通过后，从验证过的提交发布 `v0.1.0`。 |
-| GitHub Fork、线上 CI 与 Release | [Fork 已创建](https://github.com/xie8266509/agentid-sniper-web) | [线上 CI](https://github.com/xie8266509/agentid-sniper-web/actions) 通过后发布首版，发行内容必须与已验证源码一致。 |
+| 发行提交与标签 | [查看正式发行](https://github.com/xie8266509/agentid-sniper-web/releases) | `v0.2.0` 正式标签对应发行清单与通过检查的源码。 |
+| GitHub Fork、线上 CI 与 Release | [发行仓库](https://github.com/xie8266509/agentid-sniper-web) | [线上 CI](https://github.com/xie8266509/agentid-sniper-web/actions) 与 Release 记录可核对；发行内容必须与已验证源码一致。 |
 
 ## 更新渠道
 
 `origin` 指向增强版发行仓库，`upstream` 指向 Nancy 的原项目。维护者在独立分支审查、合并上游变更，经 PR 和 CI 后发布增强版；用户不会直接安装原作者仓库的扫描器单文件。
 
-用户一键更新绑定增强版正式发布标签和完整 `release.json` 文件清单。增强版版本和上游基线分别显示。发布校验、候选检查、源码变动保护、数据保留、备份与失败回退都须在首版发布前完成验证。
+用户一键更新绑定增强版正式发布标签和完整 `release.json` 文件清单。增强版版本和上游基线分别显示。每次发行均须检查发布清单、候选代码、源码变动保护、数据保留、备份与失败回退。
 
-## 首发边界
+## 支持边界
 
 - 已验证环境以 macOS 和 Node.js 24 为准；最低 Node.js 22.15，Git 必需。Linux/Windows 的增强版后台服务尚未完成验证。
 - 使用 `git clone` 安装；Download ZIP 缺少 `.git`，暂无一键更新保证。旧 Windows 根目录入口已停用，原始安装/启动脚本保存在 `docs/legacy/*.txt`；`setup.mjs` 已改为安全只读初始化兼容入口。
 - 首次配置保持只读模式、空钱包、零每日付费预算。自动交易必须由用户登录并核对规则后明确开启。
+- 多钱包测试不代表已验证 2–3 个真实币安账号同时在线实盘；新增钱包保持暂停和只监控，不自动启用交易。
 - NFT 自动卖出依赖 Element API Key/权限；无有效买单时等待。真实挂牌和成交尚未完成完整实盘验证，不宣传为已验证盈利或保证成交。
 - 首发不引用本机 `data/` 截图；公开截图需另外生成，先检查钱包、日志和敏感信息。
 
@@ -40,7 +41,7 @@
 
 `config.json`、整个 `data/`、钱包会话、市场 Key、运行日志、订单状态、更新备份、`node_modules/`、本机 CLI 安装目录和停止标记。首次公开提交前，额外核对 `.env`、密钥、备份和其他本机生成物，并检查 Git 历史。
 
-文档已提供安全反馈入口的条件说明；若 GitHub 私密漏洞报告尚未启用，不引导用户公开敏感复现材料。仓库创建后应核对该设置及 Issue 模板。
+文档已提供安全反馈入口的条件说明；若 GitHub 私密漏洞报告尚未启用，不引导用户公开敏感复现材料。维护者须持续核对该设置及 Issue 模板。
 
 ## 发布后维护
 

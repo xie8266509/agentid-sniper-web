@@ -3,6 +3,8 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import vm from 'node:vm';
 import { getPaidConfig, withinPaidBudget } from '../lib/config.mjs';
+import { marketOrderRecord, marketOrderState } from '../lib/sell-rules.mjs';
+import { scannerRuntimeDouble } from './watch-runtime-fixture.mjs';
 
 // Only evaluate the reviewed function bodies. Every RPC, CLI, file, and Telegram
 // dependency is an isolated double; no real wallet or network can be reached.
@@ -34,7 +36,7 @@ function harness(options = {}) {
   const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai' }).format(new Clock());
   const P = { at: clock, name: 'TEST', done: {}, old: false, wallets: 20, ph: [], replay: { data: '0x12345678', value: '0', payTok: USDT, payAmt: String(10n * 10n ** 18n), hot: 15, learned: 1, learnedAt: clock } };
   const S = { paid: { [target]: P }, dyn: [], migrated2: 1, paidSpend: { day, test: options.spent || 0 }, seenMints: {} };
-  const W = { name: 'test', addr: walletAddress, async baw(args) { events.swaps.push(args); return { j: { success: true } }; } };
+  const W = { id: 'test', name: 'test', profile: { id: 'test', address: walletAddress }, addr: walletAddress, async baw(args) { events.swaps.push(args); return { j: { success: true, data: { txHash: '0x' + 'ab'.repeat(32) } } }; } };
   const balanceChanges = options.noReward ? [] : [{ owner: walletAddress, contractAddress: reward, change: '1', tokenType: 'Erc20' }];
   const sandbox = {
     Date: Clock, MONITOR_ONLY: options.monitorOnly === true, FILE_COMMANDS_ENABLED: options.fileEnabled === true, MONITOR_NOTE: '仅监控',
@@ -42,7 +44,7 @@ function harness(options = {}) {
     S, WALLETS: [W], FORCE: new Set(options.hotGo ? [] : [target]), HOT: new Map(),
     USDT, NATIVE_BNB: BNB, WBNB: reward, FACTORY: reward, T_TRANSFER: transferTopic,
     CANDS: [['mint-test', '0x12345678']], INFRA: new Set(), CLAIM: new Set(), REGISTRY: '60b9262456de011f7d15a54cdd8c48baaa8b022f',
-    withinPaidBudget, w: word, wa: (a) => a.slice(2).padStart(64, '0'), big: (value) => value && value !== '0x' ? BigInt(value) : 0n,
+    getPaidConfig, marketOrderRecord, marketOrderState, withinPaidBudget, w: word, wa: (a) => a.slice(2).padStart(64, '0'), big: (value) => value && value !== '0x' ? BigInt(value) : 0n,
     badSel: (data) => bad.has(String(data || '').slice(0, 10).toLowerCase()), tokStr: () => '',
     async bnbUsd() { if (options.hotGo) clock += 240000; return 1000; },
     async codeOf() { return '0x'; }, async findFree() { return null; },
@@ -60,6 +62,7 @@ function harness(options = {}) {
     log(text) { events.logs.push(text); }, save() { events.writes.push('state'); },
     async rpc(method) {
       if (options.rpc) return options.rpc(method, events);
+      if (method === 'eth_getTransactionReceipt') return { status: '0x1', blockNumber: '0x10' };
       if (method === 'eth_getBalance') return '0x' + word(10n ** 18n);
       if (method === 'eth_getBlockNumber' || method === 'eth_blockNumber') return '0x1000';
       if (method === 'eth_call') return '0x';
@@ -88,6 +91,7 @@ function harness(options = {}) {
     readFileSync() { events.reads++; return JSON.stringify(options.jobs ?? []); },
     writeFileSync(path, data) { events.writes.push({ path, data }); },
   };
+  Object.assign(sandbox, scannerRuntimeDouble({ sandbox, wallet: W, state: S, events }));
   const context = vm.createContext(sandbox);
   vm.runInContext(helpers + addressSafety + learner + paid + manual + autoMint + (options.realPreview ? extract('async function previewExec(', 'async function poolOut(') : '') + (options.withQueue ? extract('const MQK =', '// 每個錢包可以打多份的') : '') + '\nglobalThis.api = { executeUsdtMint, prepareUsdtReplay, mintSimulationCheck, approvalSimulationCheck, validateFileJob, manualMints, paidLoop, learnReplay, safeAddrs, revokeOnFail, hasPositiveMintGain, autoMint, previewExec, queueMint: typeof queueMint === \'function\' ? queueMint : null };', context);
   return { api: sandbox.api, context, sandbox, events, P, S, W };
@@ -243,7 +247,7 @@ test('free mint does not execute for zero net gains or assets received by anothe
   }
   const h = harness(); seedHot(h); let executes = 0;
   h.W.baw = async (args) => {
-    if (args[1] === 'execute') { executes++; return { j: { success: true, data: { txHash: 'mock' } } }; }
+    if (args[1] === 'execute') { executes++; return { j: { success: true, data: { txHash: '0x' + 'ab'.repeat(32) } } }; }
     return { j: { success: true, data: { requestId: 'mock-preview', simulationResult: { balanceChanges: [{ owner: walletAddress, contractAddress: reward, change: '1', tokenType: 'Erc721' }], allowanceChanges: [], authorityChanges: [] } } } };
   };
   assert.match(await h.api.autoMint(target, 'mint-test', h.W, 0n), /^🤖/);
@@ -254,7 +258,7 @@ function attachMintWallet(h, { executeResult } = {}) {
   const calls = [];
   h.W.baw = async (args) => {
     calls.push(args);
-    if (args[1] === 'execute') return executeResult || { j: { success: true, data: { txHash: 'mock-fee-mint' } } };
+    if (args[1] === 'execute') return executeResult || { j: { success: true, data: { txHash: '0x' + 'ab'.repeat(32) } } };
     return { j: { success: true, data: { requestId: 'mock-mint-preview', simulationResult: {
       balanceChanges: [{ owner: walletAddress, contractAddress: reward, change: '1', tokenType: 'Erc721' }],
       allowanceChanges: [], authorityChanges: [],
@@ -334,7 +338,7 @@ test('concurrent fee mints for one wallet serialize preview and cannot overspend
   let release, previewCount = 0, executes = 0;
   const waiting = new Promise(resolve => { release = resolve; });
   h.W.baw = async (args) => {
-    if (args[1] === 'execute') { executes++; return { j: { success: true, data: { txHash: 'mock-concurrent' } } }; }
+    if (args[1] === 'execute') { executes++; return { j: { success: true, data: { txHash: '0x' + 'ab'.repeat(32) } } }; }
     previewCount++;
     await waiting;
     return { j: { success: true, data: { requestId: 'mock-preview', simulationResult: {
@@ -391,7 +395,7 @@ for (const feeFirst of [true, false]) {
     let release, previews = 0, executes = 0;
     const waiting = new Promise(resolve => { release = resolve; });
     h.W.baw = async args => {
-      if (args[1] === 'execute') { executes++; return { j: { success: true, data: { txHash: 'mock-shared-wallet-lock' } } }; }
+      if (args[1] === 'execute') { executes++; return { j: { success: true, data: { txHash: '0x' + 'ab'.repeat(32) } } }; }
       previews++;
       await waiting;
       return { j: { success: true, data: { requestId: 'shared-wallet-preview', simulationResult: {

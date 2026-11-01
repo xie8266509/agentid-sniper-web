@@ -22,6 +22,8 @@ async function fixture(t, options = {}) {
       if (command === 'wallet status') return { success: true, data: { status: connected ? 'CONNECTED' : 'UNCONNECTED' } };
       if (command === 'wallet address') return { success: true, data: { addresses: [{ binanceChainId: '56', address: walletAddress }] } };
       if (command === 'wallet settings') return { success: true, data: { devMode: { enabled: devMode, expiresAt: Math.floor(Date.now() / 1000) + 3600 }, sessionId: 'secret-to-hide' } };
+      if (command === 'wallet tx-lock') return { success: true, data: { status: 'UNLOCKED' } };
+      if (command === 'wallet agent-id') return { success: true, data: { claimed: false } };
       if (command === 'auth signin') return { success: true, data: { qrCodeId: 'mock-only', urlForWeb: 'https://web3.binance.com/en/agent-login?mock=1', pairingCode: '012345', expireAt: Date.now() + 300000 } };
       if (command === 'auth verify') { connected = true; return { success: true, data: { status: 'SUCCESS' } }; }
       if (command === 'wallet balance') return { success: true, data: [{ symbol: 'BNB', address: '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE', balance: '1.00' }] };

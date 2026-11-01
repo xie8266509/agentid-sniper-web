@@ -2,6 +2,9 @@
   "monitorOnly": true,
   "enableFileCommands": false,
   "wallets": [],
+  "portfolioBudget": {
+    "maxBnbPerDay": null
+  },
   "telegram": {
     "botToken": "",
     "chatId": "",

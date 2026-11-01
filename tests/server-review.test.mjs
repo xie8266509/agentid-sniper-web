@@ -10,6 +10,7 @@ import { createApp } from '../server.mjs';
 import { DEFAULT_CONFIG, sanitizeConfig, validateConfig } from '../lib/config.mjs';
 import { redact } from '../lib/control.mjs';
 import { buildStrategyStatus, positionState } from '../lib/strategy-status.mjs';
+import { normalizeWalletConfig } from '../lib/wallet-model.mjs';
 
 const A = '0x1111111111111111111111111111111111111111';
 const B = '0x2222222222222222222222222222222222222222';
@@ -31,6 +32,8 @@ async function app(t, custom = {}) {
     if (args[0] === 'wallet' && args[1] === 'status') return { success: true, data: { status: 'CONNECTED' } };
     if (args[0] === 'wallet' && args[1] === 'address') return { success: true, data: { addresses: [{ binanceChainId: '56', address: A }] } };
     if (args[0] === 'wallet' && args[1] === 'settings') return { success: true, data: { devMode: { enabled: true, expiresAt: Date.now() + 3600000 } } };
+    if (args[0] === 'wallet' && args[1] === 'tx-lock') return { success: true, data: { status: 'UNLOCKED' } };
+    if (args[0] === 'wallet' && args[1] === 'agent-id') return { success: true, data: { claimed: false } };
     if (args[0] === 'contract-call' && args[1] === 'preview') return { success: true, data: { requestId: 'mock-request', parsedTx: { to: B }, simulationResult: { authorityChanges: [] }, risks: [] } };
     if (args[0] === 'contract-call' && args[1] === 'execute') return { success: true, data: { txHash: 'mock-tx' } };
     return { success: true, data: {} };
@@ -196,7 +199,7 @@ test('holdings of a secondary-wallet-only token use that wallet state', async ()
   const source = readFileSync(join(root, 'lib', 'control.mjs'), 'utf8').replace(/^import .*;\n/gm, '').replace(/^export /gm, '').replaceAll('import.meta.url', JSON.stringify('file:///mock/lib/control.mjs')) + '\nserviceInfo = async () => ({running:false}); globalThis.getHoldings = holdingsData;';
   const config = { wallets: [{ name: 'first', address: A }, { name: 'second', address: B }], tokens: [{ sym: 'SAME', addr: A, only: B }] };
   const state = { tokens: { SAME: { lastBal: '111', last: { v: 11 } }, 'second:SAME': { lastBal: '222', last: { v: 22 } } } };
-  const sandbox = { dirname, join, fileURLToPath, buildStrategyStatus, positionState, createNftMarket: () => ({ snapshot: () => ({ markets: {}, marketSync: {} }) }), execFile() { throw new Error('Unexpected process'); }, promisify() { return () => { throw new Error('Unexpected process'); }; }, readConfig: () => config, readFileSync: () => JSON.stringify(state) };
+  const sandbox = { dirname, join, fileURLToPath, normalizeWalletConfig, buildStrategyStatus, positionState, createNftMarket: () => ({ snapshot: () => ({ markets: {}, marketSync: {} }) }), execFile() { throw new Error('Unexpected process'); }, promisify() { return () => { throw new Error('Unexpected process'); }; }, readConfig: () => config, readFileSync: () => JSON.stringify(state) };
   vm.runInNewContext(source, sandbox);
   const holding = (await sandbox.getHoldings()).tokens[0];
   assert.equal(holding.wallet, 'second'); assert.equal(holding.quantity, '222'); assert.equal(holding.value, 22);

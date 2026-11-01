@@ -1,13 +1,14 @@
 # Agent ID Sniper Web
 
-**v0.1.0 社区 Web 增强版**：在本机管理 Binance Agentic Wallet 的 Agent ID 铸造监控、持仓和卖出规则。
+**v0.2.0 社区 Web 增强版 · 2026-11-01 正式发行**：在本机管理多个 Binance Agentic Wallet 的 Agent ID 铸造监控、持仓和卖出规则。
 
 基于 [Nancy 的 Agent ID Sniper](https://github.com/nancyc0813-maker/agentid-sniper)。原作者 [@nancy_c813](https://x.com/nancy_c813)，Web 增强版维护 [@supra_bnb](https://x.com/supra_bnb)。这是社区维护项目，不是 Binance 官方产品。
 
 ## 功能
 
-- Web 控制台：运行概览、钱包 App 登录、策略配置、持仓、手动预演与运行日志。
-- 每个钱包使用独立的本地 CLI 会话，Web、登录脚本和扫描器共用同一隔离方式。
+- 钱包中心直接创建、App 配对、核验绑定；全局钱包筛选覆盖持仓、策略与交易记录。
+- 每个钱包使用稳定 `walletId` 和独立 CLI 会话；旧钱包保留原会话目录与 `instanceId`，改名或重排不更换身份。
+- 全局自动总闸与每钱包模式、暂停和功能开关共同控制执行；钱包预算和 ERC20 规则可独立配置或复制全局模板。
 - ERC20 精确数量卖出、阶梯止盈与长抱；按订单和本笔链上凭证确认结果，未知结果停止自动重发。
 - NFT 链上持仓核验、Element 参考地板价、固定价挂牌、目标净收入与跟踪止盈规则。
 - Web 后台独立检查增强版更新，一键验证、备份、更新及回退；扫描器停止时仍能检查。
@@ -28,15 +29,19 @@ npm run web:start
 
 打开 [http://127.0.0.1:4317](http://127.0.0.1:4317)。控制台只监听本机。
 
-`setup` 会安装项目内的 Binance 官方 CLI，并在配置不存在时创建只读默认配置：空钱包、`monitorOnly: true`、每日付费预算为 `0`。已有配置会保留。启动 Web 不会自动启动扫描器或启用交易。
+`setup` 会安装项目内的 Binance 官方 CLI，并在配置不存在时创建只读默认配置：空钱包、`monitorOnly: true`、每钱包每日付费预算为 `0`，`portfolioBudget.maxBnbPerDay: null` 表示未设全部钱包总上限。已有配置会保留。启动 Web 不会自动启动扫描器或启用交易。
 
-首次使用，在「钱包管理」获取配对链接，用对应币安 App 核对配对码并完成登录，再导入真实 BSC 地址。需要签名或交易时，在 App 的 Agentic Wallet 设置中开启开发者模式。项目不要求输入私钥或助记词。
+首次使用，在「钱包」点击「添加钱包」→「创建并配对」，用对应币安 App 核对配对码，再核验并绑定真实 BSC 地址。已领取的 Agent ID 使用官方返回的真实 handle，未领取时留空。新钱包绑定后仍为 `paused: true`、`mode: monitor`，不会自动启用。需要签名或交易时，在 App 的 Agentic Wallet 设置中开启开发者模式。项目不要求输入私钥或助记词。
 
 首发使用 Git 克隆安装；Download ZIP 缺少 `.git`，不承诺一键更新可用。根目录的旧 Windows 安装/启动入口已停用，只显示支持范围和 README 提示；原脚本已作为不可执行的文本归档于 [docs/legacy](docs/legacy/)。这些入口不会安装依赖、启动扫描器或执行交易。
 
-## 启用策略
+## 多钱包与启用策略
 
-先在 Web 核对钱包、单项目和每日预算，再明确启动自动模式。自动模式会按保存的规则发送链上交易；只读模式不执行自动铸造或买卖。首次 NFT 规则保存为停用草稿，启用和初次授权需要单独确认。
+先核对钱包、单项目、每钱包每日预算和全部钱包总预算，再打开全局自动总闸、选择钱包模式并解除暂停。`monitor` 只监控，`sell-only` 仅允许卖出，`auto` 按规则自动交易；`autoMint`、`autoSellTokens`、`autoSellNfts` 可分别关闭。手动与 NFT 预演、确认固定原钱包，切换钱包后需重新预演。
+
+总预算 `portfolioBudget.maxBnbPerDay` 为 `null` 时不设总限额，为 `0` 时禁止付费操作；仍受每钱包预算限制。发送前原子预占额度，不明结果保留预占并阻止自动重发；默认最多两个钱包并发，同一钱包串行。归档保留会话、额度和订单；有未决操作时须先核对。暂停不撤销已签名 NFT 挂单，须单独撤单。首次 NFT 规则保存为停用草稿，启用和初次授权需要单独确认。
+
+当前本地测试不代表已验证 2–3 个真实币安账号同时在线实盘。
 
 NFT 自动卖出需要具备相应权限的 [Element API Key](https://element.market/naas)，钱包须可用并满足预演要求。目前支持 BSC ElementEx 普通固定价挂牌和可完整核验的单品 WBNB 买单（收入按已验证编码可为 BNB 或 WBNB）；未知编码、额外授权或无法核验的结果会暂停。没有有效买单时等待，不用地板价代替可成交报价。**NFT 真实挂牌与成交尚未完成完整实盘验证。**
 
@@ -69,5 +74,5 @@ npm test
 ## 贡献与许可
 
 - [贡献说明](CONTRIBUTING.md) · [安全反馈](SECURITY.md) · [变更记录](CHANGELOG.md)
-- [发布准备状态](README.opensource.md) · [上游 README 历史快照](docs/UPSTREAM_README.md)
+- [发布与维护](README.opensource.md) · [上游 README 历史快照](docs/UPSTREAM_README.md)
 - 本项目沿用 [MIT License](LICENSE)，保留 Nancy 的原始版权与许可；Element ABI 的第三方许可见 [NOTICE](NOTICE) 和 [Element SDK License](lib/vendor/element-sdk-LICENSE)。

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { decodeAbiUint } from '../lib/nft-codec.mjs';
 import * as sellRules from '../lib/sell-rules.mjs';
 import { DEFAULT_RULES } from '../lib/config.mjs';
@@ -171,10 +172,10 @@ const executionSource = watch.slice(watch.indexOf('function positionFor('), watc
 const word = (value) => BigInt(value).toString(16).padStart(64, '0');
 function executionHarness({ decimals = 6, status = 'PENDING', after, submit, refund, receiptOut, missingReceipt = false, storageFail = false, missingDecimals = false, ruleOverrides = {}, cost = 10, value = 30, seed = {} } = {}) {
   let balance = 100n * 10n ** BigInt(decimals), statusValue = status;
-  const seen = { swaps: [], lists: [], saved: [], messages: [] };
+  const seen = { swaps: [], lists: [], saved: [], messages: [], walletLocks: [], blocked: [] };
   const token = { sym: 'TEST', addr: tokenAddress, cost };
-  const S = { tokens: {}, trades: [], dyn: [] };
-  const W = { addr: wallet, name: 'test', async baw(args) {
+  const S = { tokens: {}, trades: [], dyn: [], costWalletAddress: wallet };
+  const W = { id: 'test-wallet', profile: { id: 'test-wallet', address: wallet }, addr: wallet, name: 'test', legacyName: 'test', async baw(args) {
     if (args[1] === 'swap') {
       seen.swaps.push(args);
       if (submit) return submit(args);
@@ -184,8 +185,30 @@ function executionHarness({ decimals = 6, status = 'PENDING', after, submit, ref
     if (statusValue === 'FINISHED' && after !== undefined) balance = after;
     return { t: 'status', j: { success: true, data: { list: [{ orderId: args.at(-1), status: statusValue, toTokenActualQty: '0.01', txHash: '0x' + '4'.repeat(64), refund }] } } };
   } };
+  // Execution plumbing is an in-memory boundary double. The real shared file
+  // locks, unknown-result gate and crash recovery are exercised by wallet-core
+  // and scanner-recovery tests; these assertions keep testing sell bookkeeping.
+  const walletScope = new AsyncLocalStorage(), queues = new Map();
+  const withWalletExecution = async (profile, work, options = {}) => {
+    assert.equal(profile.id, W.id);
+    seen.walletLocks.push({ walletId: profile.id, kind: options.kind, allowBlocked: options.allowBlocked === true });
+    if (walletScope.getStore() === profile.id) return work();
+    const prior = queues.get(profile.id) || Promise.resolve();
+    const running = prior.catch(() => {}).then(() => walletScope.run(profile.id, work));
+    queues.set(profile.id, running);
+    try { return await running; } finally { if (queues.get(profile.id) === running) queues.delete(profile.id); }
+  };
   const context = vm.createContext({
-    ...sellRules, decodeAbiUint, MONITOR_ONLY: false, S, TOKENS: [token], ME: wallet,
+    ...sellRules, decodeAbiUint, structuredClone, MONITOR_ONLY: false, S, TOKENS: [token], ME: wallet,
+    DIR: '/isolated', withWalletExecution,
+    canWallet: selected => selected.id === W.id,
+    recoverScannerWallet: async () => null,
+    rulesFor: () => context.RULE,
+    legacyAliases: selected => Object.hasOwn(selected, 'legacyNames') ? selected.legacyNames : [selected.legacyName || selected.name],
+    tokenCostFor: (_selected, item) => Number(item.cost) || 0,
+    async markWalletBlocked(profile, reason) { seen.blocked.push({ walletId: profile.id, reason }); },
+    async clearWalletBlocked(profile, { reference }) { assert.equal(profile.id, W.id); assert.ok(reference); },
+    logWallet() {}, syncWalletProfiles: () => [W],
     WALLETS: [W], RULE: { ...rules, notifyX: [5, 10], ...ruleOverrides },
     NATIVE_BNB: '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
     wa: (a) => a.slice(2).padStart(64, '0'),
