@@ -15,7 +15,7 @@ import { normalizeWalletConfig, getWalletId, resolveWallet, effectiveWalletConfi
 import { collectWalletReadiness, assertAnyWalletReady, readinessConfigKey } from './lib/wallet-readiness.mjs';
 import { withWalletExecution, walletExecutionView, markWalletBlocked, clearWalletBlocked, acquireWalletMaintenance } from './lib/wallet-executor.mjs';
 import { createWalletBudget } from './lib/wallet-budget.mjs';
-import { nftRpc } from './lib/nft-holdings.mjs';
+import { createWebRpc } from './lib/nft-holdings.mjs';
 import { createWalletBalanceReader } from './lib/wallet-balances.mjs';
 import { reconcileScannerPending } from './lib/scanner-recovery.mjs';
 
@@ -59,7 +59,8 @@ export function createApp(overrides = {}) {
     const wallet = wallets.find(wallet => wallet.id === identity.id);
     return wallet ? String(wallet.address || '').toLowerCase() === identity.address && (wallet.draft === true) === identity.draft : !wallets.length && identity.id === 'bootstrap-wallet' && !identity.address;
   };
-  const balanceReader = createWalletBalanceReader({ rpc: overrides.rpc || nftRpc, isCurrent: balanceIdentityCurrent });
+  const rpc = overrides.rpc || createWebRpc({ readConfig: config });
+  const balanceReader = createWalletBalanceReader({ rpc, isCurrent: balanceIdentityCurrent });
   const walletAt = index => config().wallets[index] || { id: 'bootstrap-wallet', name: '钱包 1', address: '', bawDir: 'data/wallets/wallet-1' };
   const keyAt = index => getWalletId(walletAt(index), index);
   const executor = (wallet, work, options = {}) => durableRuntime ? withWalletExecution(wallet, work, { root: appRoot, ...options }) : work();
@@ -100,7 +101,7 @@ export function createApp(overrides = {}) {
   const getTelegramMonitor = () => telegramMonitor ||= createTelegramMonitor({ root: appRoot, readConfig: deps.readConfig });
   let nftTrading = overrides.nftTrading;
   const getNftTrading = () => nftTrading ||= createLocalNftTrading({
-    root: appRoot, readConfig: config, runWallet: deps.runWallet,
+    root: appRoot, readConfig: config, runWallet: deps.runWallet, rpc,
     onWalletResolved: async (rule, reference) => {
       const wallet = config().wallets.find(wallet => wallet.address.toLowerCase() === rule.walletAddress);
       if (!durableRuntime || !wallet || !reference) return;
@@ -383,14 +384,13 @@ export function createApp(overrides = {}) {
         const pending = scannerPending(wallet);
         if (!pending) throw failure(409, '请在原代币或 NFT 订单中核对；不能跳过订单状态直接解锁');
         if (suppliedHash && suppliedHash.toLowerCase() !== pending.txHash?.toLowerCase()) throw failure(409, '只能核验原提交记录或官方订单关联的交易哈希');
-        const outcome = await reconcileScannerPending({ wallet, pending, runWallet: (args, options = {}) => deps.runWallet(args, { ...options, walletId: wallet.id, walletIndex: indexOf(wallet.id) }), rpc: overrides.rpc || nftRpc, budget, root: appRoot });
+        const outcome = await reconcileScannerPending({ wallet, pending, runWallet: (args, options = {}) => deps.runWallet(args, { ...options, walletId: wallet.id, walletIndex: indexOf(wallet.id) }), rpc, budget, root: appRoot });
         return { ...outcome, message: outcome.reason || (outcome.resolved ? '原订单凭证已核验，不会重复发送' : '原订单仍待核验，继续保留额度') };
       }
       if (!/^0x[0-9a-f]{64}$/i.test(details.txHash || '')) return { resolved: false, message: '缺少与原提交关联的交易凭证，保持待核对；不能用同参数的历史交易解除等待' };
       const txHash = suppliedHash || details.txHash;
       if (!/^0x[0-9a-f]{64}$/i.test(txHash || '')) return { resolved: false, message: '尚无可核验的交易哈希，请先在币安 App 查找这笔交易' };
       if (details.txHash && txHash.toLowerCase() !== details.txHash.toLowerCase()) throw failure(409, '交易哈希与上笔提交记录不一致');
-      const rpc = overrides.rpc || nftRpc;
       let transaction, receipt, chain;
       try { [transaction, receipt, chain] = await Promise.all([rpc('eth_getTransactionByHash', [txHash]), rpc('eth_getTransactionReceipt', [txHash]), rpc('eth_chainId', [])]); }
       catch { throw failure(502, '暂时无法取得链上凭证，继续保留待核对状态'); }
@@ -534,7 +534,7 @@ export function createApp(overrides = {}) {
             data = { ...data, walletId: selected.id, lines: (data.lines || []).filter(line => mentions(line, selected) || !current.wallets.some(wallet => mentions(line, wallet))) };
           }
         }
-        else if (req.method === 'GET' && path === '/api/holdings') data = { ...await deps.holdingsData({ force: url.searchParams.get('refresh') === '1' }), nftTrading: await getNftTrading().view() };
+        else if (req.method === 'GET' && path === '/api/holdings') data = { ...await deps.holdingsData({ force: url.searchParams.get('refresh') === '1', rpc }), nftTrading: await getNftTrading().view() };
         else if (req.method === 'GET' && path === '/api/nft/trading') data = await getNftTrading().view();
         else if (req.method === 'POST' && path.startsWith('/api/nft/trading/')) {
           if (serviceBusy) throw failure(409, '请等待服务操作完成，再修改 NFT 自动卖出');

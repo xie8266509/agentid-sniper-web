@@ -155,6 +155,19 @@ test('USDT recharge is persisted when funds never arrive or mint simulation fail
   }
 });
 
+test('an unknown USDT balance after a confirmed recharge keeps its original evidence and blocks the next recharge attempt', async () => {
+  let balanceReads = 0;
+  const h = harness({ contractCall: (contract, data) => contract === USDT && data.startsWith('0x70a08231') ? ++balanceReads === 1 ? '0x' + word(0) : null : undefined });
+  const run = () => h.api.executeUsdtMint(h.W, { to: target, data: '0x12345678', need: 10n * 10n ** 18n });
+  await assert.rejects(run(), /結果不明.*换币后无法核验 USDT 余额/);
+  const pending = structuredClone(h.S.walletPending.test);
+  assert.equal(pending.kind, 'market-order'); assert.equal(pending.phase, 'verified'); assert.match(pending.txHash, /^0x[a-f0-9]{64}$/);
+  assert.ok(h.events.reservations.has(pending.reservationId)); assert.equal(h.events.previews.length, 0);
+  await assert.rejects(run(), /結果不明.*待核对交易/);
+  assert.equal(h.events.swaps.length, 1); assert.equal(h.events.reservationCalls.length, 1); assert.equal(balanceReads, 2);
+  assert.deepEqual(structuredClone(h.S.walletPending.test), pending); assert.ok(h.events.reservations.has(pending.reservationId));
+});
+
 test('replay quantity scaling includes 5% allowance and native BNB in the strict project cap', () => {
   const h = harness();
   const replay = { data: '0x12345678' + word(1) + word(0) + word(2n * 10n ** 18n), payAmt: String(2n * 10n ** 18n), value: String(2n * 10n ** 15n) };

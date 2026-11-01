@@ -16,6 +16,7 @@ import { socialSelectionHash } from '../lib/social-candidates.mjs';
 import * as mintPolicy from '../lib/mint-policy.mjs';
 import { createAgentMaturity } from '../lib/agent-maturity.mjs';
 import { createMintParticipation } from '../lib/mint-participation.mjs';
+import { createRpcClient } from '../lib/rpc-client.mjs';
 
 export const raw = readFileSync(new URL('../watch.mjs', import.meta.url), 'utf8');
 export const VIRTUAL_ROOT = '/isolated/watch-monitor';
@@ -50,6 +51,9 @@ globalThis.api = {
   const seen = { cliFactories: [], cliCalls: [], network: [], writes: [], directories: [], logs: [], errors: [] };
   const timers = [];
   const sandbox = {
+    // Always keep the VM's explicit fake fetch. Never let the imported pool
+    // fall back to host fetch, even when a scanner fixture is misconfigured.
+    createRpcClient: options => createRpcClient({ ...options, minIntervalMs: 0, networkCooldownMs: 0, sleep: async () => {}, fetchImpl: options.fetchImpl }),
     socialSelectionHash, createAgentMaturity, createMintParticipation, Buffer, structuredClone, dirname, join, fileURLToPath, withinPaidBudget, decodeAbiUint, createHash, ...sellRules, ...mintPolicy, ...walletReadiness,
     normalizeWalletConfig: input => walletModel.normalizeWalletConfig(JSON.parse(JSON.stringify(input))),
     getWalletId: walletModel.getWalletId,
@@ -80,8 +84,11 @@ globalThis.api = {
       assert.ok(!String(url).includes('telegram.org'), 'Telegram calls must not run in this harness');
       const request = JSON.parse(options.body);
       seen.network.push(request);
-      if (!rpcResponse) throw new Error('Unexpected mocked network request: ' + request.method);
-      return { async json() { return { result: await rpcResponse(request) }; } };
+      if (!rpcResponse && request.method !== 'eth_chainId') throw new Error('Unexpected mocked network request: ' + request.method);
+      return { ok: true, status: 200, async json() {
+        const respond = async entry => ({ jsonrpc: '2.0', id: entry.id, result: entry.method === 'eth_chainId' ? '0x38' : await rpcResponse(entry) });
+        return Array.isArray(request) ? Promise.all(request.map(respond)) : respond(request);
+      } };
     },
     appendFileSync(path, value) { seen.logs.push({ path, value }); },
     writeFileSync(path, value) { if (path !== join(VIRTUAL_ROOT, 'data', 'watch.lock')) seen.writes.push({ path, value }); memoryFiles.set(path, String(value)); },

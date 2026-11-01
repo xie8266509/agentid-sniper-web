@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { makeWatchBaw } from './lib/wallet-cli.mjs';
 import { getPaidConfig, getRuleConfig, withinPaidBudget } from './lib/config.mjs';
 import { decodeAbiUint } from './lib/nft-codec.mjs';
+import { createRpcClient } from './lib/rpc-client.mjs';
 import { normalizeWalletConfig, getWalletId, effectiveWalletConfig, walletCanAutomate } from './lib/wallet-model.mjs';
 import { assessWalletReadiness, currentWalletReadiness, readWalletReadinessSession, readinessConfigKey, walletHasAutomaticWork } from './lib/wallet-readiness.mjs';
 import { withWalletExecution, markWalletBlocked, clearWalletBlocked, assertWalletMaintenanceIdle } from './lib/wallet-executor.mjs';
@@ -182,12 +183,11 @@ async function lockNote(c, wAddr) { /* 買到的幣現在能不能轉：模擬�
 }
 async function tg(text) { if (/^🛒/u.test(text)) { const m = text.match(/\n(0x[a-fA-F0-9]{40})\n/); if (m) { text += await riskNote(m[1].toLowerCase()); const wn = (text.match(/^🛒 \[([^\]]+)\]/u) || [])[1]; const W = WALLETS.find((x) => x.name === wn); if (W) text += await lockNote(m[1].toLowerCase(), W.addr).catch(() => ''); } } log('TG: ' + text.replace(/\n/g, ' | ')); toGroup(text).catch(() => {}); if (!TG || (!CONFIG.notifyAll && !sendable(text))) return; try { await fetch(`https://api.telegram.org/bot${TG.a}/sendMessage`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ chat_id: TG.b, text, disable_web_page_preview: true, disable_notification: !important(text) }), signal: AbortSignal.timeout(10000) }); } catch {} }
 
-const RPCS = Array.isArray(CONFIG.rpcs) && CONFIG.rpcs.length ? CONFIG.rpcs : ['https://bsc-dataseed.bnbchain.org', 'https://bsc-rpc.publicnode.com', 'https://bsc.publicnode.com', 'https://bsc.drpc.org', 'https://1rpc.io/bnb', 'https://binance.llamarpc.com']; // 可在 config.json 的 rpcs 换成自己的节点（公共节点常被限流）
-let ri = 0;
-async function rpc(method, params) {
-  let last; for (let i = 0; i < RPCS.length; i++) { const u = RPCS[(ri + i) % RPCS.length]; try { const r = await (await fetch(u, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }), signal: AbortSignal.timeout(12000) })).json(); if (r.error) throw new Error(r.error.message); ri = (ri + i) % RPCS.length; return r.result; } catch (e) { last = e; } }
-  throw last;
-}
+const RPCS = Array.isArray(CONFIG.rpcs) && CONFIG.rpcs.length ? CONFIG.rpcs : ['https://bsc-dataseed.bnbchain.org', 'https://bsc-rpc.publicnode.com', 'https://bsc.drpc.org', 'https://1rpc.io/bnb', 'https://binance.llamarpc.com'];
+// Every scanner read shares one bounded queue and provider cooldown, including
+// logs, block receipts and batch evidence. Wallet writes still use the CLI.
+const RPC_CLIENT = createRpcClient({ urls: RPCS, expectedChainId: 56, fetchImpl: (url, options) => fetch(url, options), maxConcurrent: 3, minIntervalMs: 250 });
+const rpc = (method, params, options) => RPC_CLIENT.request(method, params, options);
 const w = (n) => BigInt(n).toString(16).padStart(64, '0');
 const wa = (a) => a.toLowerCase().replace(/^0x/, '').padStart(64, '0');
 const call = (to, data) => rpc('eth_call', [{ to, data }, 'latest']).catch(() => null);
@@ -1036,13 +1036,25 @@ async function inscScan() {
 const MINTS = new Map(), mintChecked = new Map();
 const ZERO32 = '0x' + '0'.repeat(64);
 async function mintLogs(from, to) {
-  // 1) drpc 支援不帶地址的 getLogs（最省流量）
-  try { const r = await (await fetch('https://bsc.drpc.org', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getLogs', params: [{ fromBlock: '0x' + from.toString(16), toBlock: '0x' + to.toString(16), topics: [T_TRANSFER, ZERO32] }] }), signal: AbortSignal.timeout(10000) })).json(); if (Array.isArray(r.result)) return r.result; } catch {}
-  // 2) 退而求其次：抓整個區塊的收據自己過濾
-  const out = [], nodes = ['https://bsc-dataseed.bnbchain.org', 'https://bsc-dataseed1.defibit.io', 'https://bsc-dataseed1.ninicoin.io', 'https://bsc-rpc.publicnode.com'];
-  await Promise.all(Array.from({ length: to - from + 1 }, (_, i) => from + i).map(async (b, i) => {
-    for (let k = 0; k < nodes.length; k++) { try { const r = await (await fetch(nodes[(i + k) % nodes.length], { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getBlockReceipts', params: ['0x' + b.toString(16)] }), signal: AbortSignal.timeout(12000) })).json(); if (Array.isArray(r.result)) { for (const rc of r.result) for (const l of rc.logs || []) if (l.topics?.[0] === T_TRANSFER && l.topics[1] === ZERO32 && l.topics[2]) out.push(l); return; } } catch {} }
+  // Some nodes require an address filter. Fall back to receipts only for a
+  // capability failure; an exhausted pool must wait instead of amplifying load.
+  try {
+    const result = await rpc('eth_getLogs', [{ fromBlock: '0x' + from.toString(16), toBlock: '0x' + to.toString(16), topics: [T_TRANSFER, ZERO32] }]);
+    if (!Array.isArray(result)) throw new Error('铸造事件返回格式无效');
+    return result;
+  } catch (error) { if (error.retryAfterMs > 0) throw error; }
+  const out = [], nums = Array.from({ length: to - from + 1 }, (_, i) => from + i);
+  let index = 0, failure;
+  await Promise.all(Array.from({ length: Math.min(3, nums.length) }, async () => {
+    while (!failure && index < nums.length) {
+      try {
+        const block = nums[index++], receipts = await rpc('eth_getBlockReceipts', ['0x' + block.toString(16)]);
+        if (!Array.isArray(receipts) || receipts.some(receipt => !receipt || !Array.isArray(receipt.logs))) throw new Error('铸造事件区块收据不完整，保留扫描进度');
+        for (const receipt of receipts) for (const entry of receipt.logs) if (entry.topics?.[0] === T_TRANSFER && entry.topics[1] === ZERO32 && entry.topics[2]) out.push(entry);
+      } catch (error) { failure ||= error; }
+    }
   }));
+  if (failure) throw failure;
   return out;
 }
 async function fullCode(c, code) { /* 審查修正（FAGENT 漏掉的原因）：代理合約一律追到背後的真正程式——EIP-1967、Beacon 槽位、程式裡寫死的 Beacon／實作地址、最小代理（EIP-1167） */
@@ -1056,7 +1068,7 @@ async function fullCode(c, code) { /* 審查修正（FAGENT 漏掉的原因）�
   return code;
 }
 async function mintScan(head) {
-  if (!S.mintBlock || head - S.mintBlock > 300) S.mintBlock = head - 5;
+  if (!S.mintBlock) S.mintBlock = head - 5;
   const to = Math.min(head, S.mintBlock + 60); if (to <= S.mintBlock) return;
   const logs = await mintLogs(S.mintBlock + 1, to); S.mintBlock = to;
   const now = Date.now();
@@ -1161,30 +1173,44 @@ function pumpBG() { while (bgRun < 3 && BG.length) { const f = BG.shift(); bgRun
 async function scanNew(head) {
   if (!S.lastBlock) S.lastBlock = head - 5;
   if (head - S.lastBlock > 1500) { log(`掃描落後太多（${head - S.lastBlock} 塊），跳到最新`); S.lastBlock = head - 200; }
-  // BSC 現在約 0.45 秒一個區塊（每分鐘 ~130 塊），以前一次只掃 40 塊會越落越後（曾落後 2.5 小時）→ 改成多節點並行抓
+  // Small batches keep block following within the shared HTTP request budget;
+  // only a contiguous verified prefix can advance the scanner checkpoint.
   const to = Math.min(head, S.lastBlock + 400);
   const nums = []; for (let b = S.lastBlock + 1; b <= to; b++) nums.push(b);
-  const blocks = new Map(); let idx = 0;
-  const fetchBlk = async (b) => { for (let k = 0; k < RPCS.length; k++) { const u = RPCS[(b + k) % RPCS.length]; try { const r = await (await fetch(u, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getBlockByNumber', params: ['0x' + b.toString(16), true] }), signal: AbortSignal.timeout(15000) })).json(); if (r.result) return r.result; } catch {} } return null; };
-  await Promise.all(Array.from({ length: 24 }, async () => { while (idx < nums.length) { const b = nums[idx++]; const blk = await fetchBlk(b); if (blk) { countHot(blk.transactions); } if (blk) blocks.set(b, blk.transactions.filter((t) => !t.to || ((t.input || '').length > 2000 && ((t.input || '').toLowerCase().includes(REGISTRY) || DEPLOYERS.includes(t.to.toLowerCase()))))); else blocks.set(b, null); } }));
+  const blocks = new Map(); let idx = 0, failed = false;
+  await Promise.all(Array.from({ length: 2 }, async () => {
+    while (!failed && idx < nums.length) {
+      const batch = nums.slice(idx, idx + 4); idx += batch.length;
+      let results;
+      try { results = await RPC_CLIENT.batch(batch.map(b => ({ method: 'eth_getBlockByNumber', params: ['0x' + b.toString(16), true] })), { timeoutMs: 15000 }); }
+      catch { failed = true; break; }
+      for (const [index, block] of batch.entries()) {
+        const transactions = results[index]?.transactions;
+        if (!Array.isArray(transactions) || transactions.some(tx => !tx || typeof tx !== 'object')) { blocks.set(block, null); failed = true; continue; }
+        countHot(transactions);
+        blocks.set(block, transactions.filter(t => !t.to || ((t.input || '').length > 2000 && ((t.input || '').toLowerCase().includes(REGISTRY) || DEPLOYERS.includes(t.to.toLowerCase())))));
+      }
+    }
+  }));
   let done = S.lastBlock;
   for (const b of nums) { if (blocks.get(b) == null) break; done = b; }
   if (done === S.lastBlock && nums.length) { log('scan 抓區塊失敗 ' + nums[0]); return; }
   S.scanBatchLag = head - done;
-  for (let b = S.lastBlock + 1; b <= done; b++) {
+  blockLoop: for (let b = S.lastBlock + 1; b <= done; b++) {
     for (const tx of blocks.get(b) || []) {
       // 新合約有三種出生方式：①直接部署 ②透過 CREATE2 部署器（灯笼镇就是這種）③由別的工廠合約建立
       const inp = (tx.input || '').toLowerCase();
       if (tx.to && !(inp.length > 2000 && (inp.includes(REGISTRY) || DEPLOYERS.includes(tx.to.toLowerCase())))) continue;
       let cs = [];
       try {
-        if (!tx.to) { const rc = await rpc('eth_getTransactionReceipt', [tx.hash]); if (rc?.contractAddress) cs = [rc.contractAddress.toLowerCase()]; }
+        if (!tx.to) { const rc = await rpc('eth_getTransactionReceipt', [tx.hash]); if (!rc) throw new Error('部署收据尚未取得'); if (rc.contractAddress) cs = [rc.contractAddress.toLowerCase()]; }
         else if (tx.to.toLowerCase() === '0x4e59b44847b379578588920ca78fbf26c0b4956c') { const salt = inp.slice(2, 66), init = inp.slice(66); cs = ['0x' + keccakHex('ff' + tx.to.slice(2).toLowerCase() + salt + keccakHex(init)).slice(24)]; }
-        else { const rc = await rpc('eth_getTransactionReceipt', [tx.hash]); if (rc?.status !== '0x1') continue; const as = [...new Set((rc.logs || []).map((l) => l.address.toLowerCase()))]; for (const a of as) { const before = await rpc('eth_getCode', [a, '0x' + (b - 1).toString(16)]).catch(() => '0x'); if (!before || before === '0x') cs.push(a); } }
-      } catch { continue; }
+        else { const rc = await rpc('eth_getTransactionReceipt', [tx.hash]); if (rc?.status === '0x0') continue; if (rc?.status !== '0x1' || !Array.isArray(rc.logs)) throw new Error('工厂部署收据尚未完整取得'); const as = [...new Set(rc.logs.map((l) => l.address.toLowerCase()))]; for (const a of as) { const before = await rpc('eth_getCode', [a, '0x' + (b - 1).toString(16)]); if (typeof before !== 'string') throw new Error('部署历史代码读取失败'); if (before === '0x') cs.push(a); } }
+      } catch (error) { log(`scan 部署核验失败，保留区块 ${b}：${error.message}`); done = b - 1; break blockLoop; }
       for (const c of cs) try {
         if (S.seenMints[c]) continue;
-        let code = (await rpc('eth_getCode', [c, 'latest'])) || '';
+        let code = await rpc('eth_getCode', [c, 'latest']);
+        if (typeof code !== 'string') throw new Error('部署代码读取失败');
         code = await fullCode(c, code); /* 代理合約（各種寫法）都追到背後真正的程式 */
         if (!code.toLowerCase().includes(REGISTRY) && !code.includes('9f92d0dd')) continue;
         S.seenMints[c] = ts(); noteDeploy(code); S.deployer = S.deployer || {}; S.deployer[c] = (tx.from || '').toLowerCase(); S.depFrom = S.depFrom || {}; S.depFrom[c] = S.deployer[c]; noteDev(S.deployer[c], c);
@@ -1204,7 +1230,7 @@ async function scanNew(head) {
         if (!ok.length) { S.paid = S.paid || {}; S.paid[c] = { at: Date.now(), name, done: {} }; }
         await tg(`🆕 發現新的 Agent ID 專屬合約${name ? '：' + name : ''}\n${c}\n${MONITOR_ONLY ? MONITOR_NOTE : ok.length ? '✅ 模擬免費可鑄：' + ok.join('、') + '\n' + minted : `⚪ 現在不是免費的（${pay}，或還沒開）→ 已加入追蹤：\n· 開放後若免費或手續費 ≤0.001 BNB → 自動打\n· 付費 → 進度達到配置門檻（或讀不到進度但很多人在打）且每個錢包 ≤20U → 自動打`}\nhttps://bscscan.com/address/${c}`);
         }); // 背景處理新合約（模擬、鑄造、通知），掃描不用等
-      } catch {}
+      } catch (error) { log(`scan 合约核验失败，保留区块 ${b}：${error.message}`); done = b - 1; break blockLoop; }
     }
   }
 
@@ -1222,13 +1248,10 @@ const T_BEACON_UP = '0x1cf3b03a6cf19fa2baba4df148e9dcabedea7f8a5c07840e207e5c089
 const T_UPGRADED = '0xbc7cd75a20ee27fd9adebab32041f755214dbc6bffa90cc0225b39da2e5c2d3b';  // Upgraded(address)
 const implCache = new Map();
 const VAULT_FACTORIES = ['0x90497450f2a706f1951b5bdda52b4e5d16f34c06']; // Flap 金庫工廠（AIDROP 就是它建的）
-const LOG_NODES = ['https://bsc-rpc.publicnode.com', 'https://bsc.blockpi.network/v1/rpc/public', 'https://bsc.drpc.org', 'https://1rpc.io/bnb', 'https://binance.llamarpc.com', 'https://bsc.publicnode.com'];
-let logNi = 0; const logBad = new Map();
-async function logsRpc(params) { /* 查事件用的多節點輪替：某個節點被限流就冷卻 2 分鐘換下一個 */
-  let last; for (let i = 0; i < LOG_NODES.length; i++) { const u = LOG_NODES[(logNi + i) % LOG_NODES.length]; if ((logBad.get(u) || 0) > Date.now()) continue;
-    try { const r = await (await fetch(u, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getLogs', params }), signal: AbortSignal.timeout(12000) })).json(); if (r.error) throw new Error(r.error.message); if (!Array.isArray(r.result)) throw new Error('bad result'); logNi = (logNi + i) % LOG_NODES.length; return r.result; }
-    catch (e) { last = e; logBad.set(u, Date.now() + 120e3); } }
-  throw last || new Error('所有節點冷卻中');
+async function logsRpc(params) {
+  const result = await rpc('eth_getLogs', params);
+  if (!Array.isArray(result)) throw new Error('事件返回格式无效');
+  return result;
 }
 async function proxyScan(from, to) {
   if (to < from) return;
@@ -1866,7 +1889,8 @@ async function executeUsdtMintInner(W, { to, data, need, value = 0n, recheck = n
   if (usd + valueBnb * price > PAID.maxUsd) throw new Error('超过单笔预算');
   const spent = resetPaidBudgetDay()[W.id] || 0;
   const balance = Number(BigInt(await rpc('eth_getBalance', [W.addr, 'latest']))) / 1e18;
-  let usdtBalance = big(await call(USDT, '0x70a08231' + wa(W.addr)));
+  let usdtBalance = decodeAbiUint(await call(USDT, '0x70a08231' + wa(W.addr)));
+  if (usdtBalance === null) throw new Error('无法核验 USDT 余额，未执行补款、授权或铸造');
   const held = usdtBalance < need ? usdtBalance : need;
   const heldEquivalent = Number(held) / 1e18 / price;
   const missing = need - held;
@@ -1891,7 +1915,11 @@ async function executeUsdtMintInner(W, { to, data, need, value = 0n, recheck = n
       const swap = await runPaidCommand(W, ['market-order', 'swap', '--binanceChainId', '56', '--fromTokenQty', swapBnb.toFixed(6), '--fromToken', NATIVE_BNB, '--toToken', USDT], bnbBudgetWei(swapBnb), null, swapRisk);
       if (!swap.j?.success) throw new Error('BNB 换 USDT 失败 ' + (swap.j?.error?.message || swap.t).slice(0, 100));
       S.paidSpend[W.id] = spent + swapBnb; save();
-      for (let i = 0; i < 30 && usdtBalance < need; i++) { await sleep(3000); usdtBalance = big(await call(USDT, '0x70a08231' + wa(W.addr))); }
+      for (let i = 0; i < 30 && usdtBalance < need; i++) {
+        await sleep(3000);
+        usdtBalance = decodeAbiUint(await call(USDT, '0x70a08231' + wa(W.addr)));
+        if (usdtBalance === null) { scope.unknown = true; throw new Error('結果不明：换币后无法核验 USDT 余额，已停止授权和铸造，需核对原始换币记录'); }
+      }
       if (usdtBalance < need) throw new Error('USDT 未到账');
     }
     await previewExec(W, USDT, '0x095ea7b3' + wa(to) + w(need), 0n, (sim) => approvalSimulationCheck(sim, W, to), null, 'mint', { manual });
@@ -1987,18 +2015,8 @@ const agentCache = new Map(); // Legacy cache is never used as wallet-age or non
 async function rpcBatch(reqs) {
   const out = [];
   for (let offset = 0; offset < reqs.length; offset += 100) {
-    const batch = reqs.slice(offset, offset + 100);
-    for (const url of ['https://bsc-rpc.publicnode.com', 'https://bsc-dataseed.bnbchain.org', 'https://bsc.publicnode.com']) {
-      try {
-        const response = await (await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(batch.map((request, index) => ({ jsonrpc: '2.0', id: offset + index, ...request }))), signal: AbortSignal.timeout(20000) })).json();
-        if (!Array.isArray(response)) continue;
-        const ids = new Set(); let invalid = false, got = 0;
-        for (const entry of response) { if (!entry || !Number.isInteger(entry.id) || entry.id < offset || entry.id >= offset + batch.length || ids.has(entry.id)) { invalid = true; break; } ids.add(entry.id); if (entry.result !== undefined) got++; }
-        if (invalid || !got) continue;
-        for (const entry of response) if (entry.result !== undefined) out[entry.id] = entry.result;
-        break;
-      } catch {}
-    }
+    const results = await RPC_CLIENT.batch(reqs.slice(offset, offset + 100), { timeoutMs: 20000 });
+    for (let index = 0; index < results.length; index++) if (Object.hasOwn(results, index)) out[offset + index] = results[index];
   }
   return out;
 }
@@ -2009,7 +2027,7 @@ async function heatOf(c, P) { // Only transaction senders with a verified Agent 
   const span = hadHeat ? 6000 : 20000;
   for (let b = Math.max(0, head - span); b <= head; b += 10000) {
     const q = [{ address: tok ? [c, tok] : c, fromBlock: '0x' + b.toString(16), toBlock: '0x' + Math.min(b + 9999, head).toString(16) }];
-    const logs = await rpc('eth_getLogs', q).catch(() => logsRpc(q));
+    const logs = await logsRpc(q);
     if (!Array.isArray(logs)) throw new Error('无法核验参与交易日志');
     for (const record of logs) { const block = parseInt(record.blockNumber, 16); if (!record.transactionHash || !Number.isFinite(block)) continue; if (!hashes.has(record.transactionHash) || hashes.get(record.transactionHash) < block) hashes.set(record.transactionHash, block); }
   }
@@ -2377,15 +2395,16 @@ async function nftVolWatch() {
   // 1) Element 成交（一次抓完再按系列分）
   const fills = {};
   for (let b = from; b <= head; b += 10000) {
-    const L = await rpc('eth_getLogs', [{ address: ELEMENT_EX, topics: [T_721_FILLED], fromBlock: '0x' + b.toString(16), toBlock: '0x' + Math.min(b + 9999, head).toString(16) }]).catch(() => []);
+    const L = await logsRpc([{ address: ELEMENT_EX, topics: [T_721_FILLED], fromBlock: '0x' + b.toString(16), toBlock: '0x' + Math.min(b + 9999, head).toString(16) }]);
     for (const l of L || []) { const w = l.data.slice(2).match(/.{64}/g) || []; const col = '0x' + (w[7] || '').slice(24); if (!S.nftCols[col]) continue; const isBnb = (w[4] || '').endsWith('eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'); const px = Number(BigInt('0x' + (w[5] || '0'))) / 1e18; (fills[col] = fills[col] || []).push(isBnb ? px : null); }
     await sleep(200);
   }
   // 2) 各系列轉手次數（不含新鑄造）＋我們持有幾張
   for (const col of Object.keys(S.nftCols)) {
+    try {
     let moves = 0;
-    for (let b = from; b <= head; b += 50000) { const L = await rpc('eth_getLogs', [{ address: col, topics: [T_TRANSFER], fromBlock: '0x' + b.toString(16), toBlock: '0x' + Math.min(b + 49999, head).toString(16) }]).catch(() => []); for (const l of L || []) if (l.topics.length === 4 && !/^0x0+$/.test(l.topics[1])) moves++; }
-    let held = 0; for (const W of WALLETS) { const r = await call(col, '0x70a08231' + wa(W.addr)); if (r && r.length >= 66) held += Number(BigInt(r.slice(0, 66))); }
+    for (let b = from; b <= head; b += 50000) { const L = await logsRpc([{ address: col, topics: [T_TRANSFER], fromBlock: '0x' + b.toString(16), toBlock: '0x' + Math.min(b + 49999, head).toString(16) }]); for (const l of L) if (l.topics.length === 4 && !/^0x0+$/.test(l.topics[1])) moves++; }
+    let held = 0; for (const W of WALLETS) { const balance = decodeAbiUint(await rpc('eth_call', [{ to: col, data: '0x70a08231' + wa(W.addr) }, 'latest'])); if (balance === null) throw new Error('NFT 数量无法核验，保留上次成交量统计'); held += Number(balance); }
     const f = fills[col] || [], prev = S.nftVol[col];
     const px = f.filter((x) => x != null), vol = px.reduce((a, b) => a + b, 0);
     const hot = held > 0 && px.length >= 3 && vol > 0 && (prev ? px.length >= 2 * (prev.f || 0) : px.length >= 5); // 只看真的有付錢的成交（使用者 15:22：轉來轉去不算）
@@ -2395,6 +2414,7 @@ async function nftVolWatch() {
     }
     S.nftVol[col] = { f: f.length, t: moves, held, at: ts() };
     await sleep(150);
+    } catch (error) { if (error.retryAfterMs > 0) throw error; log(`NFT 系列统计暂不可用 ${col}：${error.message}`); }
   }
   log(`NFT 成交量檢查完成：${Object.keys(S.nftCols).length} 個系列`);
 }
@@ -2615,13 +2635,14 @@ async function tgCmdLoop() {
 let HOLDINGS_SCHEDULER = null;
 function startHoldingsScheduler() {
   if (HOLDINGS_SCHEDULER) return HOLDINGS_SCHEDULER;
-  let stopped = false, busy = false, lastFullStarted = null, lastFastStarted = null, lastOpenStarted = Date.now();
+  let stopped = false, busy = false, lastFullStarted = null, lastFastStarted = null, lastOpenStarted = Date.now(), retryAt = 0, failures = 0;
   let timer;
   const stop = () => { stopped = true; if (timer) clearInterval(timer); };
   const tick = async () => {
     if (stopped || busy) return;
     if (existsSync(join(DIR, 'WATCH_STOP'))) { stop(); return; }
     const now = Date.now();
+    if (now < retryAt) return;
     const activeFast = Object.values(S.tokens).some((state) => state.openAt && now - state.openAt < (state.effectiveRules?.fastMin ?? RULE.fastMin) * 60000 && state.stage !== 9 && !state.done);
     const fullDue = lastFullStarted === null || now - lastFullStarted >= 5000;
     const fastDue = activeFast && (lastFastStarted === null || now - lastFastStarted >= 1000);
@@ -2645,8 +2666,15 @@ function startHoldingsScheduler() {
       else if (onlyFast) S.holdingsFastUpdatedAt = S.holdingsUpdatedAt;
       else S.holdingsFullUpdatedAt = S.holdingsUpdatedAt;
       delete S.holdingsError; delete S.holdingsErrorAt;
+      failures = 0; retryAt = 0; delete S.holdingsRetryAt;
     } catch (error) {
-      if (!stopped) { S.holdingsError = error.message; S.holdingsErrorAt = Date.now(); log('独立持仓检查失败：' + error.message); }
+      if (!stopped) {
+        failures++;
+        const delay = Math.max(Math.min(60000, 5000 * 2 ** Math.min(failures - 1, 4)), Number(error.retryAfterMs) || 0);
+        retryAt = Date.now() + delay;
+        S.holdingsError = error.message; S.holdingsErrorAt = Date.now(); S.holdingsRetryAt = retryAt;
+        log('独立持仓检查失败：' + error.message + `；${Math.ceil(delay / 1000)} 秒后自动重试`);
+      }
     } finally {
       busy = false; S.holdingsInFlight = partial;
       if (!stopped) save();
@@ -2695,7 +2723,7 @@ async function main() {
       if (!globalThis._heatBusy && Date.now() - (globalThis._heatAt || 0) > 20e3) { globalThis._heatAt = Date.now(); globalThis._heatBusy = true; heatWatch().catch((e) => log('heatWatch ' + e.message)).finally(() => { globalThis._heatBusy = false; }); } // 熱度監測（背景）
       if (!globalThis._inscBusy && Date.now() - (globalThis._inscAt || 0) > 30000) { globalThis._inscAt = Date.now(); globalThis._inscBusy = true; inscScan().catch(error => log('铭文通知检查 ' + error.message)).finally(() => { globalThis._inscBusy = false; }); }
       if (!globalThis._fpBusy && Date.now() - (globalThis._fpAt || 0) > 300e3) { globalThis._fpAt = Date.now(); globalThis._fpBusy = true; freeProgWatch().catch((e) => log('freeProg ' + e.message)).finally(() => { globalThis._fpBusy = false; }); } // 免費項目進度，每 5 分鐘
-      if (!globalThis._nftBusy && Date.now() - (S.nftVolAt || 0) > 12 * 3600e3) { S.nftVolAt = Date.now(); globalThis._nftBusy = true; nftVolWatch().catch((e) => log('nftVol ' + e.message)).finally(() => { globalThis._nftBusy = false; }); } // 12 小時看一次 NFT 成交量（背景）
+      if (!globalThis._nftBusy && Date.now() - (S.nftVolAt || 0) > 12 * 3600e3) { S.nftVolAt = Date.now(); globalThis._nftBusy = true; nftVolWatch().catch((e) => { S.nftVolAt = Date.now() - 12 * 3600e3 + Math.max(60000, Number(e.retryAfterMs) || 0); log('nftVol ' + e.message); }).finally(() => { globalThis._nftBusy = false; }); } // 12 小時看一次 NFT 成交量（背景）
       // Classification may take minutes; measure lag against a fresh chain head,
       // rather than the head captured before the batch was scanned.
       const latestHead = await rpc('eth_blockNumber', []).then((value) => parseInt(value, 16)).catch(() => null);
@@ -2707,7 +2735,7 @@ async function main() {
       S.loopDurationMs = S.scanUpdatedAt - loopStartedAt;
       lastLoopAt = Date.now(); save(); writeFileSync(join(DIR, 'data', 'watch_heartbeat.txt'), ts() + ' 掃描落後 ' + S.scanLag + ' 塊' + (S.scanLagEstimated ? '（估算）' : '') + ' · 付費檢查一輪 ' + (globalThis._paidDur ?? '?') + ' 秒');
       if ((S.scanLag || 0) > 400 && Date.now() - (S.lagAlert || 0) > 3600e3) { S.lagAlert = Date.now(); await tg(`⚠️ 新合約掃描落後 ${S.scanLag} 個區塊（約 ${Math.round(S.scanLag * 0.45 / 60)} 分鐘），可能是公用節點變慢，手動處理`); }
-    } catch (e) { log('出错 ' + e.message); }
+    } catch (e) { log('出错 ' + e.message); if (e.retryAfterMs > 1000) await sleep(Math.min(60000, e.retryAfterMs - 1000)); }
     await sleep(1000);
   }
 }
