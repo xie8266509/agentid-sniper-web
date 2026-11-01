@@ -1380,6 +1380,7 @@ async function autoMintInner(c, fname, W, val) {
   riskQuote.participationPlan = await quoteAutomaticParticipation(W, c, d, val, { sim });
   riskQuote.paymentUsdMicros = usdBudgetMicros(feeBnb * feePrice);
   riskQuote.mintTracking = mintTrackingPlan(W, sim, feeBnb * feePrice, riskQuote.mintToken);
+  riskQuote.mintContext = { version: 1, final: true, project: c.toLowerCase(), name: String(S.paid?.[c]?.name || '').slice(0, 120) };
   if (val > 0n) {
     const balance = Number(BigInt(await rpc('eth_getBalance', [W.addr, 'latest']))) / 1e18;
     if (!feeAllowed(balance)) return '⏸ 超过单笔/每日付费预算，没有铸';
@@ -1669,6 +1670,7 @@ async function previewExecInner(W, to, data, valueWei, check, recheck, opts = {}
   if (riskQuote && valueWei > 0n) riskQuote.paymentUsdMicros = usdBudgetMicros(paymentUsd);
   if (riskQuote && !isApproval && opts.manual === true && opts.manualMintProject === to.toLowerCase() && W.operationKind !== 'token-sell') riskQuote.manualMintProject = to.toLowerCase();
   if (riskQuote && !isApproval) riskQuote.mintTracking = mintTrackingPlan(W, sim, paymentUsd, riskQuote.mintToken || opts.fallbackToken);
+  if (riskQuote && !isApproval && !badSel(data) && hasPositiveMintGain(sim, W)) riskQuote.mintContext = { version: 1, final: true, project: to.toLowerCase(), name: String(S.paid?.[to.toLowerCase()]?.name || '').slice(0, 120) };
   INFLIGHT++; let x; try { x = await runPaidCommand(W, ['contract-call', 'execute', '--requestId', rid], valueWei, { from: W.addr, to, value: valueWei.toString(), inputData: data }, riskQuote); } finally { INFLIGHT--; }
   if (mintExecutionUnknown(x)) throw new Error('結果不明：送出逾時或响应中断，可能已上鏈，先不重打');
   if (!x.j?.success) throw new Error('送出失敗 ' + (x.j?.error?.message || x.t).slice(0, 120));
@@ -1785,6 +1787,7 @@ async function runPaidCommand(W, args, amountWei = 0n, expected = null, riskQuot
   const spent = resetPaidBudgetDay()[W.id] || 0;
   const field = name => args[args.indexOf(name) + 1];
   const isFinalMint = scope && expected?.to === scope.finalTarget && expected?.inputData === scope.finalData;
+  const mintContext = kind === 'contract' && W.operationKind !== 'token-sell' && (!scope || isFinalMint) && riskQuote?.mintContext;
   const successSpent = scope ? isFinalMint ? scope.totalWei : scope.spentWei + (kind === 'market-order' ? amountWei : 0n) : amountWei;
   const failureSpent = scope ? scope.spentWei : 0n;
   const successUsd = scope ? isFinalMint ? scope.totalUsdMicros : scope.spentUsdMicros + (kind === 'market-order' ? BigInt(usdBudgetMicros(Number(amountWei) / 1e18 * scope.price)) : 0n) : BigInt(paymentUsdMicros);
@@ -1796,6 +1799,7 @@ async function runPaidCommand(W, args, amountWei = 0n, expected = null, riskQuot
     mintRiskReservation = riskQuote ? MINT_RISK.reserve(riskQuote) : null; }
   catch (error) { if (ownParticipationId) MINT_PARTICIPATION.release(ownParticipationId); if (reservation) await scannerBudget().settle(reservation.id, { spentWei: 0n, spentUsdMicros: '0' }); throw error; }
   const pending = { ...(participationId ? { participationId, participationFinal: scope ? !!isFinalMint : true } : {}), version: 1, walletId: W.id, walletAddress: W.addr, walletIndex: W.index, kind, createdAt: Date.now(), amountWei: amountWei.toString(), expected: kind !== 'market-order' ? expected : { fromToken: field('--fromToken'), toToken: field('--toToken'), fromTokenQty: field('--fromTokenQty') }, ...(allocation ? { reservationId: allocation.id, reservationDay: allocation.day, reservedAmountWei: allocation.amountWei, ...(allocation.amountUsdMicros !== undefined ? { reservedAmountUsdMicros: allocation.amountUsdMicros } : {}) } : { reservedAmountWei: '0' }), ...(mintRiskReservation ? { mintRiskReservation } : {}), ...(riskQuote?.manualMintProject ? { manualMintProject: riskQuote.manualMintProject } : {}), ...(riskQuote?.mintTracking ? { mintTracking: { ...riskQuote.mintTracking, costUsdMicros: successUsd.toString() } } : {}), settlement: { successSpentWei: successSpent.toString(), failureSpentWei: failureSpent.toString(), ...(allocation?.amountUsdMicros !== undefined ? { successSpentUsdMicros: successUsd.toString(), failureSpentUsdMicros: failureUsd.toString() } : {}) } };
+  if (mintContext) pending.mintContext = { ...mintContext };
   S.walletPending ||= {}; S.walletPending[W.id] = pending; save(true);
   let result;
   try {

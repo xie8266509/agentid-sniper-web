@@ -31,7 +31,7 @@ function fixture() {
     el: (tag, attrs, ...children) => new Element(tag, attrs, ...children), replace: (node, ...children) => node.replaceChildren(...children),
     button: (label, _icon, click) => new Element('button', { label, click }), title: (_name, _description, actions) => new Element('header', {}, actions),
     panel: (_name, _icon, body, aside) => new Element('section', {}, body, aside), badge: () => new Element('span'), icon: () => new Element('svg'),
-    empty: () => new Element('div'), walletConnectionInfo: () => null, walletStateLabel: () => '未检查', walletBalanceCell: wallet => new Element('div', { balanceWallet: wallet.id }),
+    empty: () => new Element('div'), walletConnectionInfo: () => null, walletStateLabel: () => '未检查', walletBalanceCell: wallet => new Element('div', { balanceWallet: wallet.id }), walletMintCell: wallet => new Element('div', { mintWallet: wallet.id }),
     walletExecutionCell: () => new Element('div'), walletRunState: () => '已暂停', walletModes: { auto: '自动交易', monitor: '只监控' }, walletMode: wallet => wallet.mode,
     shortAddress: value => value, agentIdLabel: wallet => wallet.agentId, budgetCell: () => new Element('div'),
     confirmAction: async () => true, api: async (path, options) => { calls.push({ path, ...JSON.parse(JSON.stringify(options)) }); return {}; },

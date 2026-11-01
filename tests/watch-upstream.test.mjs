@@ -800,8 +800,9 @@ test('manual USDT approval cannot complete the project, but the bound final mint
     }
     const requestId = args[args.indexOf('--requestId') + 1]; submissions.push(requestId);
     assert.equal(h.P.done.test, undefined);
-    if (requestId === 'approve') { assert.equal(h.S.walletPending.test.manualMintProject, undefined); return { j: { success: true, data: { txHash: '0x' + 'aa'.repeat(32) } } }; }
+    if (requestId === 'approve') { assert.equal(h.S.walletPending.test.manualMintProject, undefined); assert.equal(h.S.walletPending.test.mintContext, undefined); return { j: { success: true, data: { txHash: '0x' + 'aa'.repeat(32) } } }; }
     assert.equal(h.S.walletPending.test.manualMintProject, target);
+    assert.equal(h.S.walletPending.test.mintContext?.final, true); assert.equal(h.S.walletPending.test.mintContext?.project, target);
     return { j: { success: false, data: { txHash: '0x' + 'ab'.repeat(32) }, error: { name: 'TIMEOUT', message: 'mock interrupted mint' } } };
   };
   await h.api.manualMints();
