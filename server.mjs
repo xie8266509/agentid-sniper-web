@@ -12,9 +12,11 @@ import { createIdleUpdates, assertIdleData } from './lib/idle-updates.mjs';
 import { createTelegramMonitor } from './lib/telegram-monitor.mjs';
 import { readRestartHealth, scannerIsActive, spawnWebRestart } from './lib/update-runtime.mjs';
 import { normalizeWalletConfig, getWalletId, resolveWallet, effectiveWalletConfig, walletCanAutomate } from './lib/wallet-model.mjs';
+import { collectWalletReadiness, assertAnyWalletReady, readinessConfigKey } from './lib/wallet-readiness.mjs';
 import { withWalletExecution, walletExecutionView, markWalletBlocked, clearWalletBlocked, acquireWalletMaintenance } from './lib/wallet-executor.mjs';
 import { createWalletBudget } from './lib/wallet-budget.mjs';
 import { nftRpc } from './lib/nft-holdings.mjs';
+import { createWalletBalanceReader } from './lib/wallet-balances.mjs';
 import { reconcileScannerPending } from './lib/scanner-recovery.mjs';
 
 const MAX_BODY = 128 * 1024;
@@ -52,6 +54,12 @@ export function createApp(overrides = {}) {
   const budget = durableRuntime ? createWalletBudget({ root: appRoot }) : null;
   const sessionVersions = new Map();
   const config = () => normalizeWalletConfig(deps.readConfig());
+  const balanceIdentityCurrent = identity => {
+    const wallets = config().wallets || [];
+    const wallet = wallets.find(wallet => wallet.id === identity.id);
+    return wallet ? String(wallet.address || '').toLowerCase() === identity.address && (wallet.draft === true) === identity.draft : !wallets.length && identity.id === 'bootstrap-wallet' && !identity.address;
+  };
+  const balanceReader = createWalletBalanceReader({ rpc: overrides.rpc || nftRpc, isCurrent: balanceIdentityCurrent });
   const walletAt = index => config().wallets[index] || { id: 'bootstrap-wallet', name: '钱包 1', address: '', bawDir: 'data/wallets/wallet-1' };
   const keyAt = index => getWalletId(walletAt(index), index);
   const executor = (wallet, work, options = {}) => durableRuntime ? withWalletExecution(wallet, work, { root: appRoot, ...options }) : work();
@@ -63,6 +71,7 @@ export function createApp(overrides = {}) {
     for (const [key, preview] of previews) if (preview.walletId === id) previews.delete(key);
   };
   let serviceBusy = false, updateBusy = false, activeWalletCalls = 0, updatePhase = null, updateError = null;
+  let lastWalletReadiness = null;
   let automaticUpdate = false, releaseMaintenance = null, idleUpdates;
   const idleNow = overrides.idleNow || Date.now;
   let lastActivityAt = idleNow();
@@ -504,7 +513,7 @@ export function createApp(overrides = {}) {
           data = await admitUpdate(path.endsWith('/apply') ? 'update' : 'rollback', body, res, port);
           send(202, { ok: true, data }); return;
         }
-        else if (req.method === 'GET' && path === '/api/status') data = { ...(await deps.dashboardStatus()), walletCli: deps.getCliInfo() };
+        else if (req.method === 'GET' && path === '/api/status') data = { ...(await deps.dashboardStatus()), walletCli: deps.getCliInfo(), walletReadiness: lastWalletReadiness };
         else if (req.method === 'GET' && path === '/api/config') data = { config: deps.sanitizeConfig(config()) };
         else if (req.method === 'POST' && path === '/api/config') {
           if (serviceBusy) throw failure(409, '服务操作正在进行，请稍后保存配置');
@@ -547,19 +556,25 @@ export function createApp(overrides = {}) {
           serviceBusy = true;
           try {
             if (action !== 'stop' && !config().monitorOnly && busy.size) throw failure(409, '请先完成当前钱包操作，再启动自动交易');
-            if (action !== 'stop' && !config().monitorOnly) {
-              if (body.confirmAutoTrading !== true) throw failure(409, '自动交易启动需要确认');
-              if (!config().wallets.length) throw failure(409, '请先配置钱包');
-              for (let i = 0; i < config().wallets.length; i++) {
-                const entry = config().wallets[i];
-                if (!['mint', 'token-sell', 'nft-sell'].some(kind => walletCanAutomate(config(), entry, kind))) continue;
-                const wallet = await requireConnected(i); assertDevMode(wallet.settings);
-                if (wallet.address.toLowerCase() !== config().wallets[i].address.toLowerCase()) throw failure(409, `钱包 ${i + 1} 登录地址与配置不一致，请重新导入地址`);
-              }
+            if (action !== 'stop') {
+              const snapshot = config(), revision = readinessConfigKey(snapshot), walletRevisions = snapshot.wallets.map(wallet => [wallet.id, walletRevision(wallet)]);
+              if (!snapshot.monitorOnly && body.confirmAutoTrading !== true) throw failure(409, '自动交易启动需要确认');
+              const report = await collectWalletReadiness({ config: snapshot, readWallet: (_wallet, index) => walletStatus(index, true) });
+              if (readinessConfigKey(config()) !== revision || walletRevisions.some(([id, version]) => {
+                const wallet = config().wallets.find(entry => entry.id === id); return !wallet || walletRevision(wallet) !== version;
+              })) throw failure(409, '钱包、会话或策略配置在启动预检期间已改变，请重新启动');
+              lastWalletReadiness = report;
+              assertAnyWalletReady(report);
             }
             data = await deps.controlService(action);
+            if (action !== 'stop') data = { ...data, walletReadiness: lastWalletReadiness, ...(lastWalletReadiness.mode === 'auto' ? { message: [data.message, `已核验 ${lastWalletReadiness.ready.length} 个可运行钱包；跳过 ${lastWalletReadiness.skipped.length} 个钱包`].filter(Boolean).join('\n') } : {}) };
           } finally { serviceBusy = false; }
         } else if (req.method === 'GET' && path === '/api/wallet/status') data = await walletStatus(indexOf(selector(null, url)), url.searchParams.get('refresh') === '1');
+        else if (req.method === 'GET' && path === '/api/wallet/balance-summary') {
+          const wallet = walletAt(indexOf(selector(null, url)));
+          data = await balanceReader.read(wallet, { force: url.searchParams.get('refresh') === '1' });
+          if (!balanceIdentityCurrent({ id: wallet.id, address: String(wallet.address || '').toLowerCase(), draft: wallet.draft === true })) throw failure(409, '钱包配置已改变，请刷新重试');
+        }
         else if (req.method === 'GET' && path === '/api/wallet/balance') {
           const index = indexOf(selector(null, url)); const wallet = await requireConnected(index); assertWalletBinding(index, wallet, { allowArchived: true });
           data = { balances: await walletCall(index, ['wallet', 'balance', '--binanceChainId', '56', '--hideLowValue', 'false']) };

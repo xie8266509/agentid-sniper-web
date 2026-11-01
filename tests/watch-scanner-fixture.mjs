@@ -11,6 +11,7 @@ import { createHash } from 'node:crypto';
 import { decodeAbiUint } from '../lib/nft-codec.mjs';
 import * as sellRules from '../lib/sell-rules.mjs';
 import * as walletModel from '../lib/wallet-model.mjs';
+import * as walletReadiness from '../lib/wallet-readiness.mjs';
 import { socialSelectionHash } from '../lib/social-candidates.mjs';
 import * as mintPolicy from '../lib/mint-policy.mjs';
 import { createAgentMaturity } from '../lib/agent-maturity.mjs';
@@ -40,7 +41,7 @@ globalThis.api = {
   previewExec, executeUsdtMint, paidLoop, loginCheck, cmdSell, manualMints, scanNew,
   getState: () => S, getMe: () => ME, getWallets: () => WALLETS,
   getMintQueueSize: () => MQ.size,
-  canWallet, paidFor, rulesFor, syncWalletProfiles, runtimeWallet, tokenCostFor,
+  canWallet, paidFor, rulesFor, syncWalletProfiles, runtimeWallet, tokenCostFor, checkWatchWallet, watchWalletReady,
   heatOf, freeProgress, getInflight: () => INFLIGHT,
   setHoldingsWorker: fn => { holdW = fn; },
 };`);
@@ -49,7 +50,7 @@ globalThis.api = {
   const seen = { cliFactories: [], cliCalls: [], network: [], writes: [], directories: [], logs: [], errors: [] };
   const timers = [];
   const sandbox = {
-    socialSelectionHash, createAgentMaturity, createMintParticipation, Buffer, structuredClone, dirname, join, fileURLToPath, withinPaidBudget, decodeAbiUint, createHash, ...sellRules, ...mintPolicy,
+    socialSelectionHash, createAgentMaturity, createMintParticipation, Buffer, structuredClone, dirname, join, fileURLToPath, withinPaidBudget, decodeAbiUint, createHash, ...sellRules, ...mintPolicy, ...walletReadiness,
     normalizeWalletConfig: input => walletModel.normalizeWalletConfig(JSON.parse(JSON.stringify(input))),
     getWalletId: walletModel.getWalletId,
     effectiveWalletConfig: (config, wallet) => walletModel.effectiveWalletConfig(JSON.parse(JSON.stringify(config)), JSON.parse(JSON.stringify(wallet))),
