@@ -98,7 +98,7 @@ globalThis.api = {
     unlinkSync: path => { seen.writes.push({ path, removed: true }); memoryFiles.delete(path); },
     copyFileSync() { throw new Error('Copying scanner code is forbidden in the test harness'); },
     statSync: () => ({ mtimeMs: 1 }),
-    process: { execPath: '/mock/node', env: {}, on() {}, exit(code) { throw new Error('SCANNER_EXIT_' + code); } },
+    process: { pid: 4242, execPath: '/mock/node', env: {}, on() {}, exit(code) { throw new Error('SCANNER_EXIT_' + code); } },
     console: { error: message => seen.errors.push(message), log() {} },
     AbortSignal: { timeout: () => ({}) },
     setInterval: () => ({ unref() {} }),
