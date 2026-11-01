@@ -10,6 +10,8 @@ import { decodeAbiUint } from './lib/nft-codec.mjs';
 import { normalizeWalletConfig, getWalletId, effectiveWalletConfig, walletCanAutomate } from './lib/wallet-model.mjs';
 import { withWalletExecution, markWalletBlocked, clearWalletBlocked, assertWalletMaintenanceIdle } from './lib/wallet-executor.mjs';
 import { createWalletBudget } from './lib/wallet-budget.mjs';
+import { createAgentMaturity } from './lib/agent-maturity.mjs';
+import { createMintParticipation } from './lib/mint-participation.mjs';
 import { reconcileScannerPending } from './lib/scanner-recovery.mjs';
 import { ensureEntryPolicy, effectiveEntryPolicy, entryGate, createMintRisk, deriveMintCost, MINT_RISK_LIMITS } from './lib/mint-policy.mjs';
 import { createMintMedia } from './lib/mint-media.mjs';
@@ -330,8 +332,10 @@ const ENTRY_POLICY = ensureEntryPolicy(S);
 const MINT_MEDIA = createMintMedia({ state: S, save });
 const SAFE_WEB = createSafeWeb();
 const MINT_RISK = createMintRisk({ state: S, rpc, call, fullCode, nftMediaCheck: (contract, uri) => MINT_MEDIA.check(contract, uri), bnbUsd, save, timeZone: CONFIG.timeZone || 'Asia/Taipei', usdt: USDT, wrappedBnb: WBNB, factory: FACTORY });
+const MINT_PARTICIPATION = createMintParticipation({ state: S, save });
+const AGENT_MATURITY = createAgentMaturity({ rpc, rpcBatch, registry: REGISTRY });
 S.mintPolicy = { ...ENTRY_POLICY, version: '2.7.4', schemaVersion: 3, freeMode: 'notify-only', participants: 'transaction-senders', limits: { ...MINT_RISK_LIMITS }, wallets: {} };
-if (S.agentsV !== 2) { S.agentsV = 2; for (const P of Object.values(S.paid || {})) { delete P.agents; delete P.burst; delete P.heatAt; } }
+if (S.agentsV !== 3) { S.agentsV = 3; for (const P of Object.values(S.paid || {})) { delete P.agents; delete P.burst; delete P.heatAt; } }
 function entryFor(W, nft = false) {
   const policy = effectiveEntryPolicy(ENTRY_POLICY, paidFor(W).goPct), nftPolicy = effectiveEntryPolicy(ENTRY_POLICY, paidFor(W).goPct, { nft: true });
   S.mintPolicy.wallets[W.id] = { ...policy, nftGoPct: nftPolicy.goPct, nftMinAgents: nftPolicy.minAgents }; return nft ? nftPolicy : policy;
@@ -737,10 +741,27 @@ async function holdW(W, head, onlyFast) {
   await recoverScannerWallet(W);
   const RULE = rulesFor(W), sellingEnabled = canWallet(W, 'token-sell');
   S.effectiveWalletRules ||= {}; S.effectiveWalletRules[W.id] = structuredClone(RULE);
-  const seen = new Set();
-  for (const t0 of TOKENS.concat(S.dyn || [])) {
+  const seen = new Set(), openingOnly = onlyFast === 'open';
+  const ordered = TOKENS.concat(S.dyn || []).map((token, index) => ({ token, index, opening: token.boughtAt > Date.now() - 72 * 3600000 && !S.tokens[positionStateKey(W.addr, token.addr)]?.pair })).sort((a, b) => Number(b.opening) - Number(a.opening) || a.index - b.index).map(item => item.token);
+  for (const t0 of ordered) {
     if (t0.only && t0.only.toLowerCase() !== W.addr) continue;
     if (seen.has(t0.addr.toLowerCase())) continue; seen.add(t0.addr.toLowerCase());
+    if (openingOnly) {
+      const st = positionFor(W, t0);
+      if ((st.pendingSell || st.submissionIntent || st.sellReviewRequired) && !MONITOR_ONLY) { await sell(t0, st, 0n, '', W); if (st.pendingSell || st.submissionIntent || st.sellReviewRequired) continue; }
+      if (st.pair || !(t0.boughtAt > Date.now() - 72 * 3600000) || st.closedOrderConfirmed && st.done || st.done && st.lastBal === '0' && Date.now() - (st.doneAt || 0) < 30 * 60000) continue;
+      const balance = decodeAbiUint(await call(t0.addr, '0x70a08231' + wa(W.addr)));
+      if (balance === null) { st.balanceReadErrorAt = Date.now(); continue; }
+      if (balance === 0n) continue;
+      const pair = await findPair(t0);
+      if (pair && !st.pair) {
+        st.pair = pair.pair; st.checked = true; st.openAt ||= Date.now(); st.fromBlock = Math.max(0, head - 400);
+        if (pair.ds) { st.pairDs = 1; st.pairInfo = `${pair.dex} / ${pair.quote}`; }
+        await honeypotCheck(W, t0, st, balance);
+        await tg(`🚀 ${t0.sym} 开池了\n池子 ${pair.pair}\n按配置规则追踪价格`);
+      }
+      continue;
+    }
     if (!(tokenCostFor(W, t0) > 0) && !t0.costUnknown && (/^\d+$/.test(t0.paidBnbWei || '') && BigInt(t0.paidBnbWei) > 0n || /^\d+$/.test(t0.paidUsdtWei || '') && BigInt(t0.paidUsdtWei) > 0n)) { t0.costUnknown = true; t0.costSource = 'payment-evidence'; save(); }
     if (t0.costUnknown) {
       const bnbEvidence = t0.unpricedPaidBnbWei ?? t0.paidBnbWei, usdtEvidence = t0.unpricedPaidUsdtWei ?? t0.paidUsdtWei;
@@ -754,6 +775,7 @@ async function holdW(W, head, onlyFast) {
     st.eligibility = !sellingEnabled ? 'monitor-only' : t.hold ? 'hold' : 'waiting-price';
     st.reason = !sellingEnabled ? '此钱包只监控或已暂停，不执行新卖出' : t.hold ? '配置为持有，仅通知' : '等待可用价格';
     if ((st.pendingSell || st.submissionIntent || st.sellReviewRequired) && !MONITOR_ONLY) { await sell(t, st, 0n, '', W); if (st.pendingSell || st.submissionIntent || st.sellReviewRequired) continue; }
+    if (st.done && st.lastBal === '0' && Number.isFinite(st.doneAt) && Date.now() >= st.doneAt && Date.now() - st.doneAt < 30 * 60000) continue;
     if (t.costUnknown) { st.eligibility = 'unknown-cost'; st.reason = '已确认付费但成本价格无法核验，暂停自动卖出并等待恢复成本'; st.costUnknown = true; continue; }
     delete st.costUnknown;
     if (onlyFast && !(st.openAt && Date.now() - st.openAt < RULE.fastMin * 60000 && st.stage !== 9 && !st.done)) continue;
@@ -762,13 +784,14 @@ async function holdW(W, head, onlyFast) {
     const previous = BigInt(st.lastBal || '0');
     st.lastBal = bal.toString();
     const received = bal > previous && st.balInit; st.balInit = true;
-    if (bal === 0n) { st.done = true; st.eligibility = 'empty'; st.reason = '当前链上余额为零'; st.last = { v: 0, at: ts() }; continue; }
+    if (bal === 0n) { st.done = true; st.doneAt = Date.now(); st.eligibility = 'empty'; st.reason = '当前链上余额为零'; st.last = { v: 0, at: ts() }; continue; }
     if ((st.done || st.stage >= 9) && (!st.closedOrderConfirmed || previous === 0n || bal > previous)) {
       Object.assign(st, { done: false, stage: 0, done2: [], sellNowDone: false, referenceBalance: bal.toString(), pricePeak: 0, freePricePeak: 0, freeFail: 0 });
       delete st.sellRetry; delete st.moon; delete st.moonOnly; delete st.drawdownSampleAt; delete st.drawdownRule; delete st.drawdownHits;
     }
     if (st.moonOnly && /^\d+$/.test(st.moon || '') && bal > BigInt(st.moon)) st.moonOnly = false;
-    st.done = false;
+    st.done = false; delete st.doneAt;
+    if (st.openSafetyPending && st.pair) { await honeypotCheck(W, t, st, bal); delete st.openSafetyPending; }
     if (!st.referenceBalance || BigInt(st.referenceBalance) <= 0n) { st.referenceBalance = bal.toString(); st.basisEstimated = st.done2.length > 0; }
     const decimals = Number.isInteger(st.decimals) ? BigInt(st.decimals) : decodeAbiUint(await call(t.addr, '0x313ce567'));
     if (decimals !== null && decimals <= 255n) st.decimals = Number(decimals);
@@ -1198,6 +1221,7 @@ async function autoMintInner(c, fname, W, val) {
   /* 使用者 10/31 19:21：新規則——不管免費還是付費，進度超過 50% 就打，之前的規矩（重複 DEV、黑名單、熱度、手續費上限…）全部不看；只保留貔貅類安全檢查（每筆都模擬、不能授權、不能扣到預期外的資產、Flap 禁止）。讀不到進度的才用熱度判斷 */
   { const sd = await serialDev(c); if (sd) { if (S.paid?.[c]) { S.paid[c].serialLog = 1; S.paid[c].lastReason = sd + '，照規則不打'; } return `⛔ ${sd}，照規則不打`; } }
   const fp = await freeProgress(c);
+  try { await refreshMatureHeat(c, S.paid?.[c]); } catch (error) { return '⏸ ' + error.message; }
   const agentsN = S.paid?.[c]?.agents || 0;
   const projectInfo = await MINT_RISK.contractInfo(c);
   const policy = entryFor(W, projectInfo.nft), entry = entryGate({ progress: fp, agents: agentsN, configuredPct: PAID.goPct, policy, nft: projectInfo.nft });
@@ -1220,6 +1244,7 @@ async function autoMintInner(c, fname, W, val) {
   if (simulationProblem) return '⚠️ 预演不安全：' + simulationProblem + '，没有铸';
   if (!hasPositiveMintGain(sim, W)) return '⚪ 预演显示拿不到东西（可能铸给别人或净额为 0），没有铸';
   const riskQuote = await MINT_RISK.quoteTransaction(W, { to: c, data: d, valueWei: val, keepBnb: PAID.keepBnb, paid: true, feeLike: true, project: true, paymentUsd: feeBnb * feePrice, quantity: mintQuantity(d, sim, W), nftEvidence: simulationNftGain(sim, W) });
+  riskQuote.participationPlan = await quoteAutomaticParticipation(W, c, d, val, { sim });
   riskQuote.paymentUsdMicros = usdBudgetMicros(feeBnb * feePrice);
   riskQuote.mintTracking = mintTrackingPlan(W, sim, feeBnb * feePrice, riskQuote.mintToken);
   if (val > 0n) {
@@ -1402,6 +1427,13 @@ function flapGuard(to, data, sim) {
   return '';
 }
 let INFLIGHT = 0; // 正在送出的交易數（重啟前要等它歸零，避免重打）
+async function refreshMatureHeat(project, info) {
+  if (!info) throw Object.assign(new Error('参与钱包资格尚未核验'), { code: 'MINT_POLICY_DEFERRED' });
+  const fresh = Number.isFinite(info.heatAt) && info.heatAt <= Date.now() && Date.now() - info.heatAt < 120000 && Number.isSafeInteger(info.agents);
+  if (fresh) return;
+  try { await heatOf(project, info); }
+  catch (error) { info.agents = 0; info.burst = 0; info.heatAt = 0; throw Object.assign(new Error('参与钱包资格暂时无法重新核验：' + error.message), { code: 'MINT_POLICY_DEFERRED' }); }
+}
 function mintQuantity(data, sim, W) {
   let nftQuantity = 0n;
   for (const change of sim?.balanceChanges || []) if (String(change.owner).toLowerCase() === W.addr && /Erc721|Erc1155/i.test(change.tokenType || '') && /^\d+$/.test(String(change.change)) && BigInt(String(change.change)) > 0n) nftQuantity += BigInt(String(change.change));
@@ -1410,10 +1442,58 @@ function mintQuantity(data, sim, W) {
   return null;
 }
 function simulationNftGain(sim, W) { return (sim?.balanceChanges || []).some(change => String(change.owner).toLowerCase() === W.addr && /Erc721|Erc1155/i.test(change.tokenType || '') && /^\d+$/.test(String(change.change)) && BigInt(String(change.change)) > 0n); }
+function legacyParticipationUnknown(project) {
+  const previous = S.mintParticipation?.projects?.[project];
+  const covered = walletId => Object.values(previous?.reservations || {}).some(entry => entry.walletId === walletId && ['reserved', 'confirmed'].includes(entry.status));
+  return Object.entries(S.paid?.[project]?.done || {}).some(([walletId, status]) => ['minted', 'free', 'unknown', 'full'].includes(status) && !covered(walletId)) || Object.values(S.walletPending || {}).some(pending => !pending.participationId && pending.expected?.to?.toLowerCase() === project);
+}
+async function quoteAutomaticParticipation(...args) {
+  try { return await quoteAutomaticParticipationInner(...args); }
+  catch (error) { error.code = 'MINT_POLICY_DEFERRED'; throw error; }
+}
+async function quoteAutomaticParticipationInner(W, project, data, valueWei, { paymentToken = NATIVE_BNB, paymentWei = valueWei, sim = null, amountBnbWei = null } = {}) {
+  project = project.toLowerCase();
+  if (W.paidReservation?.participationId && (W.paidReservation.finalTarget?.toLowerCase() !== project || W.paidReservation.finalData !== data)) throw new Error('项目预占与最终铸造意图不一致');
+  valueWei = BigInt(valueWei); paymentWei = BigInt(paymentWei);
+  const code = (await fullCode(project, await codeOf(project))).toLowerCase();
+  const progress = await progressOf(project, code, '');
+  let quantity = mintQuantity(data, sim, W), unitPayment = 0n;
+  const usdt = paymentToken === USDT;
+  const quoteSelector = usdt ? '725c4058' : '68bce8cd';
+  if (code.includes(quoteSelector)) unitPayment = decodeAbiUint(await call(project, '0x' + quoteSelector + w(1))) || 0n;
+  if (!usdt && unitPayment === 0n) for (const selector of ['8d859f3e', 'a035b1fe', '6817c76c', '13faede6', '817b1cd2']) if (code.includes(selector)) { const price = decodeAbiUint(await call(project, '0x' + selector)); if (price > 0n) { unitPayment = price; break; } }
+  if (unitPayment <= 0n) throw new Error('无法核验项目铸造单价，不自动付费');
+  const paid = usdt ? paymentWei : valueWei;
+  if (quantity === null) {
+    if (paid <= 0n || paid % unitPayment !== 0n || paid / unitPayment > 10000n) throw new Error('无法从付款与单价核验铸造份数');
+    quantity = Number(paid / unitPayment);
+  } else {
+    const quoted = code.includes(quoteSelector) ? decodeAbiUint(await call(project, '0x' + quoteSelector + w(quantity))) : unitPayment * BigInt(quantity);
+    if (quoted === null || quoted <= 0n || paid < quoted || paid > (quoted * 120n + 99n) / 100n) throw new Error('本次付款超出已核验份数的项目报价及价格余量');
+    // Discounted/bundled quotes can only reduce the total-size lower bound.
+    if (quoted / BigInt(quantity) < unitPayment) unitPayment = quoted / BigInt(quantity);
+  }
+  if (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > 10000) throw new Error('无法核验本次铸造份数，不自动付费');
+  let paymentBnb = valueWei, unitBnbWei = unitPayment;
+  if (usdt) {
+    const price = await bnbUsd(), micros = Math.floor(price * 1000000), highMicros = Math.ceil(price * 1000000);
+    if (!Number.isSafeInteger(micros) || micros <= 0) throw new Error('无法核验项目规模的最新 BNB/USD 报价');
+    unitBnbWei = unitPayment * 1000000n / BigInt(highMicros);
+    paymentBnb += (paymentWei * 1000000n + BigInt(micros) - 1n) / BigInt(micros);
+  }
+  if (amountBnbWei !== null && BigInt(amountBnbWei) < paymentBnb) throw new Error('实际付款超出项目预占金额');
+  return MINT_PARTICIPATION.quote({ project, cap: progress.cap, sold: progress.sold, unitBnbWei, quantity, amountBnbWei: amountBnbWei ?? paymentBnb, legacyUnknown: legacyParticipationUnknown(project), excludeId: W.paidReservation?.participationId });
+}
+function settleMintParticipation(pending, result, scope = null) {
+  if (!pending.participationId || !result.resolved) return;
+  if (pending.participationFinal && result.status === 'confirmed') MINT_PARTICIPATION.settle(pending.participationId, { status: 'confirmed', txHash: result.txHash });
+  else if (result.status === 'reverted' || !scope && result.status === 'confirmed') MINT_PARTICIPATION.settle(pending.participationId, { status: 'reverted' });
+}
 function applyManualMintCompletion(W, pending, txHash) {
   const project = pending.manualMintProject;
   if (!project) return;
   if (pending.kind !== 'contract' || pending.walletId !== W.id || pending.walletAddress !== W.addr || !validMintAddress(project) || pending.expected?.to?.toLowerCase() !== project || !validMintCalldata(pending.expected?.inputData, true) || badSel(pending.expected.inputData) || !/^0x[0-9a-f]{64}$/i.test(txHash || '')) throw new Error('手动铸造完成凭证无法绑定原钱包与项目');
+  if (!pending.participationId) MINT_PARTICIPATION.markUnknown(project);
   S.paid ||= {}; const P = S.paid[project] ||= { at: Date.now(), name: '', done: {} }; P.done ||= {}; P.done[W.id] = 'minted';
   if (FORCE.has(project) && WALLETS.every(wallet => P.done[wallet.id] === 'minted')) { S.forceDone ||= {}; S.forceDone[project] = 1; }
   save(true);
@@ -1449,6 +1529,10 @@ async function previewExecInner(W, to, data, valueWei, check, recheck, opts = {}
   if (valueWei > 0n && !(paymentPrice > 0)) throw new Error('无法核验本笔付款的 USD 成本');
   const paymentUsd = Number(valueWei) / 1e18 * paymentPrice + (opts.paymentToken === USDT ? Number(opts.paymentWei || 0n) / 1e18 : 0);
   const riskQuote = W.operationKind === 'token-sell' ? null : await MINT_RISK.quoteTransaction(W, { to, data, valueWei, keepBnb: PAID.keepBnb, paid: true, manual: opts.manual === true, project: !isApproval, paymentToken: opts.paymentToken, paymentWei: opts.paymentWei ?? valueWei, paymentUsd, quantity: mintQuantity(data, sim, W), nftEvidence: !isApproval && simulationNftGain(sim, W) });
+  if (riskQuote && !isApproval && opts.manual !== true) {
+    riskQuote.participationPlan = await quoteAutomaticParticipation(W, to, data, valueWei, { paymentToken: opts.paymentToken, paymentWei: opts.paymentWei ?? valueWei, sim, amountBnbWei: W.paidReservation?.totalWei });
+    if (W.paidReservation?.participationPlan && riskQuote.participationPlan.quantity !== W.paidReservation.participationPlan.quantity) throw new Error('最终铸造份数与补款前的项目预占不一致');
+  }
   if (riskQuote && valueWei > 0n) riskQuote.paymentUsdMicros = usdBudgetMicros(paymentUsd);
   if (riskQuote && !isApproval && opts.manual === true && opts.manualMintProject === to.toLowerCase() && W.operationKind !== 'token-sell') riskQuote.manualMintProject = to.toLowerCase();
   if (riskQuote && !isApproval) riskQuote.mintTracking = mintTrackingPlan(W, sim, paymentUsd, riskQuote.mintToken || opts.fallbackToken);
@@ -1519,7 +1603,7 @@ async function confirmWalletResult(W, scope = null) {
   if (!pending) throw new Error('結果不明：缺少已保存的交易意图');
   for (let attempt = 0; attempt < 12; attempt++) {
     const result = await reconcileScannerPending({ wallet: W.profile, pending, runWallet: async (args) => (await W.baw(args, 30000)).j, rpc, budget: scope ? { settle: async () => {} } : scannerBudget(), root: DIR });
-    if (result.resolved) { await settleConfirmedMintRisk(pending, result); if (result.status === 'confirmed') { applyMintTracking(W, pending, result.txHash); applyManualMintCompletion(W, pending, result.txHash); pending.txHash = result.txHash; } return result.status === 'confirmed'; }
+    if (result.resolved) { await settleConfirmedMintRisk(pending, result); settleMintParticipation(pending, result, scope); if (result.status === 'confirmed') { applyMintTracking(W, pending, result.txHash); applyManualMintCompletion(W, pending, result.txHash); pending.txHash = result.txHash; } return result.status === 'confirmed'; }
     if (result.status === 'review') break;
     await sleep(2000);
   }
@@ -1543,7 +1627,7 @@ function recoverScannerWallet(W) {
     const pending = S.walletPending?.[W.id]; if (!pending) return null;
     const result = await reconcileScannerPending({ wallet: W.profile, pending, runWallet: async args => (await W.baw(args, 30000)).j, rpc, budget: scannerBudget(), root: DIR });
     if (result.resolved && S.walletPending[W.id] === pending) {
-      await settleConfirmedMintRisk(pending, result);
+      await settleConfirmedMintRisk(pending, result); settleMintParticipation(pending, result);
       if (result.status === 'confirmed') { applyMintTracking(W, pending, result.txHash); applyManualMintCompletion(W, pending, result.txHash); }
       if (pending.reservationDay === S.paidSpend?.day) S.paidSpend[W.id] = Math.max(0, (S.paidSpend[W.id] || 0) - Number(pending.reservedAmountWei || 0) / 1e18 + Number(result.spentWei || 0) / 1e18);
       delete S.walletPending[W.id];
@@ -1572,10 +1656,13 @@ async function runPaidCommand(W, args, amountWei = 0n, expected = null, riskQuot
   const failureSpent = scope ? scope.spentWei : 0n;
   const successUsd = scope ? isFinalMint ? scope.totalUsdMicros : scope.spentUsdMicros + (kind === 'market-order' ? BigInt(usdBudgetMicros(Number(amountWei) / 1e18 * scope.price)) : 0n) : BigInt(paymentUsdMicros);
   const failureUsd = scope ? scope.spentUsdMicros : 0n;
-  let mintRiskReservation;
-  try { mintRiskReservation = riskQuote ? MINT_RISK.reserve(riskQuote) : null; }
-  catch (error) { if (reservation) await scannerBudget().settle(reservation.id, { spentWei: 0n, spentUsdMicros: '0' }); throw error; }
-  const pending = { version: 1, walletId: W.id, walletAddress: W.addr, walletIndex: W.index, kind, createdAt: Date.now(), amountWei: amountWei.toString(), expected: kind !== 'market-order' ? expected : { fromToken: field('--fromToken'), toToken: field('--toToken'), fromTokenQty: field('--fromTokenQty') }, ...(allocation ? { reservationId: allocation.id, reservationDay: allocation.day, reservedAmountWei: allocation.amountWei, ...(allocation.amountUsdMicros !== undefined ? { reservedAmountUsdMicros: allocation.amountUsdMicros } : {}) } : { reservedAmountWei: '0' }), ...(mintRiskReservation ? { mintRiskReservation } : {}), ...(riskQuote?.manualMintProject ? { manualMintProject: riskQuote.manualMintProject } : {}), ...(riskQuote?.mintTracking ? { mintTracking: { ...riskQuote.mintTracking, costUsdMicros: successUsd.toString() } } : {}), settlement: { successSpentWei: successSpent.toString(), failureSpentWei: failureSpent.toString(), ...(allocation?.amountUsdMicros !== undefined ? { successSpentUsdMicros: successUsd.toString(), failureSpentUsdMicros: failureUsd.toString() } : {}) } };
+  let mintRiskReservation, ownParticipationId = null;
+  let participationId = scope?.participationId || null;
+  try {
+    if (riskQuote?.participationPlan && !participationId) participationId = ownParticipationId = MINT_PARTICIPATION.reserve(riskQuote.participationPlan, W.id);
+    mintRiskReservation = riskQuote ? MINT_RISK.reserve(riskQuote) : null; }
+  catch (error) { if (ownParticipationId) MINT_PARTICIPATION.release(ownParticipationId); if (reservation) await scannerBudget().settle(reservation.id, { spentWei: 0n, spentUsdMicros: '0' }); throw error; }
+  const pending = { ...(participationId ? { participationId, participationFinal: scope ? !!isFinalMint : true } : {}), version: 1, walletId: W.id, walletAddress: W.addr, walletIndex: W.index, kind, createdAt: Date.now(), amountWei: amountWei.toString(), expected: kind !== 'market-order' ? expected : { fromToken: field('--fromToken'), toToken: field('--toToken'), fromTokenQty: field('--fromTokenQty') }, ...(allocation ? { reservationId: allocation.id, reservationDay: allocation.day, reservedAmountWei: allocation.amountWei, ...(allocation.amountUsdMicros !== undefined ? { reservedAmountUsdMicros: allocation.amountUsdMicros } : {}) } : { reservedAmountWei: '0' }), ...(mintRiskReservation ? { mintRiskReservation } : {}), ...(riskQuote?.manualMintProject ? { manualMintProject: riskQuote.manualMintProject } : {}), ...(riskQuote?.mintTracking ? { mintTracking: { ...riskQuote.mintTracking, costUsdMicros: successUsd.toString() } } : {}), settlement: { successSpentWei: successSpent.toString(), failureSpentWei: failureSpent.toString(), ...(allocation?.amountUsdMicros !== undefined ? { successSpentUsdMicros: successUsd.toString(), failureSpentUsdMicros: failureUsd.toString() } : {}) } };
   S.walletPending ||= {}; S.walletPending[W.id] = pending; save(true);
   let result;
   try {
@@ -1594,6 +1681,7 @@ async function runPaidCommand(W, args, amountWei = 0n, expected = null, riskQuot
     }
     if (!result.j?.success) {
       if (mintRiskReservation && !pending.txHash && !pending.orderId) MINT_RISK.settle(mintRiskReservation, { rejected: true });
+      if (participationId) MINT_PARTICIPATION.release(participationId);
       pending.phase = 'rejected'; pending.rejection = result.j.error?.name; save(true);
       if (reservation) await scannerBudget().settle(reservation.id, { spentWei: 0n, spentUsdMicros: '0' });
       delete S.walletPending[W.id]; save(true); return result;
@@ -1680,8 +1768,11 @@ async function executeUsdtMintInner(W, { to, data, need, value = 0n, recheck = n
   const projectInfo = await MINT_RISK.projectCheck(to, { paying: true, paymentToken: USDT, paymentWei: need, paymentUsd: chargeUsd, quantity: mintQuantity(data, null, W), manual });
   if (value > 0n) await MINT_RISK.projectCheck(to, { paying: true, paymentWei: value, paymentUsd: chargeUsd, quantity: mintQuantity(data, null, W), manual });
   if (swapBnb > 0 && balance < swapBnb + valueBnb + PAID.keepBnb + 0.001) throw new Error('补款后不足以保留 gas 及 BNB 保留额');
-  const reservation = await scannerBudget().reserve({ wallet: W.profile, config: currentRuntimeConfig(), amountWei: bnbBudgetWei(chargeBnb), amountUsdMicros: usdBudgetMicros(chargeUsd), ...(projectInfo?.nft ? { projectId: to.toLowerCase(), projectLimitUsdMicros: '10000000' } : {}), legacySpent: S.paidSpend });
-  const scope = { reservation, totalWei: bnbBudgetWei(chargeBnb), finalTarget: to, finalData: data, spentWei: 0n, totalUsdMicros: BigInt(usdBudgetMicros(chargeUsd)), spentUsdMicros: 0n, price, unknown: false }; W.paidReservation = scope;
+  const participationPlan = manual ? null : await quoteAutomaticParticipation(W, to, data, value, { paymentToken: USDT, paymentWei: need, amountBnbWei: bnbBudgetWei(chargeBnb) });
+  const participationId = participationPlan ? MINT_PARTICIPATION.reserve(participationPlan, W.id) : null;
+  let reservation;
+  try { reservation = await scannerBudget().reserve({ wallet: W.profile, config: currentRuntimeConfig(), amountWei: bnbBudgetWei(chargeBnb), amountUsdMicros: usdBudgetMicros(chargeUsd), ...(projectInfo?.nft ? { projectId: to.toLowerCase(), projectLimitUsdMicros: '10000000' } : {}), legacySpent: S.paidSpend }); } catch (error) { if (participationId) MINT_PARTICIPATION.release(participationId); throw error; }
+  const scope = { reservation, participationId, participationPlan, totalWei: bnbBudgetWei(chargeBnb), finalTarget: to, finalData: data, spentWei: 0n, totalUsdMicros: BigInt(usdBudgetMicros(chargeUsd)), spentUsdMicros: 0n, price, unknown: false }; W.paidReservation = scope;
   try {
     if (swapBnb > 0) {
       // The official CLI chooses the swap route. Reserve a conservative fee
@@ -1705,6 +1796,7 @@ async function executeUsdtMintInner(W, { to, data, need, value = 0n, recheck = n
       S.paidSpend[W.id] = spent + chargeBnb; save(true);
       await markWalletBlocked(W.profile, 'USDT 铸造执行结果尚未核对', { root: DIR, details: { reservationId: reservation.id } });
     } else {
+      if (participationId) MINT_PARTICIPATION.release(participationId);
       await scannerBudget().settle(reservation.id, { spentWei: scope.spentWei, spentUsdMicros: scope.spentUsdMicros.toString() });
       if (S.walletPending[W.id]?.reservationId === reservation.id) delete S.walletPending[W.id];
       save(true);
@@ -1781,8 +1873,25 @@ function markUnmintable(c, P, sym, progress, why = '要官網簽名或白名單'
   if (false && (heatTier(P) >= 1 || ((progress || 0) >= 0.4 && (progress || 0) < 0.95))) tg(`⚠️ ${sym || P.name || '新項目'} 達到進場條件（累計 ${P.agents || 0} 個代理人${progress > 0 ? '，進度約 ' + Math.round(progress * 100) + '%' : ''}），但工具打不了：${why}。要的話請手動\n${c}`).catch(() => {});
 }
 function noteFail(c, P, sym, progress) { P.cf = (P.cf || 0) + 1; if (P.cf >= 8) markUnmintable(c, P, sym, progress, '模擬鑄造一直失敗，可能已賣完、要官網簽名、白名單或已關閉'); } // 重試 4 輪（兩個錢包）都失敗就不再試
-const agentCache = new Map(); // 地址 → 有沒有 .ai Agent ID
-async function rpcBatch(reqs) { const out = []; for (let i = 0; i < reqs.length; i += 100) { for (const u of ['https://bsc-rpc.publicnode.com', 'https://bsc-dataseed.bnbchain.org', 'https://bsc.publicnode.com']) { let got = 0; try { const j = await (await fetch(u, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(reqs.slice(i, i + 100).map((r, k) => ({ jsonrpc: '2.0', id: i + k, ...r }))), signal: AbortSignal.timeout(20000) })).json(); for (const r of (Array.isArray(j) ? j : [])) if (r.result !== undefined) { out[r.id] = r.result; got++; } } catch {} if (got) break; } } return out; } /* 除錯 11/1：只用一個節點，被限流時整批查不到 → Agent ID 人數算成 0（GOOSE 534 人在打卻顯示 0） */
+const agentCache = new Map(); // Legacy cache is never used as wallet-age or nonce proof.
+async function rpcBatch(reqs) {
+  const out = [];
+  for (let offset = 0; offset < reqs.length; offset += 100) {
+    const batch = reqs.slice(offset, offset + 100);
+    for (const url of ['https://bsc-rpc.publicnode.com', 'https://bsc-dataseed.bnbchain.org', 'https://bsc.publicnode.com']) {
+      try {
+        const response = await (await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(batch.map((request, index) => ({ jsonrpc: '2.0', id: offset + index, ...request }))), signal: AbortSignal.timeout(20000) })).json();
+        if (!Array.isArray(response)) continue;
+        const ids = new Set(); let invalid = false, got = 0;
+        for (const entry of response) { if (!entry || !Number.isInteger(entry.id) || entry.id < offset || entry.id >= offset + batch.length || ids.has(entry.id)) { invalid = true; break; } ids.add(entry.id); if (entry.result !== undefined) got++; }
+        if (invalid || !got) continue;
+        for (const entry of response) if (entry.result !== undefined) out[entry.id] = entry.result;
+        break;
+      } catch {}
+    }
+  }
+  return out;
+}
 async function heatOf(c, P) { // Only transaction senders with a verified Agent ID count.
   const hadHeat = Boolean(P.heatAt); P.agents = 0; P.burst = 0; P.heatAt = 0;
   const head = parseInt(await rpc('eth_blockNumber', []), 16); let tok = ''; const tr = await call(c, '0xfc0c546a'); if (tr && tr.length >= 66 && BigInt(tr.slice(0, 66)) > 0n) tok = '0x' + tr.slice(26, 66).toLowerCase();
@@ -1799,12 +1908,8 @@ async function heatOf(c, P) { // Only transaction senders with a verified Agent 
     const transactions = await rpcBatch(recent.map(([hash]) => ({ method: 'eth_getTransactionByHash', params: [hash] })));
     recent.forEach(([, block], index) => { const sender = String(transactions[index]?.from || '').toLowerCase(); if (!/^0x[0-9a-f]{40}$/.test(sender) || skip.has(sender)) return; if (!last.has(sender) || last.get(sender) < block) last.set(sender, block); });
   }
-  const unknown = [...last.keys()].filter(address => !(agentCache.get(address)?.at > Date.now() - 60000)).slice(0, 800);
-  if (unknown.length) {
-    const res = await rpcBatch(unknown.map(address => ({ method: 'eth_call', params: [{ to: '0x' + REGISTRY, data: '0x70a08231' + wa(address) }, 'latest'] })));
-    unknown.forEach((address, index) => { const value = res[index]; if (typeof value === 'string' && /^0x[0-9a-f]{64}$/i.test(value)) agentCache.set(address, { value: BigInt(value) > 0n, at: Date.now() }); });
-  }
-  let agents = 0, burst = 0; for (const [address, block] of last) { const proof = agentCache.get(address); if (proof?.at > Date.now() - 60000 && proof.value) { agents++; if (block >= head - 400) burst++; } }
+  const eligible = await AGENT_MATURITY.qualify([...last.keys()]);
+  let agents = 0, burst = 0; for (const [address, block] of last) if (eligible.has(address)) { agents++; if (block >= head - 400) burst++; }
   P.agents = agents; P.burst = burst; P.heatAt = Date.now();
 }
 const hk = (P) => (P.heatAt || 0) + (heatTier(P) >= 1 || (P.progress || 0) >= 0.2 ? 0 : 540e3);
@@ -1958,6 +2063,7 @@ async function paidLoop(mode = 'all', shard = null) {
     { const now = Date.now(); P.ph = (P.ph || []).filter((x) => now - x.t < 15 * 60e3); if (!P.ph.length || now - P.ph[P.ph.length - 1].t > 10e3) P.ph.push({ t: now, p: progress }); }
     price = price || (await bnbUsd());
     const projectInfo = await MINT_RISK.contractInfo(c);
+    try { await refreshMatureHeat(c, P); } catch (error) { P.lastReason = error.message; P.policyDeferredAt = Date.now(); continue; }
     const needPct = effectiveEntryPolicy(ENTRY_POLICY, PAID.goPct, { nft: projectInfo.nft }).goPct;
     const entry = entryGate({ progress, agents: P.agents || 0, configuredPct: PAID.goPct, policy: ENTRY_POLICY, nft: projectInfo.nft });
     if (!entry.allowed) { P.lastReason = entry.reason; continue; }
@@ -2117,7 +2223,7 @@ async function paidLoop(mode = 'all', shard = null) {
           if (tku) { const tracked = S.dyn.find(token => token.addr === tku.toLowerCase() && token.only === W.addr); if (tracked) tracked.deployer = P.deployer; }
           await tg(`🛒 [${W.name}] 自動打了付費 Agent ID 項目：${sym}\n${n} 份，花 ${cu.toFixed(2)} USDT（由 BNB 換）· 已售 ${sold ?? '?'} 份 · 進度約 ${Math.round(progress * 100)}%\n${c}\n交易 ${r.tx}\n已加入監控：${ruleTxt()}`);
         }
-      } catch (e) { if (e.message.includes('結果不明')) { P.done[W.id] = 'unknown'; save(true); logWallet(W, `paid ${c} ${e.message}`); await tg(`⚠️ [${W.name}] ${sym} 送出結果不明（逾時），為避免重打已停止，請到錢包確認有沒有打到\n${c}`); return; } if (e.message.includes('已開池')) { P.done[W.id] = 'pool-cheaper'; logWallet(W, `paid ${c} ${e.message}`); return; } if (/價格剛剛漲了/.test(e.message)) { logWallet(W, `paid ${c} ${e.message}（下一輪再打）`); return; } P.failW = P.failW || {}; P.failW[W.id] = (P.failW[W.id] || 0) + 1; P.fail = (P.fail || 0) + 1; logWallet(W, `paid ${c} ${e.message}`); if (kind === 'replay' && P.fail >= 6) { markUnmintable(c, P, sym, progress, '照別人的方式預演一直失敗'); return; } /* 審查 11/1：照抄型 2 次失敗就放棄太快、價格變動不算失敗、失敗按錢包算 */ if (P.failW[W.id] >= 6) { P.done[W.id] = 'fail'; await tg(`⚠️ [${W.name}] 付費項目 ${sym} 自動打失敗，已放棄：${e.message.slice(0, 150)}\n${c}`); } }
+      } catch (e) { if (e.code === 'MINT_POLICY_DEFERRED') { P.lastReason = e.message; P.policyDeferredAt = Date.now(); logWallet(W, `等待项目条件 ${c}：${e.message}`); return; } if (e.message.includes('結果不明')) { P.done[W.id] = 'unknown'; save(true); logWallet(W, `paid ${c} ${e.message}`); await tg(`⚠️ [${W.name}] ${sym} 送出結果不明（逾時），為避免重打已停止，請到錢包確認有沒有打到\n${c}`); return; } if (e.message.includes('已開池')) { P.done[W.id] = 'pool-cheaper'; logWallet(W, `paid ${c} ${e.message}`); return; } if (/價格剛剛漲了/.test(e.message)) { logWallet(W, `paid ${c} ${e.message}（下一輪再打）`); return; } P.failW = P.failW || {}; P.failW[W.id] = (P.failW[W.id] || 0) + 1; P.fail = (P.fail || 0) + 1; logWallet(W, `paid ${c} ${e.message}`); if (kind === 'replay' && P.fail >= 6) { markUnmintable(c, P, sym, progress, '照別人的方式預演一直失敗'); return; } /* 審查 11/1：照抄型 2 次失敗就放棄太快、價格變動不算失敗、失敗按錢包算 */ if (P.failW[W.id] >= 6) { P.done[W.id] = 'fail'; await tg(`⚠️ [${W.name}] 付費項目 ${sym} 自動打失敗，已放棄：${e.message.slice(0, 150)}\n${c}`); } }
     })));
     } finally { busyP.delete(c); const dt = Date.now() - tE; if (dt > 10e3) log(`檢查 ${c} 花了 ${Math.round(dt / 1000)} 秒（${mode}）`); }
   }
@@ -2271,7 +2377,7 @@ async function manualMints() {
 }
 // ── TG 指令：使用者直接在機器人打「賣 XXX」「賣 XXX 一半」「餘額」，幾秒內執行，不經過 Claude ──
 // ── 更新提醒（開源版才開；使用者 11/1 00:47：不自動更新，只提醒；用戶回 /update 才更新，更新前安檢＋sha256＋備份，新版起不來自動換回）──
-const UPD = { on: false, ver: '2.7.9', repo: 'nancyc0813-maker/agentid-sniper', group: 't.me/nancy_c0813' }; /* Web 增强版仅由 Web 后台检查自己的正式发行；扫描器不查询或安装 Nancy 上游版本。 */
+const UPD = { on: false, ver: '2.8.1', repo: 'nancyc0813-maker/agentid-sniper', group: 't.me/nancy_c0813' }; /* Web 增强版仅由 Web 后台检查自己的正式发行；扫描器不查询或安装 Nancy 上游版本。 */
 const verGt = (a, b) => { const x = String(a).split('.').map(Number), y = String(b).split('.').map(Number); for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0); return false; };
 async function updCheck(quiet = false) {
   if (!UPD.on) return null;
@@ -2396,7 +2502,7 @@ async function tgCmdLoop() {
 let HOLDINGS_SCHEDULER = null;
 function startHoldingsScheduler() {
   if (HOLDINGS_SCHEDULER) return HOLDINGS_SCHEDULER;
-  let stopped = false, busy = false, lastFullStarted = null, lastFastStarted = null;
+  let stopped = false, busy = false, lastFullStarted = null, lastFastStarted = null, lastOpenStarted = Date.now();
   let timer;
   const stop = () => { stopped = true; if (timer) clearInterval(timer); };
   const tick = async () => {
@@ -2406,10 +2512,12 @@ function startHoldingsScheduler() {
     const activeFast = Object.values(S.tokens).some((state) => state.openAt && now - state.openAt < (state.effectiveRules?.fastMin ?? RULE.fastMin) * 60000 && state.stage !== 9 && !state.done);
     const fullDue = lastFullStarted === null || now - lastFullStarted >= 5000;
     const fastDue = activeFast && (lastFastStarted === null || now - lastFastStarted >= 1000);
-    if (!fullDue && !fastDue) return;
-    const onlyFast = !fullDue;
+    const openDue = now - lastOpenStarted >= 15000;
+    if (!fullDue && !fastDue && !openDue) return;
+    const onlyFast = openDue ? 'open' : !fullDue;
     busy = true; S.holdingsInFlight = true; S.holdingsStartedAt = now;
-    if (fullDue) { lastFullStarted = now; lastFastStarted = now; } else lastFastStarted = now;
+    if (openDue) lastOpenStarted = now;
+    else if (fullDue) { lastFullStarted = now; lastFastStarted = now; } else lastFastStarted = now;
     let partial = false;
     try {
       const head = Number.parseInt(await rpc('eth_blockNumber', []), 16);
@@ -2419,8 +2527,9 @@ function startHoldingsScheduler() {
       if (result?.pending) { S.holdingsScope = 'partial'; partial = true; return; }
       if (stopped || existsSync(join(DIR, 'WATCH_STOP'))) return;
       S.holdingsUpdatedAt = Date.now();
-      S.holdingsScope = onlyFast ? 'fast' : 'all';
-      if (onlyFast) S.holdingsFastUpdatedAt = S.holdingsUpdatedAt;
+      S.holdingsScope = onlyFast === 'open' ? 'opening' : onlyFast ? 'fast' : 'all';
+      if (onlyFast === 'open') S.holdingsOpenUpdatedAt = S.holdingsUpdatedAt;
+      else if (onlyFast) S.holdingsFastUpdatedAt = S.holdingsUpdatedAt;
       else S.holdingsFullUpdatedAt = S.holdingsUpdatedAt;
       delete S.holdingsError; delete S.holdingsErrorAt;
     } catch (error) {

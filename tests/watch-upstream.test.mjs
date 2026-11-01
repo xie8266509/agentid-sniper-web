@@ -7,6 +7,7 @@ import { marketOrderRecord, marketOrderState } from '../lib/sell-rules.mjs';
 import { scannerRuntimeDouble } from './watch-runtime-fixture.mjs';
 import { createMintRisk, effectiveEntryPolicy, entryGate, deriveMintCost } from '../lib/mint-policy.mjs';
 import { id as signatureHash } from 'ethers';
+import { createMintParticipation } from '../lib/mint-participation.mjs';
 import { decodeAbiUint } from '../lib/nft-codec.mjs';
 
 // Only evaluate the reviewed function bodies. Every RPC, CLI, file, and Telegram
@@ -34,13 +35,13 @@ const transferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4
 const bad = new Set(['0xa9059cbb', '0x095ea7b3', '0x23b872dd', '0x42842e0e', '0xb88d4fde', '0xa22cb465', '0x39509351', '0xd505accf', '0xf242432a', '0x2eb2c2d6']);
 const limitSelector = signatureHash('maxPerWallet()').slice(0, 10);
 
-function harness(options = {}) {
+export function harness(options = {}) {
   let clock = Date.now();
   class Clock extends Date { constructor(...args) { super(...(args.length ? args : [clock])); } static now() { return clock; } }
   const events = { previews: [], swaps: [], writes: [], logs: [], notifications: [], reads: 0, learned: 0 };
   const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai' }).format(new Clock());
-  const P = { at: clock, name: 'TEST', done: {}, old: false, wallets: 20, agents: 175, ph: [], replay: { data: '0x12345678', value: '0', payTok: USDT, payAmt: String(10n * 10n ** 18n), hot: 15, learned: 1, learnedAt: clock } };
-  const S = { paid: { [target]: P }, agentsV: 2, mintPolicy: { wallets: {} }, dyn: [], migrated2: 1, paidSpend: { day, test: options.spent || 0 }, seenMints: {} };
+  const P = { at: clock, name: 'TEST', done: {}, old: false, wallets: 20, agents: 175, heatAt: clock, ph: [], replay: { data: '0x12345678', value: '0', payTok: USDT, payAmt: String(10n * 10n ** 18n), hot: 15, learned: 1, learnedAt: clock } };
+  const S = { paid: { [target]: P }, agentsV: 3, mintPolicy: { wallets: {} }, dyn: [], migrated2: 1, paidSpend: { day, test: options.spent || 0 }, seenMints: {} };
   const W = { id: 'test', name: 'test', profile: { id: 'test', address: walletAddress }, addr: walletAddress, async baw(args) { events.swaps.push(args); return { j: { success: true, data: { txHash: '0x' + 'ab'.repeat(32) } } }; } };
   const balanceChanges = options.noReward ? [] : [{ owner: walletAddress, contractAddress: reward, change: '1', tokenType: 'Erc20' }];
   const sandbox = {
@@ -57,11 +58,11 @@ function harness(options = {}) {
     fpCache: new Map(),
     async freeProgress() { return options.freeProgress === undefined ? 0.9 : options.freeProgress; },
     async serialDev() { return options.serialReason || ''; },
-    async fullCode() { return '0x' + (options.refund === false ? '' : '63590e1ae3') + (options.noLimit ? '' : limitSelector.slice(2)) + (options.nft ? 'c87b56dd' : ''); },
+    async fullCode() { if (options.actualScale) return '0x68bce8cd725c4058' + limitSelector.slice(2); return '0x' + (options.refund === false ? '' : '63590e1ae3') + (options.noLimit ? '' : limitSelector.slice(2)) + (options.nft ? 'c87b56dd' : ''); },
     async poolOpen() { return options.poolOpen === true; },
     trackFromSim() {}, noteFree() {}, MQ: new Map(),
     async autoMintMax(c, name, wallet, value) { return sandbox.api.autoMint(c, name, wallet, value); },
-    async progressOf() { return { progress: 0 }; }, async deployerOf() { return ''; }, isRepeatDev() { return false; }, isSerial() { return false; },
+    async progressOf() { return options.actualScale ? { progress: .9, cap: options.scaleCap ?? 10000, sold: options.scaleSold ?? 9000 } : { progress: 0 }; }, async deployerOf() { return ''; }, isRepeatDev() { return false; }, isSerial() { return false; },
     async logsRpc(params) { return sandbox.rpc('eth_getLogs', params); },
     async poolOut() { return 0n; }, async groupProgress() {}, async tg(message) { events.notifications.push(message); }, async tgSay() {}, async sleep() {},
     ts: () => 'mock-time',
@@ -76,7 +77,7 @@ function harness(options = {}) {
       if (method === 'eth_getCode') return '0x6000';
       if (method === 'eth_getBlockNumber' || method === 'eth_blockNumber') return '0x1000';
       if (method === 'eth_call' && params?.[0]?.data?.startsWith('0x70a08231')) return '0x' + word(1000n * 10n ** 18n);
-      if (method === 'eth_call' && params?.[0]?.data === limitSelector) return '0x' + word(10);
+      if (method === 'eth_call' && params?.[0]?.data === limitSelector) return '0x' + word(options.limitValue ?? 10);
       if (method === 'eth_call' && params?.[0]?.data?.startsWith('0xc87b56dd')) { const bytes = Buffer.from('https://mock-nft.test/1.json'); return '0x' + word(32) + word(bytes.length) + bytes.toString('hex').padEnd(Math.ceil(bytes.length / 32) * 64, '0'); }
       if (method === 'eth_call') return '0x';
       if (method === 'eth_getLogs') return [];
@@ -88,6 +89,8 @@ function harness(options = {}) {
         const toppedUp = options.usdtArrives && events.swaps.length;
         return '0x' + word(toppedUp ? 1000n * 10n ** 18n : options.usdtBalance ?? 1000n * 10n ** 18n);
       }
+      if (options.actualScale && data.startsWith('0x68bce8cd')) return '0x' + word(BigInt('0x' + data.slice(10)) * BigInt(options.nativeUnit ?? 10n ** 15n));
+      if (options.actualScale && data.startsWith('0x725c4058')) return '0x' + word(BigInt('0x' + data.slice(10)) * BigInt(options.usdtUnit ?? 10n ** 18n));
       if (options.hotGo) return '0x' + word(0);
       if (data === '0x192fc516') return '0x' + word(90);
       if (data === '0xd8f93498') return '0x' + word(100);
@@ -106,8 +109,13 @@ function harness(options = {}) {
   };
   Object.assign(sandbox, scannerRuntimeDouble({ sandbox, wallet: W, state: S, events }));
   sandbox.MINT_RISK = createMintRisk({ state: S, rpc: (...args) => sandbox.rpc(...args), fullCode: (...args) => sandbox.fullCode(...args), nftMediaCheck: async () => ({ verified: true }), save: (...args) => sandbox.save(...args), now: () => clock, timeZone: 'Asia/Shanghai', usdt: USDT });
+  sandbox.MINT_PARTICIPATION = createMintParticipation({ state: S, save: (...args) => sandbox.save(...args), now: () => clock });
   const context = vm.createContext(sandbox);
   vm.runInContext((options.trackBasis ? extract('function trackFromSim(', 'function positionFor(') : extract('function mintTrackingPlan(', 'function positionFor(')) + helpers + addressSafety + policyHelpers + learner + paid + manual + autoMint + (options.realPreview ? extract('async function previewExec(', 'async function poolOut(') : '') + (options.withQueue ? extract('const MQK =', '// 每個錢包可以打多份的') : '') + '\nglobalThis.api = { executeUsdtMint, prepareUsdtReplay, mintSimulationCheck, approvalSimulationCheck, validateFileJob, manualMints, paidLoop, learnReplay, safeAddrs, revokeOnFail, hasPositiveMintGain, autoMint, previewExec, settleConfirmedMintRisk, recoverScannerWallet, applyManualMintCompletion, othersPay, verifyAgentProject, queuePaidPhase, queueMint: typeof queueMint === \'function\' ? queueMint : null };', context);
+  if (!options.actualScale) sandbox.quoteAutomaticParticipation = async (_W, project, _data, value, opts = {}) => {
+    const amount = BigInt(opts.amountBnbWei ?? (BigInt(value) + (opts.paymentToken === USDT ? BigInt(opts.paymentWei || 0) / 1000n : 0n)));
+    return sandbox.MINT_PARTICIPATION.quote({ project, cap: '1000000000000000000000', sold: '1000', quantity: '1', unitBnbWei: amount || 1n, amountBnbWei: amount || 1n, excludeId: _W.paidReservation?.participationId });
+  };
   return { api: sandbox.api, context, sandbox, events, P, S, W };
 }
 
@@ -188,7 +196,7 @@ test('file queues reject legacy schemas, unknown fields, unsafe calldata and qua
 });
 
 test('unlearned replay records refresh, and hot fallback without a usable history base does not throw', async () => {
-  const h = harness({ hotGo: true });
+  const h = harness({ hotGo: true }); h.sandbox.refreshMatureHeat = async () => {}; // This fixture advances the clock to exercise learning, not Agent-age RPC.
   h.sandbox.progressOf = async () => ({ progress: null });
   h.P.replay = { data: '0x12345678', value: String(10n ** 16n) }; h.P.ph = [];
   h.P.agents = 175; h.P.burst = 15; // unreadable progress still requires the verified-sender threshold
@@ -787,4 +795,49 @@ test('manual USDT approval cannot complete the project, but the bound final mint
   assert.deepEqual(submissions, ['approve', 'mint']); assert.equal(h.P.done.test, undefined); assert.equal(h.S.walletPending.test.manualMintProject, target);
   assert.equal((await h.api.recoverScannerWallet(h.W)).status, 'confirmed'); assert.equal(h.P.done.test, 'minted'); assert.equal(h.S.walletPending.test, undefined);
   await h.api.recoverScannerWallet(h.W); assert.deepEqual(submissions, ['approve', 'mint']);
+});
+
+
+test('a full remaining USDT project allocation is reserved once before approval and survives final revalidation', async () => {
+  const h = harness({ actualScale: true, realPreview: true, maxUsd: 30, limitValue: 20 });
+  const held = h.sandbox.MINT_PARTICIPATION.quote({ project: target, cap: '10000', sold: '9000', unitBnbWei: '1000000000000000', quantity: '180', amountBnbWei: '180000000000000000' });
+  const other = h.sandbox.MINT_PARTICIPATION.reserve(held, 'other-wallet'); h.sandbox.MINT_PARTICIPATION.settle(other, { status: 'confirmed', txHash: '0x' + 'cd'.repeat(32) });
+  const submissions = [];
+  h.W.baw = async args => {
+    if (args[1] === 'preview') { const to = args[args.indexOf('--to') + 1]; return { j: { success: true, data: { requestId: to === USDT ? 'approve' : 'mint', simulationResult: { balanceChanges: to === USDT ? [] : [{ owner: walletAddress, contractAddress: reward, change: '1', tokenType: 'Erc20' }], allowanceChanges: to === USDT ? [{ owner: walletAddress, contractAddress: USDT, spender: target }] : [], authorityChanges: [] } } } }; }
+    submissions.push(args[args.indexOf('--requestId') + 1]); return { j: { success: true, data: { txHash: '0x' + 'ab'.repeat(32) } } };
+  };
+  await h.api.executeUsdtMint(h.W, { to: target, data: '0xe38fd349' + word(20), need: 20n * 10n ** 18n });
+  assert.deepEqual(submissions, ['approve', 'mint']);
+  const entries = Object.values(h.S.mintParticipation.projects[target].reservations); assert.equal(entries.length, 2); assert.ok(entries.every(entry => entry.status === 'confirmed')); assert.equal(entries.reduce((sum, entry) => sum + BigInt(entry.quantity), 0n), 200n);
+});
+
+test('BNB mint quote allows the existing 0.5 percent fee buffer while charging every wei to the collective cap', async () => {
+  const h = harness({ actualScale: true, realPreview: true }), calls = attachMintWallet(h);
+  const value = 1005000000000000n;
+  await h.api.previewExec(h.W, target, '0xe38fd349' + word(1), value, sim => h.api.mintSimulationCheck(sim, h.W, { bnbWei: value }));
+  assert.equal(calls.filter(args => args[1] === 'execute').length, 1);
+  const [entry] = Object.values(h.S.mintParticipation.projects[target].reservations); assert.equal(entry.quantity, '1'); assert.equal(entry.amountBnbWei, value.toString()); assert.equal(entry.status, 'confirmed');
+});
+
+test('a scale failure before a USDT recharge produces no swap, approval, or execution', async () => {
+  const h = harness({ actualScale: true, realPreview: true, usdtBalance: 0n, scaleCap: 9999 });
+  const calls = attachMintWallet(h);
+  await assert.rejects(h.api.executeUsdtMint(h.W, { to: target, data: '0xe38fd349' + word(1), need: 10n ** 18n }), error => error.code === 'MINT_POLICY_DEFERRED');
+  assert.equal(calls.length, 0); assert.equal(h.events.reservationCalls?.length || 0, 0);
+});
+
+test('scale limits and missing project pricing stay deferred across repeated paid rounds without permanent failure counts', async () => {
+  const h = harness({ actualScale: true, realPreview: true, scaleCap: 9999 }), calls = attachMintWallet(h);
+  for (let attempt = 0; attempt < 8; attempt++) await h.api.paidLoop();
+  assert.equal(h.P.done.test, undefined); assert.equal(h.P.failW?.test, undefined); assert.equal(h.P.unmintable, undefined); assert.ok(h.P.policyDeferredAt); assert.equal(calls.filter(args => args[1] === 'execute').length, 0);
+});
+
+
+test('stale mature-wallet counts cannot authorize a fee mint when fresh qualification is unavailable', async () => {
+  const h = harness({ actualScale: true, realPreview: true }), calls = attachMintWallet(h);
+  h.P.heatAt = h.sandbox.Date.now() - 120001;
+  h.context.AGENT_MATURITY = { qualify: async () => { throw Error('mock historical proof unavailable'); } };
+  assert.match(await h.api.autoMint(target, 'mint-test', h.W, 10n ** 15n), /无法重新核验/);
+  assert.equal(h.P.agents, 0); assert.equal(h.P.heatAt, 0); assert.equal(calls.length, 0);
 });

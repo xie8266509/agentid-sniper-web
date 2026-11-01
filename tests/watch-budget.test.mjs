@@ -8,6 +8,7 @@ import { getPaidConfig, withinPaidBudget } from '../lib/config.mjs';
 import { marketOrderRecord, marketOrderState } from '../lib/sell-rules.mjs';
 import { scannerRuntimeDouble } from './watch-runtime-fixture.mjs';
 import { createMintRisk, effectiveEntryPolicy, entryGate } from '../lib/mint-policy.mjs';
+import { createMintParticipation } from '../lib/mint-participation.mjs';
 import { decodeAbiUint } from '../lib/nft-codec.mjs';
 import { id as signatureHash } from 'ethers';
 
@@ -23,7 +24,7 @@ const limitSelector = signatureHash('maxPerWallet()').slice(0, 10);
 
 function isolatedLoop(kind, { maxUsd = 20, maxBnbPerDay = 0.05, spent = 0, topUpNeverArrives = false } = {}) {
   const seen = { previews: [], swaps: 0, saves: 0, logs: [] };
-  const P = { at: Date.now(), name: 'TEST', done: {}, agents: 175, old: false };
+  const P = { at: Date.now(), name: 'TEST', done: {}, agents: 175, heatAt: Date.now(), old: false };
   if (kind === 'replay') P.replay = { value: (10n ** 16n).toString(), data: '0x12345678', sampleValue: (10n ** 16n).toString(), sampleData: '0x12345678' };
   if (kind === 'recv') P.recvValue = (10n ** 16n).toString();
   const codes = { replay: '0x', recv: '0x', gen: '0xa0712d688d859f3e', bnb: '0xe38fd34968bce8cd', usdt: '0x725c405894bf804d' };
@@ -32,7 +33,7 @@ function isolatedLoop(kind, { maxUsd = 20, maxBnbPerDay = 0.05, spent = 0, topUp
     seen.swaps++;
     return { j: { success: true, data: { txHash: '0x' + 'ab'.repeat(32) } } };
   } };
-  const S = { paid: { [target]: P }, agentsV: 2, mintPolicy: { wallets: {} }, dyn: [], migrated2: 1, paidSpend: { day: today(), [W.name]: spent } };
+  const S = { paid: { [target]: P }, agentsV: 3, mintPolicy: { wallets: {} }, dyn: [], migrated2: 1, paidSpend: { day: today(), [W.name]: spent } };
   const sandbox = {
     DIR: '/isolated', MONITOR_ONLY: false, CONFIG: { timeZone: 'Asia/Shanghai' }, S,
     PAID: getPaidConfig({ paid: { maxUsd, maxBnbPerDay, keepBnb: 0.006 } }),
@@ -86,8 +87,10 @@ function isolatedLoop(kind, { maxUsd = 20, maxBnbPerDay = 0.05, spent = 0, topUp
   sandbox.cc = async (c, data) => sandbox.call(c, data);
   Object.assign(sandbox, scannerRuntimeDouble({ sandbox, wallet: W, state: S, events: seen }));
   sandbox.MINT_RISK = createMintRisk({ state: S, rpc: (...args) => sandbox.rpc(...args), fullCode: (...args) => sandbox.fullCode(...args), save: (...args) => sandbox.save(...args), timeZone: 'Asia/Shanghai' });
+  sandbox.MINT_PARTICIPATION = createMintParticipation({ state: S, save: (...args) => sandbox.save(...args) });
   sandbox.mintUint = value => BigInt(value || 0); sandbox.validMintAddress = value => /^0x[0-9a-f]{40}$/i.test(value); sandbox.validMintCalldata = value => /^0x[0-9a-f]+$/i.test(value);
-  vm.runInNewContext(extract('function mintTrackingPlan(', 'function positionFor(') + extract('function mintQuantity(', 'async function previewExec(') + loopSource + usdtSource + '\nglobalThis.run = paidLoop;', sandbox);
+  vm.runInNewContext(extract('function mintTrackingPlan(', 'function positionFor(') + extract('async function refreshMatureHeat(', 'async function previewExec(') + loopSource + usdtSource + '\nglobalThis.run = paidLoop;', sandbox);
+  sandbox.quoteAutomaticParticipation = async (_W, project, _data, _value, opts = {}) => sandbox.MINT_PARTICIPATION.quote({ project, cap: '1000000000000000000000', sold: '1000', quantity: '1', unitBnbWei: BigInt(opts.amountBnbWei), amountBnbWei: BigInt(opts.amountBnbWei), excludeId: _W.paidReservation?.participationId });
   return { run: sandbox.run, S, seen, P, W };
 }
 

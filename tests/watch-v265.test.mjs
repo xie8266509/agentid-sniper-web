@@ -27,6 +27,7 @@ function heatHarness({ logs, transactions, registered = [], unavailable = false 
     Date, REGISTRY: registry,
     validMintAddress: value => /^0x[0-9a-f]{40}$/i.test(value),
     agentCache: new Map(),
+    AGENT_MATURITY: { qualify: async addresses => new Set(addresses.filter(address => registered.includes(address))) },
     wa: address => address.slice(2).padStart(64, '0'),
     async call() { return '0x'; },
     async rpc(method) {
@@ -99,7 +100,7 @@ test('old recipient-based participation caches clear once without changing compl
   };
   const first = isolatedWatch({ state });
   const migrated = first.api.getState();
-  assert.equal(migrated.agentsV, 2);
+  assert.equal(migrated.agentsV, 3);
   assert.equal(migrated.paid[target].agents, undefined);
   assert.equal(migrated.paid[target].burst, undefined);
   assert.equal(migrated.paid[target].heatAt, undefined);
