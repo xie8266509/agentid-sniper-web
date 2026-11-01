@@ -21,8 +21,19 @@ function fixture() {
 test('balance UI distinguishes exact zero, unknown, dust and amounts above Number precision', () => {
   const { sandbox: s } = fixture();
   assert.equal(s.format(null, 'BNB'), '—'); assert.equal(s.format('0', 'BNB'), '0');
-  assert.equal(s.format('0.000000000000000001', 'BNB'), '0.000000000000000001');
+  assert.equal(s.format('0.000000000000000001', 'BNB'), '<0.00000001');
   assert.equal(s.format('9007199254740993', 'USDT'), '9,007,199,254,740,993');
+});
+test('balance summaries show useful decimals and explicit rounding instead of ellipses', () => {
+  const { sandbox: s } = fixture();
+  assert.equal(s.format('0.061834123456789', 'BNB'), '≈0.06183412');
+  assert.equal(s.format('0.71456789', 'USDT'), '≈0.714568');
+  assert.equal(s.format('0.714567', 'USDT'), '0.714567');
+  assert.equal(s.format('0.710000000000000000', 'USDT'), '0.71');
+  assert.equal(s.format('0.0000009', 'USDT'), '<0.000001');
+  assert.equal(s.format('0.000001', 'USDT'), '0.000001');
+  assert.equal(s.format('999999999999999999.9999999', 'USDT'), '≈1,000,000,000,000,000,000');
+  assert.equal(s.format('0009007199254740993.123456789', 'USDT'), '≈9,007,199,254,740,993.123457');
 });
 test('two wallets resolve out of order without mixing balances, and repeated requests are merged', async () => {
   const f = fixture(), a = f.sandbox.load('alpha'), repeat = f.sandbox.load('alpha'), b = f.sandbox.load('beta');
