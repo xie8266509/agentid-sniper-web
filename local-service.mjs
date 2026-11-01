@@ -1,3 +1,4 @@
+import { assertWalletMaintenanceIdle } from './lib/wallet-executor.mjs';
 // macOS background runner. Usage: node local-service.mjs start|stop|status [web]
 import { spawn, spawnSync } from 'node:child_process';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -39,6 +40,8 @@ function status() {
   console.log(`日志：${join(DATA, 'watch.log')}`);
   return Boolean(pid);
 }
+
+if (!WEB && ['start', 'run'].includes(command)) assertWalletMaintenanceIdle(DIR);
 
 if (command === 'start') {
   const config = JSON.parse(readFileSync(join(DIR, 'config.json'), 'utf8'));

@@ -1,0 +1,68 @@
+name: Check upstream and prepare review
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-review
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare a pinned review PR
+    if: github.ref == 'refs/heads/main' && github.repository == 'xie8266509/agentid-sniper-web'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      created: ${{ steps.review.outputs.created }}
+      commit: ${{ steps.review.outputs.commit }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      # This runs only the trusted main script. It never checks out or executes
+      # upstream code, a PR head, dependency lifecycle scripts, or candidate tests.
+      - id: review
+        name: Detect version and SHA, deduplicate, prepare a draft PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/upstream-automation.mjs --submit
+  verify-review:
+    name: Check current Web baseline and review packet
+    needs: prepare
+    if: needs.prepare.outputs.created == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm test
+      - run: npm run release:prepare -- --check
+      - run: npm run release:check
+      - name: Explain review status
+        run: |
+          printf '%s\n' 'This draft contains pinned upstream differences and a review checklist only.' 'Passing baseline checks does not mean new upstream trading behavior is integrated.' >> "$GITHUB_STEP_SUMMARY"

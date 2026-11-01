@@ -1,13 +1,13 @@
-# v0.3.0 发布与维护
+# v0.4.0 发布与维护
 
-发行仓库：[xie8266509/agentid-sniper-web](https://github.com/xie8266509/agentid-sniper-web)。当前正式发行 **v0.3.0（2026-11-01）**，同步上游 v2.7.4，加入美元日预算、NFT 严格条件与可选群线索，保留更新器时差修复及多钱包工作台；历史保留在 [变更记录](CHANGELOG.md)。线上提交、CI 和发行结果分别以仓库页面为准。
+发行仓库：[xie8266509/agentid-sniper-web](https://github.com/xie8266509/agentid-sniper-web)。当前正式发行 **v0.4.0（2026-11-01）**，同步上游 v2.7.6，加入闲时安装、上游检测及审核后自动发行，保留更新器时差修复及多钱包工作台；历史保留在 [变更记录](CHANGELOG.md)。线上提交、CI 和发行结果分别以仓库页面为准。
 
 ## 归属与发行方式
 
 - 原项目：[Nancy / Agent ID Sniper](https://github.com/nancyc0813-maker/agentid-sniper)，原作者 [@nancy_c813](https://x.com/nancy_c813)。
 - 社区 Web 增强版维护：[@supra_bnb](https://x.com/supra_bnb)。Web 页脚、README 和 NOTICE 已标注双方来源。
 - 保留 `LICENSE` 中 Nancy 的 MIT 版权与完整许可；保留 `lib/vendor/element-sdk-LICENSE` 和 ABI 来源提交。不替换原作者版权。
-- 首个增强版版本为 `v0.1.0`，当前正式版为 `v0.3.0`；上游基线单独记录为 `v2.7.4 / b8fd114`。
+- 首个增强版版本为 `v0.1.0`，当前正式版为 `v0.4.0`；上游基线单独记录为 `v2.7.6 / 8f9c488`。
 - 发行目标是 GitHub，`package.json` 的 `private: true` 可保留。
 
 ## 执行清单
@@ -19,12 +19,12 @@
 | 更新渠道与完整发行清单 | 本地验证通过 | 用户只跟随增强版正式发布标签与 `release.json`；校验 Web、钱包、NFT 等完整发行内容，更新与回退不覆盖数据。 |
 | 源码收齐、忽略规则与敏感信息检查 | 已知模式检查通过 | 首个提交包括增强版完整源码；完整历史和发布候选检查通过，不含配置、会话、Key 或日志。 |
 | CI、干净安装与升级/回退回归 | 本地验证通过 | Node.js 24 离线测试及 macOS 安装验证通过，不使用真实钱包或交易权限。 |
-| 发行提交与标签 | [查看正式发行](https://github.com/xie8266509/agentid-sniper-web/releases) | `v0.3.0` 正式标签对应发行清单与通过检查的源码。 |
+| 发行提交与标签 | [查看正式发行](https://github.com/xie8266509/agentid-sniper-web/releases) | `v0.4.0` 正式标签对应发行清单与通过检查的源码。 |
 | GitHub Fork、线上 CI 与 Release | [发行仓库](https://github.com/xie8266509/agentid-sniper-web) | [线上 CI](https://github.com/xie8266509/agentid-sniper-web/actions) 与 Release 记录可核对；发行内容必须与已验证源码一致。 |
 
 ## 更新渠道
 
-`origin` 指向增强版发行仓库，`upstream` 指向 Nancy 的原项目。维护者在独立分支审查、合并上游变更，经 PR 和 CI 后发布增强版；用户不会直接安装原作者仓库的扫描器单文件。
+`origin` 指向增强版发行仓库，`upstream` 指向 Nancy 的原项目。每 15 分钟目标频率自动生成固定差异和适配清单的 Draft PR；维护者完成兼容修改、审核并合入后，以 main 完整 SHA 运行 `Publish reviewed release` 自动验证和发布；用户不会直接安装原作者仓库的扫描器单文件。
 
 用户一键更新绑定增强版正式发布标签和完整 `release.json` 文件清单。增强版版本和上游基线分别显示。每次发行均须检查发布清单、候选代码、源码变动保护、数据保留、备份与失败回退。
 

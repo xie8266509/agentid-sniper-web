@@ -62,6 +62,7 @@
   "rpcs": [],
   "telegramUser": {
     "enabled": false,
-    "groupIds": []
+    "groupIds": [],
+    "vipGroupIds": []
   }
 }

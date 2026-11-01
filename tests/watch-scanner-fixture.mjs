@@ -11,6 +11,7 @@ import { createHash } from 'node:crypto';
 import { decodeAbiUint } from '../lib/nft-codec.mjs';
 import * as sellRules from '../lib/sell-rules.mjs';
 import * as walletModel from '../lib/wallet-model.mjs';
+import { socialSelectionHash } from '../lib/social-candidates.mjs';
 import * as mintPolicy from '../lib/mint-policy.mjs';
 
 export const raw = readFileSync(new URL('../watch.mjs', import.meta.url), 'utf8');
@@ -46,11 +47,12 @@ globalThis.api = {
   const seen = { cliFactories: [], cliCalls: [], network: [], writes: [], directories: [], logs: [], errors: [] };
   const timers = [];
   const sandbox = {
-    Buffer, structuredClone, dirname, join, fileURLToPath, withinPaidBudget, decodeAbiUint, createHash, ...sellRules, ...mintPolicy,
+    socialSelectionHash, Buffer, structuredClone, dirname, join, fileURLToPath, withinPaidBudget, decodeAbiUint, createHash, ...sellRules, ...mintPolicy,
     normalizeWalletConfig: input => walletModel.normalizeWalletConfig(JSON.parse(JSON.stringify(input))),
     getWalletId: walletModel.getWalletId,
     effectiveWalletConfig: (config, wallet) => walletModel.effectiveWalletConfig(JSON.parse(JSON.stringify(config)), JSON.parse(JSON.stringify(wallet))),
     walletCanAutomate: (config, wallet, kind) => walletModel.walletCanAutomate(JSON.parse(JSON.stringify(config)), JSON.parse(JSON.stringify(wallet)), kind),
+    assertWalletMaintenanceIdle: () => {},
     withWalletExecution: async (_wallet, work) => work(),
     reconcileScannerPending: async () => { throw new Error('Unexpected recovery in monitor fixture'); },
     markWalletBlocked: async () => {}, clearWalletBlocked: async () => {},

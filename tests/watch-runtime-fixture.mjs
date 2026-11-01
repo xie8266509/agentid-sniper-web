@@ -31,6 +31,7 @@ export function scannerRuntimeDouble({ sandbox, wallet, state, events }) {
     async withWalletExecution(selected, work, { allowBlocked } = {}) { if (!allowBlocked && blocked.has(selected.id)) throw new Error('結果不明：此钱包尚有待核对交易'); return work(); },
     async markWalletBlocked(selected, reason, { details = {} } = {}) { blocked.set(selected.id, { reason, details }); },
     async clearWalletBlocked(selected) { blocked.delete(selected.id); },
+    assertWalletMaintenanceIdle: () => {},
     createWalletBudget: () => budget,
   };
 }

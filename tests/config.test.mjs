@@ -150,3 +150,10 @@ test('configuration save preserves write-only tokens, validates before write, an
     assert.equal(initial.telegram.botToken, fakeToken);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('Telegram priority groups default empty and must be explicitly selected listening groups', () => {
+  assert.deepEqual(validateConfig({ ...example(), telegramUser: { enabled: false, groupIds: [] } }).telegramUser.vipGroupIds, []);
+  const cfg = validateConfig({ ...example(), telegramUser: { enabled: true, groupIds: ['-11', '-22'], vipGroupIds: ['-22', '-22'] } });
+  assert.deepEqual(cfg.telegramUser.vipGroupIds, ['-22']); assert.deepEqual(sanitizeConfig(cfg).telegramUser.vipGroupIds, ['-22']);
+  assert.throws(() => validateConfig({ ...example(), telegramUser: { enabled: false, groupIds: ['-11'], vipGroupIds: ['-22'] } }), /属于已选/);
+});

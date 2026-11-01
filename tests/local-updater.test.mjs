@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { createLocalUpdater, UPDATE_REPOSITORY } from '../lib/local-updater.mjs';
+import { assertWalletMaintenanceIdle } from '../lib/wallet-executor.mjs';
 import { DEFAULT_RELEASE_REPOSITORY, isReleaseSourcePath } from '../lib/release-info.mjs';
 
 const hash = (s) => createHash('sha256').update(s).digest('hex');
@@ -329,4 +330,63 @@ test('a source directory symlink cannot redirect update writes outside the proje
   writeFileSync(join(outside, 'index.html'), '<h1>outside file</h1>'); rmSync(join(f.root, 'web'), { recursive: true }); symlinkSync(outside, join(f.root, 'web'), 'dir');
   await f.updater.check(); await assert.rejects(f.updater.update({ targetCommit: f.target }), /符号链接/);
   assert.equal(readFileSync(join(outside, 'index.html'), 'utf8'), '<h1>outside file</h1>'); assert.equal(f.git('rev-parse', 'HEAD'), f.base);
+});
+
+
+function fixtureCommand(f, intercept) {
+  return async (file, args, options = {}) => {
+    const intercepted = await intercept?.(file, args, options); if (intercepted) return intercepted;
+    try { return { code: 0, stdout: execFileSync(file, args, { cwd: options.cwd || f.root, env: { ...process.env, ...options.env }, encoding: options.encoding || 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }), stderr: '' }; }
+    catch (e) { return { code: e.status || 1, stdout: String(e.stdout || ''), stderr: String(e.stderr || '') }; }
+  };
+}
+const storedUpdate = f => JSON.parse(readFileSync(join(f.root, 'data/local_updates/status.json'), 'utf8'));
+
+test('candidate rejection and pre-write cancellation never persist an interrupted source replacement', async t => {
+  for (const cancel of [false, true]) {
+    const kinds = [], f = fixture(t, { validateCandidate: async () => { if (!cancel) throw new Error('mock candidate regression'); }, beforeApply: async ({ kind }) => { kinds.push(kind); if (cancel && kind === 'apply') throw Object.assign(new Error('mock auto preference disabled'), { idleDeferred: true }); } });
+    const before = readFileSync(join(f.root, 'watch.mjs'), 'utf8'); await f.updater.check();
+    await assert.rejects(f.updater.update({ targetCommit: f.target }), cancel ? /preference disabled/ : /candidate regression/);
+    assert.notEqual(storedUpdate(f).interrupted, true); assert.equal(readFileSync(join(f.root, 'watch.mjs'), 'utf8'), before); assert.equal(f.git('rev-parse', 'HEAD'), f.base);
+    assert.doesNotThrow(() => assertWalletMaintenanceIdle(f.root)); assert.deepEqual(kinds, cancel ? ['prepare', 'apply'] : ['prepare']);
+  }
+});
+
+test('successful update and complete automatic restore clear the persistent interrupted barrier', async t => {
+  for (const failRef of [false, true]) {
+    const f = fixture(t), before = readFileSync(join(f.root, 'watch.mjs'), 'utf8'), kinds = []; let injected = false;
+    const updater = createLocalUpdater({ root: f.root, fetchLatest: async () => f.published, validateCandidate: async () => ({}), beforeApply: async ({ kind }) => { kinds.push(kind); },
+      runCommand: fixtureCommand(f, async (file, args) => { if (file === 'git' && args.includes('update-ref')) { assert.equal(storedUpdate(f).interrupted, true, 'source writes must have a durable barrier'); if (failRef && !injected) { injected = true; return { code: 1, stdout: '', stderr: 'mock ref switch failure' }; } } }),
+    });
+    await updater.check();
+    if (failRef) { await assert.rejects(updater.update({ targetCommit: f.target }), /Git 操作失败/); assert.equal(readFileSync(join(f.root, 'watch.mjs'), 'utf8'), before); assert.equal(f.git('rev-parse', 'HEAD'), f.base); assert.deepEqual(kinds, ['prepare', 'apply', 'rollback']); }
+    else { await updater.update({ targetCommit: f.target }); assert.equal(f.git('rev-parse', 'HEAD'), f.target); assert.deepEqual(kinds, ['prepare', 'apply']); }
+    assert.equal(storedUpdate(f).interrupted, false); assert.doesNotThrow(() => assertWalletMaintenanceIdle(f.root));
+  }
+});
+
+test('failed restore after source writes retains the interrupted barrier even when phase becomes failed', async t => {
+  const f = fixture(t); let injected = false;
+  const updater = createLocalUpdater({ root: f.root, fetchLatest: async () => f.published, validateCandidate: async () => ({}), runCommand: fixtureCommand(f, async (file, args) => {
+    if (file === 'git' && args.includes('update-ref') && !injected) {
+      injected = true; assert.equal(storedUpdate(f).interrupted, true);
+      const storage = join(f.root, 'data/local_updates/backups'), id = readdirSync(storage)[0]; rmSync(join(storage, id, 'source/watch.mjs'));
+      return { code: 1, stdout: '', stderr: 'mock switch failure followed by missing backup source' };
+    }
+  }) });
+  await updater.check(); await assert.rejects(updater.update({ targetCommit: f.target }), /自动回退未完成/);
+  assert.equal(storedUpdate(f).phase, 'failed'); assert.equal(storedUpdate(f).interrupted, true); assert.equal(f.git('rev-parse', 'HEAD'), f.base);
+  assert.match(readFileSync(join(f.root, 'watch.mjs'), 'utf8'), /n = 2/); assert.throws(() => assertWalletMaintenanceIdle(f.root), /尚未恢复/);
+  const fresh = createLocalUpdater({ root: f.root, fetchLatest: async () => { throw new Error('must not fetch interrupted source'); } }); await fresh.check(); assert.equal(storedUpdate(f).interrupted, true); assert.throws(() => assertWalletMaintenanceIdle(f.root), /尚未恢复/);
+});
+
+test('a manual rollback interrupted after restoring source remains blocked until a complete retry', async t => {
+  const f = fixture(t); await f.updater.check(); const updated = await f.updater.update({ targetCommit: f.target }); let failed = false;
+  const updater = createLocalUpdater({ root: f.root, fetchLatest: async () => f.published, runCommand: fixtureCommand(f, async (file, args) => {
+    if (file === 'git' && args.includes('update-ref') && !failed) { failed = true; assert.equal(storedUpdate(f).interrupted, true); return { code: 1, stdout: '', stderr: 'mock rollback ref switch failure' }; }
+  }) });
+  await assert.rejects(updater.rollback({ backupId: updated.backupId }), /Git 操作失败/);
+  assert.equal(storedUpdate(f).phase, 'failed'); assert.equal(storedUpdate(f).interrupted, true); assert.equal(f.git('rev-parse', 'HEAD'), f.target); assert.throws(() => assertWalletMaintenanceIdle(f.root), /尚未恢复/);
+  const recovered = createLocalUpdater({ root: f.root, fetchLatest: async () => f.published }); await recovered.rollback({ backupId: updated.backupId });
+  assert.equal(f.git('rev-parse', 'HEAD'), f.base); assert.equal(storedUpdate(f).interrupted, false); assert.doesNotThrow(() => assertWalletMaintenanceIdle(f.root));
 });

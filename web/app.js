@@ -447,7 +447,7 @@ function renderConfig() {
     catch (e) { tgStatus.textContent = e.message; }
     finally { tgRefresh.disabled = false; }
   }, 'small');
-  const tgSection = configSection('config-telegram-user', 'TG 群项目线索 · 可选', '使用你在本机明确选定的群发现候选项目；群消息不能直接触发交易。默认关闭。', [el('label', { class: 'checkbox-row' }, el('input', { type: 'checkbox', name: 'telegramUser.enabled', checked: c.telegramUser?.enabled === true }), '启用已选群监控'), field('已选群 ID', 'telegramUser.groupIds', (c.telegramUser?.groupIds || []).join(', '), { placeholder: '逗号分隔，最多 12 个', help: '只填写手动登录时选择的群 ID。会话和凭证不经网页提交。', full: true }), tgStatus, tgRefresh, el('details', { class: 'section-spacer' }, el('summary', {}, '首次设置'), el('p', { class: 'help' }, '在本机项目目录运行 npm run setup:telegram -- --install，再运行 npm run setup:telegram -- --login。终端完成登录并选择已加入的群后，将输出的 ID 填在上方保存。首次仅读最新 1 条定位，不收集历史消息。仅保存规范化候选地址、网址和匿名计数，不保存消息正文或群名。'))]);
+  const tgSection = configSection('config-telegram-user', 'TG 群项目线索 · 可选', '使用你在本机明确选定的群发现候选项目；群消息不能直接触发交易。默认关闭。', [el('label', { class: 'checkbox-row' }, el('input', { type: 'checkbox', name: 'telegramUser.enabled', checked: c.telegramUser?.enabled === true }), '启用已选群监控'), field('已选群 ID', 'telegramUser.groupIds', (c.telegramUser?.groupIds || []).join(', '), { placeholder: '逗号分隔，最多 12 个', help: '只填写手动登录时选择的群 ID。会话和凭证不经网页提交。', full: true }), field('重点群 ID', 'telegramUser.vipGroupIds', (c.telegramUser?.vipGroupIds || []).join(', '), { placeholder: '可选，须已在上方选定', help: '可提前检查线索，每小时最多 30 个候选；链上、进度、预算检查照常执行。', full: true }), tgStatus, tgRefresh, el('details', { class: 'section-spacer' }, el('summary', {}, '首次设置'), el('p', { class: 'help' }, '在本机项目目录运行 npm run setup:telegram -- --install，再运行 npm run setup:telegram -- --login。终端完成登录并选择已加入的群后，将输出的 ID 填在上方保存。首次仅读最新 1 条定位，不收集历史消息。仅保存规范化候选地址、网址和匿名计数，不保存消息正文或群名。'))]);
   queueMicrotask(() => { if (tgStatus.isConnected) tgRefresh.click(); });
   const ruleEditor = configRulesEditor(r);
   paidSection.append(mintEntryNotice(p));
@@ -462,7 +462,7 @@ function renderConfig() {
     const fd = new FormData(form), get = (n) => fd.get(n), num = (n) => Number(get(n));
     let ruleData; try { ruleData = ruleEditor.read(fd); } catch (error) { toast(error.message, true); return; }
     const next = { ...c, monitorOnly: get('monitorOnly') !== 'false', wallets: c.wallets, telegram: { ...c.telegram, botToken: String(get('telegram.botToken') || '').trim(), chatId: String(get('telegram.chatId') || '').trim(), groupChatId: String(get('telegram.groupChatId') || '').trim(), clearBotToken: get('telegram.clearBotToken') === 'on' }, paid: { ...p }, rules: { ...r, ...ruleData }, tokens: tokenData, timeZone: String(get('timeZone')).trim(), watchVault: String(get('watchVault') || '').trim(), notifyAll: get('notifyAll') === 'on' };
-    next.telegramUser = { enabled: get('telegramUser.enabled') === 'on', groupIds: String(get('telegramUser.groupIds') || '').split(/[,，\s]+/).filter(Boolean) };
+    next.telegramUser = { enabled: get('telegramUser.enabled') === 'on', groupIds: String(get('telegramUser.groupIds') || '').split(/[,，\s]+/).filter(Boolean), vipGroupIds: String(get('telegramUser.vipGroupIds') || '').split(/[,，\s]+/).filter(Boolean) };
     next.portfolioBudget = { maxBnbPerDay: String(get('portfolioBudget.maxBnbPerDay') ?? '').trim() === '' ? null : num('portfolioBudget.maxBnbPerDay') };
     for (const key of ['maxUsd', 'dayUsd', 'maxBnbPerDay', 'keepBnb', 'minSold', 'maxAgeH']) next.paid[key] = num('paid.' + key);
     for (const key of ['goPct', 'earlyPct', 'riseDelta']) next.paid[key] = num('paid.' + key) / 100;
@@ -993,6 +993,8 @@ function paintUpdates() {
   const view = updatesView;
   if (!view?.root.isConnected || state.view !== 'updates') return;
   const blocked = updateBlockReason(value), waiting = updateAwaitingResult && !updatesData;
+  if (view.autoToggle && !view.autoSaving) view.autoToggle.checked = value.idleUpdates?.enabled === true;
+  if (view.autoState) view.autoState.textContent = value.idleUpdates?.reason || '闲时自动更新未开启';
   view.current.textContent = updateVersionText(value.current);
   view.latest.textContent = updateVersionText(value.latest);
   view.lastCheck.textContent = value.checkedAt || value.lastCheckedAt ? date(value.checkedAt || value.lastCheckedAt, true) : '尚未检查';
@@ -1082,7 +1084,16 @@ async function renderUpdates() {
   view.check = updateButton('立即检查', 'refresh', checkUpdatesNow);
   view.apply = updateButton('一键更新', 'download', () => performLocalUpdate('apply'), 'primary');
   view.rollback = updateButton('回退上一版本', 'refresh', () => performLocalUpdate('rollback'), 'ghost');
-  view.root.append(title('系统更新', '检查 Web 增强版正式发行，保留本地配置与数据。', [view.check]), view.error,
+  view.autoToggle = el('input', { type: 'checkbox', name: 'idleUpdates.enabled', 'aria-label': '闲时自动更新' });
+  view.autoState = el('p', { class: 'help', role: 'status' });
+  view.autoToggle.addEventListener('change', async () => {
+    view.autoSaving = true; view.autoToggle.disabled = true;
+    try { const data = await api('/api/updates/settings', { method: 'POST', body: { enabled: view.autoToggle.checked } }); updatesData = data.update || data; toast(view.autoToggle.checked ? '已开启闲时自动更新' : '已关闭闲时自动更新'); }
+    catch (error) { toast(error.message, true); }
+    finally { view.autoSaving = false; view.autoToggle.disabled = false; paintUpdates(); }
+  });
+  const idlePanel = panel('安装方式', 'clock', el('div', { class: 'panel-content' }, el('label', { class: 'checkbox-row' }, view.autoToggle, el('strong', {}, '闲时自动更新')), el('p', { class: 'help section-spacer' }, '默认关闭。开启后，扫描器已停止、钱包和 NFT 无未决操作、源码无修改，且连续空闲至少 60 秒时，自动备份并安装增强版正式 Release，随后重启 Web。失败会暂停此版本的自动重试。'), view.autoState, el('p', { class: 'help' }, '不会主动停止扫描器，也不会自动开启交易。关闭后会取消尚未应用的自动安装；已应用的版本可手动回退。')));
+  view.root.append(title('系统更新', '检查 Web 增强版正式发行，保留本地配置与数据。', [view.check]), view.error, idlePanel,
     panel('本地版本', 'download', el('div', { class: 'panel-content' }, view.phase, el('div', { class: 'update-version-grid' }, el('div', {}, el('span', {}, '当前程序'), view.current), el('div', {}, el('span', {}, '最新正式发行'), view.latest)), el('div', { class: 'update-check-times' }, el('span', {}, '最后检查：', view.lastCheck), el('span', {}, '下次检查：', view.nextCheck)), view.blocked, el('div', { class: 'update-actions' }, view.apply, view.rollback), view.rollbackInfo), badge('30 分钟自动检查', 'muted')),
     el('div', { class: 'update-detail-grid section-spacer' }, panel('更新内容', 'logs', el('div', { class: 'panel-content' }, view.notes)), panel('任务进度', 'activity', el('div', { class: 'panel-content' }, view.logs))),
     el('div', { class: 'update-preserve-note' }, icon('shield'), el('div', {}, el('strong', {}, '本地功能保留'), el('p', {}, '保留 Web 控制台、独立钱包会话和 NFT 自动卖出；配置、持仓数据与市场 Key 保存在本机。合并冲突或发行文件校验不通过时停止更新，并显示处理原因。'))));

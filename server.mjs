@@ -8,10 +8,11 @@ import { runWallet, getCliInfo } from './lib/wallet-cli.mjs';
 import { ROOT, dashboardStatus, controlService, holdingsData, readLogs, redact } from './lib/control.mjs';
 import { createLocalNftTrading } from './lib/nft-local.mjs';
 import { createLocalUpdater } from './lib/local-updater.mjs';
+import { createIdleUpdates, assertIdleData } from './lib/idle-updates.mjs';
 import { createTelegramMonitor } from './lib/telegram-monitor.mjs';
 import { readRestartHealth, scannerIsActive, spawnWebRestart } from './lib/update-runtime.mjs';
 import { normalizeWalletConfig, getWalletId, resolveWallet, effectiveWalletConfig, walletCanAutomate } from './lib/wallet-model.mjs';
-import { withWalletExecution, walletExecutionView, markWalletBlocked, clearWalletBlocked } from './lib/wallet-executor.mjs';
+import { withWalletExecution, walletExecutionView, markWalletBlocked, clearWalletBlocked, acquireWalletMaintenance } from './lib/wallet-executor.mjs';
 import { createWalletBudget } from './lib/wallet-budget.mjs';
 import { nftRpc } from './lib/nft-holdings.mjs';
 import { reconcileScannerPending } from './lib/scanner-recovery.mjs';
@@ -62,21 +63,30 @@ export function createApp(overrides = {}) {
     for (const [key, preview] of previews) if (preview.walletId === id) previews.delete(key);
   };
   let serviceBusy = false, updateBusy = false, activeWalletCalls = 0, updatePhase = null, updateError = null;
-  let restartGate = readRestartHealth(ROOT)?.phase === 'restarting';
-  let restartSince = restartGate ? readRestartHealth(ROOT)?.startedAt || 0 : 0;
+  let automaticUpdate = false, releaseMaintenance = null, idleUpdates;
+  const idleNow = overrides.idleNow || Date.now;
+  let lastActivityAt = idleNow();
+  let restartGate = readRestartHealth(appRoot)?.phase === 'restarting';
+  let restartSince = restartGate ? readRestartHealth(appRoot)?.startedAt || 0 : 0;
   if (restartGate && overrides.startUpdateChecker === true) { serviceBusy = true; updateBusy = true; updatePhase = 'restarting'; }
   const walletRunner = deps.runWallet;
   deps.runWallet = async (args, options = {}) => {
     if (updateBusy) throw failure(409, '正在更新本地程序，请等待 Web 恢复后操作钱包');
-    activeWalletCalls++;
+    activeWalletCalls++; lastActivityAt = idleNow();
     const beforeSend = options.beforeSend;
     try { return await walletRunner(args, { ...options, beforeSend: () => {
       if (updateBusy || options.automatic && (serviceBusy || existsSync(join(appRoot, 'WATCH_STOP')))) throw failure(409, '自动任务已停止，本次未发送');
       return beforeSend?.();
-    } }); } finally { activeWalletCalls--; }
+    } }); } finally { activeWalletCalls--; lastActivityAt = idleNow(); }
   };
   let localUpdater = overrides.localUpdater;
-  const getUpdater = () => localUpdater ||= createLocalUpdater({ root: ROOT, beforeApply: assertUpdateReady });
+  const getUpdater = () => localUpdater ||= (overrides.createUpdater || createLocalUpdater)({ root: appRoot, beforeApply: async ({ kind }) => { await assertUpdateReady(); if (automaticUpdate && kind !== 'rollback') await assertIdleReady(); } });
+  const deferredIdle = error => Object.assign(error, { idleDeferred: true });
+  const getIdleUpdates = () => idleUpdates ||= createIdleUpdates({ root: appRoot, now: overrides.idleNow || Date.now, ...(overrides.idleMs === undefined ? {} : { idleMs: overrides.idleMs }), ...(overrides.idleIntervalMs === undefined ? {} : { intervalMs: overrides.idleIntervalMs }), getUpdateView: () => getUpdater().view(), assertIdle: async () => { try { await assertUpdateReady(); await assertIdleReady({ initial: true }); } catch (error) { throw deferredIdle(error); } }, install: async ({ targetCommit }) => {
+    const port = server.address()?.port;
+    await prepareUpdate('update', { targetCommit }, true);
+    return runAdmittedUpdate('update', { targetCommit }, port, true);
+  } });
   let telegramMonitor;
   const getTelegramMonitor = () => telegramMonitor ||= createTelegramMonitor({ root: appRoot, readConfig: deps.readConfig });
   let nftTrading = overrides.nftTrading;
@@ -96,12 +106,13 @@ export function createApp(overrides = {}) {
     },
   });
   function releaseUpdateGate() {
+    releaseMaintenance?.(); releaseMaintenance = null; automaticUpdate = false;
     updateBusy = false; serviceBusy = false; updatePhase = null; restartGate = false;
     if (overrides.startNftWorker === true) nftTrading?.start?.();
   }
   function reconcileRestart() {
     if (!(restartGate || updatePhase === 'restarting')) return;
-    const health = readRestartHealth(ROOT);
+    const health = readRestartHealth(appRoot);
     if (!health) return;
     if (Math.max(health.startedAt || 0, health.completedAt || 0) < restartSince) return;
     let alive = false; try { if (Number.isSafeInteger(health.workerPid)) { process.kill(health.workerPid, 0); alive = true; } } catch {}
@@ -113,15 +124,25 @@ export function createApp(overrides = {}) {
   async function assertUpdateReady() {
     if (activeWalletCalls || busy.size || [...logins.values()].some(job => job.status === 'WAITING') || nftTrading?.hasInFlight?.()) throw failure(409, '钱包或 NFT 正在处理操作，请完成后再更新');
     const reported = Boolean((await deps.dashboardStatus()).service?.running);
-    const active = reported || await (overrides.isScannerActive ? overrides.isScannerActive() : scannerIsActive(ROOT));
+    const active = reported || await (overrides.isScannerActive ? overrides.isScannerActive() : scannerIsActive(appRoot));
     if (active) throw failure(409, '请先停止扫描器，再更新本地程序；更新后不会自动开启交易');
     // Recheck after the asynchronous process probe; updateBusy prevents new CLI work.
     if (activeWalletCalls || busy.size || nftTrading?.hasInFlight?.()) throw failure(409, '钱包操作尚未结束，请稍后更新');
   }
+  async function assertIdleReady({ initial = false } = {}) {
+    try {
+      if (!getIdleUpdates().canInstall()) throw failure(409, '闲时自动更新已关闭');
+      if (initial && (serviceBusy || updateBusy || getUpdater().isBusy?.())) throw failure(409, '更新或服务操作正在进行');
+      if (idleNow() - lastActivityAt < (overrides.idleMs ?? 60000)) throw failure(409, '最近有钱包或配置操作，等待连续空闲 60 秒');
+      assertIdleData(appRoot, config().wallets, { now: idleNow, idleMs: overrides.idleMs ?? 60000 });
+      if (typeof getUpdater().assertSourceClean !== 'function') throw failure(409, '当前更新器不支持闲时源码检查');
+      await getUpdater().assertSourceClean();
+    } catch (error) { throw deferredIdle(error); }
+  }
   async function updateView() {
     reconcileRestart();
     const view = await getUpdater().view();
-    const restart = readRestartHealth(ROOT);
+    const restart = readRestartHealth(appRoot);
     const healthMatches = restart?.targetCommit === view.current?.commit;
     const showHealth = healthMatches && restart.completedAt > (view.checkedAt || 0);
     let blockedReason = view.blockedReason || '';
@@ -133,46 +154,50 @@ export function createApp(overrides = {}) {
     }
     const occupied = updateBusy || Boolean(view.busy);
     return { ...view, ...(showHealth ? { phase: restart.phase === 'verified' ? 'succeeded' : restart.phase, message: restart.message, ...(restart.error ? { error: restart.error } : {}) } : {}), ...(updatePhase ? { phase: updatePhase } : {}), ...(updateError ? { error: updateError } : {}), restartResult: restart || view.restartResult, busy: occupied, walletBusy: Boolean(activeWalletCalls || busy.size), blockedReason, rollbackBlockedReason,
+      idleUpdates: getIdleUpdates().view(),
       canUpdate: !occupied && !blockedReason && Boolean(view.available ?? view.updateAvailable),
       canRollback: !occupied && !rollbackBlockedReason && Boolean(view.rollback?.available ?? view.rollbackAvailable ?? view.canRollback),
     };
   }
-  async function admitUpdate(action, body, res, port) {
-    if (body.confirmed !== true) throw failure(409, '请确认本次软件更新或版本回退');
+  async function prepareUpdate(action, body, automatic = false) {
+    if (!automatic && body.confirmed !== true) throw failure(409, '请确认本次软件更新或版本回退');
     if (action === 'update' && !/^[a-f0-9]{40}$/i.test(body.targetCommit || '')) throw failure(400, '缺少有效的目标提交，请先检查更新');
-    if (serviceBusy || updateBusy || getUpdater().isBusy?.()) throw failure(409, '更新或服务操作正在进行，请稍后');
-    updateBusy = true; serviceBusy = true; updatePhase = 'preparing'; updateError = null;
-    try { await assertUpdateReady(); } catch (error) { updateBusy = false; serviceBusy = false; updatePhase = null; throw error; }
-    nftTrading?.stop?.();
-    previews.clear();
-    let accepted;
-    try { accepted = await updateView(); } catch (error) { releaseUpdateGate(); throw error; }
+    if (serviceBusy || updateBusy || getUpdater().isBusy?.()) throw Object.assign(failure(409, '更新或服务操作正在进行，请稍后'), { idleDeferred: automatic });
+    updateBusy = true; serviceBusy = true; automaticUpdate = automatic; updatePhase = 'preparing'; updateError = null;
+    try {
+      await assertUpdateReady();
+      if (automatic) { await assertIdleReady(); releaseMaintenance = await acquireWalletMaintenance(config().wallets, { root: appRoot, now: idleNow, idleMs: overrides.idleMs ?? 60000 }); await assertUpdateReady(); await assertIdleReady(); }
+    } catch (error) { releaseUpdateGate(); throw automatic ? deferredIdle(error) : error; }
+    nftTrading?.stop?.(); previews.clear();
+  }
+  async function runAdmittedUpdate(action, body, port, automatic = false) {
+    let restarting = false;
+    try {
+      updatePhase = null;
+      const result = action === 'update' ? await getUpdater().update({ targetCommit: body.targetCommit }) : await getUpdater().rollback();
+      // Keep portfolio maintenance until the restart worker has published its
+      // durable health barrier. The Web admission gate stays closed meanwhile.
+      if (result?.restartRequired || result?.needsWebRestart) {
+        updatePhase = 'restarting'; restartSince = Date.now();
+        const restart = overrides.restartWeb || ((input) => spawnWebRestart({ root: appRoot, port, ...input }));
+        await restart({ targetCommit: result.targetCommit || result.current?.commit, backupId: result.backupId, action }); restarting = true;
+      }
+      releaseMaintenance?.(); releaseMaintenance = null;
+      return result;
+    } catch (error) {
+      updateError = redact(error.message || '本地更新失败');
+      if (automatic) throw error;
+    } finally { if (!restarting) releaseUpdateGate(); }
+  }
+  async function admitUpdate(action, body, res, port) {
+    await prepareUpdate(action, body);
+    let accepted; try { accepted = await updateView(); } catch (error) { releaseUpdateGate(); throw error; }
     let responseFinished = false;
     res.once('close', () => { if (!responseFinished) releaseUpdateGate(); });
-    // Send an accepted response before the long operation or any Web restart.
     res.once('finish', () => {
       responseFinished = true;
       if (res.statusCode !== 202) { releaseUpdateGate(); return; }
-      setImmediate(() => {
-      void (async () => {
-        let restarting = false;
-        try {
-          updatePhase = null;
-          const result = action === 'update' ? await getUpdater().update({ targetCommit: body.targetCommit }) : await getUpdater().rollback();
-          if (result?.restartRequired || result?.needsWebRestart) {
-            updatePhase = 'restarting';
-            restartSince = Date.now();
-            const restart = overrides.restartWeb || ((input) => spawnWebRestart({ root: ROOT, port, ...input }));
-            await restart({ targetCommit: result.targetCommit || result.current?.commit, backupId: result.backupId, action });
-            restarting = true;
-          }
-        } catch (error) {
-          updateError = redact(error.message || '本地更新失败');
-        } finally {
-          if (!restarting) releaseUpdateGate();
-        }
-      })();
-      });
+      setImmediate(() => { void runAdmittedUpdate(action, body, port); });
     });
     return accepted;
   }
@@ -410,7 +435,7 @@ export function createApp(overrides = {}) {
       if (path.startsWith('/api/')) {
         if (!session) throw failure(401, '页面会话已失效，请刷新页面');
         session.expires = Date.now() + 6 * 3600000;
-        if (updateBusy && !(req.method === 'GET' && ['/api/status', '/api/updates', '/api/logs'].includes(path))) throw failure(409, '本地程序正在更新，请等待 Web 恢复后操作');
+        if (updateBusy && !(req.method === 'GET' && ['/api/status', '/api/updates', '/api/logs'].includes(path) || req.method === 'POST' && path === '/api/updates/settings')) throw failure(409, '本地程序正在更新，请等待 Web 恢复后操作');
         let body = {};
         if (req.method === 'POST') {
           if (req.headers['x-csrf-token'] !== session.csrf) throw failure(403, '请求校验失败，请刷新页面');
@@ -425,6 +450,7 @@ export function createApp(overrides = {}) {
           try { body = content ? JSON.parse(content) : {}; } catch { throw failure(400, 'JSON 格式错误'); }
           if (!body || typeof body !== 'object' || Array.isArray(body)) throw failure(400, '请求内容必须为对象');
         }
+        if (req.method === 'POST' && !['/api/updates/check', '/api/updates/settings'].includes(path)) lastActivityAt = idleNow();
         let data;
         if (req.method === 'GET' && path === '/api/wallets') data = await walletsView();
         else if (req.method === 'POST' && path === '/api/wallets') {
@@ -471,6 +497,7 @@ export function createApp(overrides = {}) {
             data = patch.archived === true && !wallet.archived ? await executor(wallet, apply, { kind: 'status', allowBlocked: true }) : await apply();
           } finally { busy.delete(wallet.id); }
         } else if (req.method === 'GET' && path === '/api/updates') data = await updateView();
+        else if (req.method === 'POST' && path === '/api/updates/settings') { getIdleUpdates().configure(body); data = await updateView(); }
         else if (req.method === 'GET' && path === '/api/telegram/status') data = getTelegramMonitor().view();
         else if (req.method === 'POST' && path === '/api/updates/check') { await getUpdater().check(); data = await updateView(); }
         else if (req.method === 'POST' && ['/api/updates/apply', '/api/updates/rollback'].includes(path)) {
@@ -652,9 +679,10 @@ export function createApp(overrides = {}) {
       send(error.status || 500, { ok: false, error: { message: error.status ? error.message : '服务处理失败，请检查本地配置或重试', details: error.details || error.errors } });
     }
   });
-  server.on('close', () => { clearInterval(clean); clearInterval(restartPoll); nftTrading?.stop?.(); localUpdater?.stop?.(); void telegramMonitor?.stop?.(); for (const job of logins.values()) job.controller?.abort(); });
+  server.on('close', () => { clearInterval(clean); clearInterval(restartPoll); nftTrading?.stop?.(); localUpdater?.stop?.(); idleUpdates?.stop?.(); void telegramMonitor?.stop?.(); for (const job of logins.values()) job.controller?.abort(); });
   if (overrides.startNftWorker === true) server.once('listening', () => getNftTrading().start());
-  if (overrides.startUpdateChecker === true) server.once('listening', () => getUpdater().start());
+  if (overrides.startUpdateChecker === true) server.once('listening', () => { getUpdater().start(); getIdleUpdates().start(); });
+  server.checkIdleUpdates = () => getIdleUpdates().tick();
   if (overrides.startTelegramMonitor === true) server.once('listening', () => getTelegramMonitor().start());
   return server;
 }

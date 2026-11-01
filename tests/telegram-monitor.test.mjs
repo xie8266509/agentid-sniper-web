@@ -81,3 +81,19 @@ test('unknown selected groups and symlinked sessions cannot connect or read othe
   rmSync(h.paths.session); writeFileSync(join(h.root, 'mock-target.json'), '{}', { mode: 0o600 }); symlinkSync(join(h.root, 'mock-target.json'), h.paths.session);
   assert.throws(() => readTelegramSession(h.root), /符号链接/);
 });
+
+test('Telegram priority uses only selected IDs, polls them first and records no private group identity', async t => {
+  const h = fixture(t, { groups: ['-11', '-22'] }); h.config.telegramUser.vipGroupIds = ['-22']; h.session();
+  await h.monitor.poll(); await h.monitor.poll();
+  const requests = h.calls.filter(call => call.kind === 'messages'); assert.deepEqual(requests.map(x => x.peer.chatId), ['-22', '-11', '-22', '-11']);
+  const feed = JSON.parse(readFileSync(h.paths.feed)); assert.equal(feed.candidates[0].priority, true); assert.equal(h.monitor.view().priorityGroups, 1);
+  assert.ok(!JSON.stringify(feed).includes('-22')); assert.ok(!JSON.stringify(feed).includes('mock-private-text'));
+  h.config.telegramUser.vipGroupIds = ['-999']; await h.monitor.poll(); assert.equal(h.monitor.view().state, 'setup-required');
+});
+
+test('revoking priority status during an awaited read discards the old priority contribution', async t => {
+  let h, change = false;
+  h = fixture(t, { messages: async (_peer, options) => { if (change) h.config.telegramUser.vipGroupIds = []; return [{ id: options.minId ? options.minId + 1 : 10, senderId: 'mock-sender', date: when / 1000, message: contract }]; } });
+  h.config.telegramUser.vipGroupIds = ['-11']; h.session(); await h.monitor.poll(); change = true; await h.monitor.poll();
+  const feed = JSON.parse(readFileSync(h.paths.feed)); assert.equal(feed.candidates.length, 0); assert.equal(h.monitor.view().state, 'reloading');
+});

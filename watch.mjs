@@ -8,16 +8,17 @@ import { makeWatchBaw } from './lib/wallet-cli.mjs';
 import { getPaidConfig, getRuleConfig, withinPaidBudget } from './lib/config.mjs';
 import { decodeAbiUint } from './lib/nft-codec.mjs';
 import { normalizeWalletConfig, getWalletId, effectiveWalletConfig, walletCanAutomate } from './lib/wallet-model.mjs';
-import { withWalletExecution, markWalletBlocked, clearWalletBlocked } from './lib/wallet-executor.mjs';
+import { withWalletExecution, markWalletBlocked, clearWalletBlocked, assertWalletMaintenanceIdle } from './lib/wallet-executor.mjs';
 import { createWalletBudget } from './lib/wallet-budget.mjs';
 import { reconcileScannerPending } from './lib/scanner-recovery.mjs';
 import { ensureEntryPolicy, effectiveEntryPolicy, entryGate, createMintRisk, deriveMintCost, MINT_RISK_LIMITS } from './lib/mint-policy.mjs';
 import { createMintMedia } from './lib/mint-media.mjs';
 import { createSafeWeb } from './lib/safe-web.mjs';
-import { processSocialCandidates } from './lib/social-candidates.mjs';
+import { processSocialCandidates, socialSelectionHash } from './lib/social-candidates.mjs';
 import { FREE_PEAK_DELAY_MS, FREE_SELL_MIN_USD, applyConfirmedSell, formatTokenAmount, marketOrderRecord, marketOrderState, normalizedPositionValue, parseTokenAmount, planPositionSell, positionStateKey, receiptTokenOutflow, refundedTokenUnits, samplePositionDrawdown } from './lib/sell-rules.mjs';
 
 const DIR = dirname(fileURLToPath(import.meta.url));
+assertWalletMaintenanceIdle(DIR);
 const SELF = fileURLToPath(import.meta.url), SELF_MT = statSync(SELF).mtimeMs;
 const LOG = join(DIR, 'data', 'watch.log'), STATE = join(DIR, 'data', 'watch_state.json');
 mkdirSync(join(DIR, 'data'), { recursive: true });
@@ -89,6 +90,18 @@ async function groupProgress(c, name, pct) { // 任何項目（免費或付費�
   try { const d = S.deployer?.[c] || (await deployerOf(c)); if (d && (S.black?.[d] || S.paid?.[c]?.drain)) { S.g70[c] = 'skip'; return; } } catch {} /* 審查修正：黑名單/抽走過資金的開發者，不推給群 */
   S.g70[c] = 'wait'; await sleep(90e3); /* 使用者 10/31 21:18：同一個項目群裡只播一次——先等 90 秒，期間如果我們打到了，就只發「打了」那則 */
   if (S.grpOnce?.[c]) { S.g70[c] = 'merged'; return; }
+  try {
+    const owner = S.deployer?.[c] || await deployerOf(c);
+    if (owner && S.black?.[owner] || S.paid?.[c]?.drain) { S.g70[c] = 'skip'; return; }
+    const serial = await serialDev(c);
+    if (serial) { S.g70[c] = 'skip-serial'; return; }
+    if (!await verifyAgentProject(c)) { S.g70[c] = 'skip-agent-proof'; return; }
+    const P = S.paid?.[c];
+    if (!P) { S.g70[c] = 'skip-agents'; return; }
+    const freshHeat = () => Number.isFinite(P.heatAt) && P.heatAt > 0 && P.heatAt <= Date.now() && Date.now() - P.heatAt <= 120000;
+    if (!freshHeat()) await heatOf(c, P);
+    if (!freshHeat() || !Number.isSafeInteger(P.agents) || P.agents < ENTRY_POLICY.minAgents) { S.g70[c] = 'skip-agents'; return; }
+  } catch { delete S.g70[c]; return; }
   S.g70[c] = ts(); S.grpOnce = S.grpOnce || {}; S.grpOnce[c] = 1;
   const text = `📡 Agent ID 播报\n🔥 ${name || '新项目'} 铸造进度已超过 70%（目前 ${Math.round(pct * 100)}%）\n合约：${c}`;
   log('群播報: ' + text.replace(/\n/g, ' | '));
@@ -387,12 +400,36 @@ async function verifyAgentProject(c) {
     return agents / senders.length >= 0.6;
   } catch { return false; }
 }
+async function findSocialNameHints({ title, host }) {
+  const words = [...new Set(String(title + ' ' + host.split('.')[0]).toLowerCase().match(/[a-z0-9一-鿿]{4,}/g) || [])].filter(word => !/^(agent|mint|meme|token|launch|https|www|fair|curve|chain|smart|binance)$/.test(word));
+  if (!words.length) return [];
+  const choices = [...HOT.entries()].filter(([address, heat]) => validMintAddress(address) && !INFRA.has(address) && heat.from?.size >= 5).sort((a, b) => b[1].from.size - a[1].from.size).slice(0, 12);
+  const out = [];
+  for (const [address] of choices) {
+    const name = String(S.paid?.[address]?.name || tokStr(await call(address, '0x06fdde03')) || '').toLowerCase().replace(/[^a-z0-9一-鿿]/g, '');
+    if (name.length >= 4 && words.some(word => name.includes(word) || word.includes(name))) out.push(address);
+    if (out.length >= 3) break;
+  }
+  return out;
+}
+function socialConfigScope(settings) {
+  if (settings?.enabled !== true || !Array.isArray(settings.groupIds) || settings.vipGroupIds !== undefined && !Array.isArray(settings.vipGroupIds)) return null;
+  return socialSelectionHash(settings.groupIds) + ':' + socialSelectionHash(settings.vipGroupIds || []);
+}
 async function socialCandidateWatch() {
-  if (currentRuntimeConfig().telegramUser?.enabled !== true) return;
+  const selected = currentRuntimeConfig().telegramUser, scope = socialConfigScope(selected);
+  if (!scope) return;
+  const isCurrent = () => { try { return socialConfigScope(currentRuntimeConfig().telegramUser) === scope; } catch { return false; } };
   const file = join(DIR, 'data', 'tg_candidates.json');
   if (!existsSync(file) || statSync(file).size > 524288) return;
   const snapshot = JSON.parse(readFileSync(file, 'utf8'));
-  const candidates = await processSocialCandidates({ snapshot, verifyContract: verifyAgentProject, fetchBytes: SAFE_WEB, allowedGroupIds: currentRuntimeConfig().telegramUser.groupIds });
+  S.socialDiscovery ||= {};
+  const candidates = await processSocialCandidates({ snapshot, verifyContract: verifyAgentProject, fetchBytes: SAFE_WEB, allowedGroupIds: selected.groupIds, vipGroupIds: selected.vipGroupIds || [], discoveryState: S.socialDiscovery, isCurrent, findNameHints: findSocialNameHints, onNameHints: async ({ host, addresses }) => {
+    if (!isCurrent()) return;
+    log(`热门网址 ${noLink(host)} 有同名链上候选（未确认网站关联，不加入自动交易）：${addresses.join('、')}`);
+    await tg(`🌐 热门网址 ${noLink(host)} 有同名链上候选，未确认网站关联；仅供手动核验，未加入自动交易：\n${addresses.join('\n')}`);
+  } });
+  if (!isCurrent()) return; // Revoked groups/priority cannot enqueue results from an awaited round.
   for (const candidate of candidates) {
     // Group popularity only schedules chain checks. It cannot override wallet,
     // participant, project, simulation, or budget gates in the mint paths.
@@ -402,10 +439,11 @@ async function socialCandidateWatch() {
     P.groupSignalAt = candidate.observedAt;
     P.groupCount = candidate.groupCount;
     P.groupSenders = candidate.senderCount;
+    if (candidate.priority) P.prioritySignalAt = candidate.observedAt;
     if (candidate.source === 'telegram-url') P.fromUrl = true;
     P.needLearn = 1;
   }
-  if (candidates.length) save();
+  save(); // Persist bounded retry timers and the hourly priority quota across restarts.
 }
 async function notifyFreeMint(c, progress, agents, W = null) {
   const check = entryGate({ progress, agents, policy: W ? entryFor(W) : ENTRY_POLICY });
@@ -1136,7 +1174,7 @@ async function freeProgress(c) { /* 免費項目的進度：已鑄造／總量�
   fpCache.set(c, { t: Date.now(), p }); return p;
 }
 async function progressSweep() { /* 使用者 10/31 23:21 查 Pulsepanther 沒打到：追蹤名單 500 多個，一般檢查每輪只看 16 個、一個要 10~30 秒，低進度的項目要 2~3 小時才回頭看一次，10% 直接漲到 100% 都沒發現。改成每分鐘用輕量方式只讀進度（最多 80 個、6 個同時），進度過 45% 就會進快速名單，每 15 秒檢查 */
-  const now = Date.now(); const list = Object.entries(S.paid || {}).filter(([c, P]) => !P.unmintable && (P.progress || 0) < 0.999 && now - (P.at || 0) < 3 * 86400e3 && !WALLETS.every((W) => P.done?.[W.id])).sort((x, y) => (x[1].sweepAt || 0) - (y[1].sweepAt || 0)).slice(0, 80);
+  const now = Date.now(); const list = Object.entries(S.paid || {}).filter(([c, P]) => !P.unmintable && (P.progress || 0) < 0.999 && now - (P.at || 0) < 86400e3 && !WALLETS.every((W) => P.done?.[W.id])).sort((x, y) => (y[1].groupSignalAt && !y[1].sweepAt ? 1 : 0) - (x[1].groupSignalAt && !x[1].sweepAt ? 1 : 0) || (x[1].sweepAt || 0) - (y[1].sweepAt || 0) || (y[1].at || 0) - (x[1].at || 0)).slice(0, 80);
   let i = 0; await Promise.all(Array.from({ length: 6 }, async () => { while (i < list.length) { const [c, P] = list[i++]; try { if (P.progAt && Date.now() - P.progAt < 180e3) { P.sweepAt = Date.now(); continue; } /* 除錯：正式檢查 3 分鐘內剛讀過的不覆蓋（避免讀法不同把已賣完的又拉回快速名單、佔名額） */ let fp = null; if (P.soldSel) { /* 除錯 11/1：bibiai AGENT ID 用「已售／總量」才讀得到（已售 a2309ff8、總量 a0e23ebd），一般免費讀法讀不到 → 卡在 0% 兩小時沒回頭看，漲到 92% 都不知道 */ const sr = await call(c, P.soldSel); const sold = sr && sr.length >= 66 ? Number(BigInt(sr.slice(0, 66))) : null; if (sold > 0) { if (P.capSel === undefined) P.capSel = (await findCapSel(c, await fullCode(c, await codeOf(c)).catch(() => ''), sold).catch(() => '')) || ''; if (P.capSel) { const cr = await call(c, '0x' + P.capSel); const cap = cr && cr.length >= 66 ? Number(BigInt(cr.slice(0, 66))) : 0; if (cap >= sold && cap > 0) fp = sold / cap; } } }
       if (fp == null) fp = await freeProgress(c); P.sweepAt = Date.now(); if (fp != null && fp > 0) { if (fp >= 0.45 && (P.progress || 0) < 0.45 && !P.swLog) { P.swLog = 1; log(`進度掃描：${P.name || c} 進度 ${Math.round(fp * 100)}%，移到快速檢查`); } P.progress = Math.min(fp, 0.99); /* 審查 11/1：免費合約正式檢查不會讀進度，賣完的會永遠卡 99% 佔快速名單 → 直接記 100% */ /* 100% 交給快速檢查用正式讀法確認，避免讀錯就永遠不看 */ } } catch {} } }));
 }
@@ -1158,7 +1196,7 @@ async function autoMintInner(c, fname, W, val) {
   if (MONITOR_ONLY || !canWallet(W, 'mint')) return MONITOR_NOTE;
   const PAID = paidFor(W);
   /* 使用者 10/31 19:21：新規則——不管免費還是付費，進度超過 50% 就打，之前的規矩（重複 DEV、黑名單、熱度、手續費上限…）全部不看；只保留貔貅類安全檢查（每筆都模擬、不能授權、不能扣到預期外的資產、Flap 禁止）。讀不到進度的才用熱度判斷 */
-  { const sd = await serialDev(c); if (sd) return `⛔ ${sd}，照規則不打`; }
+  { const sd = await serialDev(c); if (sd) { if (S.paid?.[c]) { S.paid[c].serialLog = 1; S.paid[c].lastReason = sd + '，照規則不打'; } return `⛔ ${sd}，照規則不打`; } }
   const fp = await freeProgress(c);
   const agentsN = S.paid?.[c]?.agents || 0;
   const projectInfo = await MINT_RISK.contractInfo(c);
@@ -1764,12 +1802,14 @@ async function observeFreeMint(c, P) {
   }
 }
 async function heatWatch() { // 背景：替追蹤中的付費項目算熱度，看不懂的合約順便學別人的打法（不拖慢 15 秒的快速檢查）
-  const ents = Object.entries(S.paid || {}).filter(([c, P]) => !INFRA.has(c) && !P.unmintable && (P.progress || 0) < 0.999 && !WALLETS.every((W) => P.done?.[W.id]))
-    .sort((a, b) => ((b[1].needLearn && (b[1].progress || 0) >= 0.45) - (a[1].needLearn && (a[1].progress || 0) >= 0.45)) || hk(a[1]) - hk(b[1])).slice(0, 8); // 快滿或很熱的約每分鐘更新，其他約 10 分鐘；快到門檻又還不會打的排最前面（除錯 11/1：BNBCAT 57% 一直排不到）
+  const signal = P => P.groupSignalAt && Date.now() - P.groupSignalAt < 86400e3;
+  const signalFirst = P => signal(P) && !P.heatAt ? 1 : 0;
+  const ents = Object.entries(S.paid || {}).filter(([c, P]) => !INFRA.has(c) && !P.unmintable && (P.progress || 0) < 0.999 && !WALLETS.every((W) => P.done?.[W.id]) && Date.now() - (P.at || 0) < 86400e3)
+    .sort((a, b) => signalFirst(b[1]) - signalFirst(a[1]) || ((b[1].needLearn && (b[1].progress || 0) >= 0.45) - (a[1].needLearn && (a[1].progress || 0) >= 0.45)) || hk(a[1]) - hk(b[1]) || (b[1].at || 0) - (a[1].at || 0)).slice(0, 8); // 快滿或很熱的約每分鐘更新，其他約 10 分鐘；快到門檻又還不會打的排最前面（除錯 11/1：BNBCAT 57% 一直排不到）
   for (const [c, P] of ents) {
     try {
       await heatOf(c, P).catch((e) => log('heat ' + c + ' ' + e.message)); /* 除錯 11/1：算熱度被節點限流時，學打法也跟著被跳過 → 分開處理 */
-      if (P.needLearn && (!P.replay || Date.now() - (P.replay.learnedAt || 0) > 120e3) && (heatTier(P) >= 1 || (P.progress || 0) >= 0.2 || (P.agents || 0) >= 20)) { const lr = await learnReplay(c).catch(() => null); if (lr?.recv) { P.recvValue = lr.recv; P.recvSeen = lr.recvSeen; P.recvVals = lr.recvVals; P.replay = { hot: lr.hot, learnedAt: lr.learnedAt }; delete P.needLearn; log(`學到 ${P.name || c} 的打法：直接轉 ${Number(BigInt(lr.recv)) / 1e18} BNB 就鑄造（${lr.recvSeen} 筆）`); } else if (lr) P.replay = lr; }
+      if ((P.needLearn || signal(P) && !P.replay && !P.recvValue) && (!P.replay || Date.now() - (P.replay.learnedAt || 0) > 120e3) && (heatTier(P) >= 1 || (P.progress || 0) >= 0.2 || (P.agents || 0) >= 20 || signal(P))) { const lr = await learnReplay(c).catch(() => null); if (lr?.recv) { P.recvValue = lr.recv; P.recvSeen = lr.recvSeen; P.recvVals = lr.recvVals; P.replay = { hot: lr.hot, learnedAt: lr.learnedAt }; delete P.needLearn; log(`學到 ${P.name || c} 的打法：直接轉 ${Number(BigInt(lr.recv)) / 1e18} BNB 就鑄造（${lr.recvSeen} 筆）`); } else if (lr) P.replay = lr; }
       await observeFreeMint(c, P).catch(error => log('免费项目通知检查 ' + c + ' ' + error.message));
     } catch (e) { log('heat ' + c + ' ' + e.message); }
   }
@@ -1854,7 +1894,7 @@ async function paidLoop(mode = 'all', shard = null) {
 
   const hotP = all.filter(([c, P]) => FORCE.has(c) || ((Date.now() - (P.groupSignalAt || 0) < 86400e3 || (P.progress || 0) >= 0.45 || (fpCache.get(c)?.p || 0) >= 0.45 || (!(P.progress > 0) && Math.max(P.agents || 0, HOT.get(c)?.from.size || 0) >= 70)) && (P.progress || 0) < 0.999 && !P.unmintable)).filter(([c, P]) => !WALLETS.every((W) => P.done[W.id])).sort((a, b) => (b[1].progress || 0) - (a[1].progress || 0) || (b[1].agents || 0) - (a[1].agents || 0)).slice(0, 12); /* 已通过链上身份候选检查的群组热议项目也加入15秒快查，自动交易门槛不变。 */
   // 快速檢查（mode='hot'）每 15 秒只看快滿／很熱的；一般檢查（mode='rest'）另外在背景約每分鐘輪流看其他的，互不拖慢
-  const rest = mode === 'hot' ? [] : all.filter((e) => !hotP.includes(e)).sort((a, b) => (a[1].lastTry || 0) - (b[1].lastTry || 0)).slice(0, 16);
+  const rest = mode === 'hot' ? [] : all.filter((e) => !hotP.includes(e) && Date.now() - (e[1].at || 0) < 86400e3).sort((a, b) => (a[1].lastTry || 0) - (b[1].lastTry || 0) || (b[1].at || 0) - (a[1].at || 0)).slice(0, 16);
   const ents = mode === 'rest' ? rest : mode === 'hot' ? (shard == null ? hotP : hotP.filter((e, i) => i % 3 === shard)) : hotP.concat(rest); /* 快速檢查分 3 組同時跑（審查修正：一個一個查要 1 分多鐘） */
   for (const [c, P] of ents) {
     if (INFRA.has(c)) { delete S.paid[c]; continue; } // Agent ID 登記合約本身不是項目（註冊 .ai 身份），不打
@@ -1891,7 +1931,7 @@ async function paidLoop(mode = 'all', shard = null) {
     if (progress === null) { const pr = await progressOf(c, code, tokAddr0); progress = typeof pr.progress === 'number' && Number.isFinite(pr.progress) && pr.progress >= 0 ? pr.progress : null; how = pr.how || ''; }
     // A low on-chain progress stays low; it cannot be replaced by unknown to bypass the gate.
     const prevProg = P.progress; P.progress = progress; P.progAt = Date.now();
-    if (progress >= 0.95 && !P.noRefundLog && !P.serialLog && !String(P.lastReason || '').includes('保本') && !WALLETS.some((W) => P.done[W.id] && !['pool-open', 'fail', 'unknown'].includes(P.done[W.id]))) { /* 照規則不打（沒有保本）的不算錯過 */ S.missed = S.missed || {}; if (!S.missed[c]) { S.missed[c] = { name: P.name || c.slice(0, 10), at: ts(), why: P.lastReason || (P.unmintable ? '打不了' : '還沒找到能打的方式') }; log(`錯過 ${c}（${S.missed[c].name}）：進度已 ${Math.round(progress * 100)}%，我們沒打到，原因：${S.missed[c].why}`); } } /* 讓自己更聰明：記下快賣完卻沒打到的項目和原因，每晚總結列出來，方便找出要補的漏洞 */
+    if (progress >= 0.95 && !P.noRefundLog && !P.serialLog && !String(P.lastReason || '').includes('保本') && !String(P.lastReason || '').includes('部署者') && !(await serialDev(c)) && !WALLETS.some((W) => P.done[W.id] && !['pool-open', 'fail', 'unknown'].includes(P.done[W.id]))) { /* 照規則不打（沒有保本）的不算錯過 */ S.missed = S.missed || {}; if (!S.missed[c]) { S.missed[c] = { name: P.name || c.slice(0, 10), at: ts(), why: P.lastReason || (P.unmintable ? '打不了' : '還沒找到能打的方式') }; log(`錯過 ${c}（${S.missed[c].name}）：進度已 ${Math.round(progress * 100)}%，我們沒打到，原因：${S.missed[c].why}`); } } /* 讓自己更聰明：記下快賣完卻沒打到的項目和原因，每晚總結列出來，方便找出要補的漏洞 */
     if (progress >= 0.7 && progress <= 1 && (prevProg != null ? prevProg < 0.7 : Date.now() - P.at < 6 * 3600e3)) groupProgress(c, P.name, progress).catch(() => {});
     { const now = Date.now(); P.ph = (P.ph || []).filter((x) => now - x.t < 15 * 60e3); if (!P.ph.length || now - P.ph[P.ph.length - 1].t > 10e3) P.ph.push({ t: now, p: progress }); }
     price = price || (await bnbUsd());
@@ -2209,7 +2249,7 @@ async function manualMints() {
 }
 // ── TG 指令：使用者直接在機器人打「賣 XXX」「賣 XXX 一半」「餘額」，幾秒內執行，不經過 Claude ──
 // ── 更新提醒（開源版才開；使用者 11/1 00:47：不自動更新，只提醒；用戶回 /update 才更新，更新前安檢＋sha256＋備份，新版起不來自動換回）──
-const UPD = { on: false, ver: '2.7.4', repo: 'nancyc0813-maker/agentid-sniper', group: 't.me/nancy_c0813' }; /* Web 增强版仅由 Web 后台检查自己的正式发行；扫描器不查询或安装 Nancy 上游版本。 */
+const UPD = { on: false, ver: '2.7.6', repo: 'nancyc0813-maker/agentid-sniper', group: 't.me/nancy_c0813' }; /* Web 增强版仅由 Web 后台检查自己的正式发行；扫描器不查询或安装 Nancy 上游版本。 */
 const verGt = (a, b) => { const x = String(a).split('.').map(Number), y = String(b).split('.').map(Number); for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0); return false; };
 async function updCheck(quiet = false) {
   if (!UPD.on) return null;
