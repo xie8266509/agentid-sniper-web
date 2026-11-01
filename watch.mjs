@@ -739,10 +739,61 @@ async function holdings(head, onlyFast = false) {
 }
 async function holdW(W, head, onlyFast) {
   await recoverScannerWallet(W);
+  const checked = new Set();
+  const walletTokens = () => {
+    const seen = new Set(), tokens = [];
+    for (const token of TOKENS.concat(S.dyn || [])) {
+      if (token.only && token.only.toLowerCase() !== W.addr || seen.has(token.addr.toLowerCase())) continue;
+      seen.add(token.addr.toLowerCase()); tokens.push(token);
+    }
+    return tokens;
+  };
+  const tokens = walletTokens();
+  const stateFor = token => positionFor(W, token);
+  const isFast = token => {
+    const state = stateFor(token), elapsed = Date.now() - state.openAt;
+    return !!state.pair && Number.isFinite(state.openAt) && state.openAt > 0 && elapsed >= 0 && elapsed < rulesFor(W).fastMin * 60000 && state.stage !== 9 && !state.done;
+  };
+  let firstError = null;
+  const check = async (token, mode) => {
+    try { await checkHoldingsBatch(W, head, mode, [token]); }
+    catch (error) {
+      firstError ||= error;
+      const state = stateFor(token); state.holdingsError = error.message; state.holdingsErrorAt = Date.now();
+      logWallet(W, '持仓检查失败 ' + token.sym + '：' + error.message);
+    } finally {
+      checked.add(token.addr.toLowerCase());
+      if (isFast(token)) stateFor(token).fastCheckedAt = Date.now();
+    }
+  };
+  const fastDue = token => { const at = stateFor(token).fastCheckedAt; return !Number.isFinite(at) || at > Date.now() || Date.now() - at >= 1000; };
+  const pumpFast = async (force = false) => {
+    const due = token => force ? !checked.has(token.addr.toLowerCase()) : fastDue(token);
+    const fast = walletTokens().filter(token => isFast(token) && due(token)).sort((a, b) => (stateFor(a).fastCheckedAt || 0) - (stateFor(b).fastCheckedAt || 0));
+    for (const token of fast) if (isFast(token) && due(token)) await check(token, true);
+  };
+  // Recovery stays ahead of every fast/full filter. Each position is processed
+  // on this one await chain, including when an old position's RPC is slow.
+  for (const token of tokens) { const state = stateFor(token); if (state.pendingSell || state.submissionIntent || state.sellReviewRequired) await check(token, onlyFast); }
+  // An explicit full refresh must apply changed rules/cost/pending evidence
+  // immediately, even when the preceding fast read completed this same second.
+  await pumpFast(!onlyFast);
+  if (onlyFast !== true) {
+    const ordinary = tokens.filter(token => !checked.has(token.addr.toLowerCase()) && !isFast(token)).map((token, index) => ({ token, index, opening: token.boughtAt > Date.now() - 72 * 3600000 && !stateFor(token).pair })).sort((a, b) => Number(b.opening) - Number(a.opening) || a.index - b.index);
+    for (const { token } of ordinary) {
+      await pumpFast();
+      if (isFast(token) || checked.has(token.addr.toLowerCase())) continue;
+      await check(token, onlyFast);
+    }
+    if (ordinary.length) await pumpFast();
+  }
+  if (firstError) throw firstError;
+}
+async function checkHoldingsBatch(W, head, onlyFast, selectedTokens) {
   const RULE = rulesFor(W), sellingEnabled = canWallet(W, 'token-sell');
   S.effectiveWalletRules ||= {}; S.effectiveWalletRules[W.id] = structuredClone(RULE);
   const seen = new Set(), openingOnly = onlyFast === 'open';
-  const ordered = TOKENS.concat(S.dyn || []).map((token, index) => ({ token, index, opening: token.boughtAt > Date.now() - 72 * 3600000 && !S.tokens[positionStateKey(W.addr, token.addr)]?.pair })).sort((a, b) => Number(b.opening) - Number(a.opening) || a.index - b.index).map(item => item.token);
+  const ordered = selectedTokens.map((token, index) => ({ token, index, opening: token.boughtAt > Date.now() - 72 * 3600000 && !S.tokens[positionStateKey(W.addr, token.addr)]?.pair })).sort((a, b) => Number(b.opening) - Number(a.opening) || a.index - b.index).map(item => item.token);
   for (const t0 of ordered) {
     if (t0.only && t0.only.toLowerCase() !== W.addr) continue;
     if (seen.has(t0.addr.toLowerCase())) continue; seen.add(t0.addr.toLowerCase());
@@ -2377,7 +2428,7 @@ async function manualMints() {
 }
 // ── TG 指令：使用者直接在機器人打「賣 XXX」「賣 XXX 一半」「餘額」，幾秒內執行，不經過 Claude ──
 // ── 更新提醒（開源版才開；使用者 11/1 00:47：不自動更新，只提醒；用戶回 /update 才更新，更新前安檢＋sha256＋備份，新版起不來自動換回）──
-const UPD = { on: false, ver: '2.8.1', repo: 'nancyc0813-maker/agentid-sniper', group: 't.me/nancy_c0813' }; /* Web 增强版仅由 Web 后台检查自己的正式发行；扫描器不查询或安装 Nancy 上游版本。 */
+const UPD = { on: false, ver: '2.8.2', repo: 'nancyc0813-maker/agentid-sniper', group: 't.me/nancy_c0813' }; /* Web 增强版仅由 Web 后台检查自己的正式发行；扫描器不查询或安装 Nancy 上游版本。 */
 const verGt = (a, b) => { const x = String(a).split('.').map(Number), y = String(b).split('.').map(Number); for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0); return false; };
 async function updCheck(quiet = false) {
   if (!UPD.on) return null;

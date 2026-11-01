@@ -2,12 +2,12 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULT_CONFIG, readConfig, saveConfig, validateConfig } from '../lib/config.mjs';
 import { effectiveWalletConfig, normalizeWalletConfig, resolveWallet, walletCanAutomate } from '../lib/wallet-model.mjs';
-import { clearWalletBlocked, markWalletBlocked, walletExecutionView, withWalletExecution } from '../lib/wallet-executor.mjs';
+import { acquireWalletFileLock, clearWalletBlocked, markWalletBlocked, walletExecutionView, withWalletExecution } from '../lib/wallet-executor.mjs';
 import { bnbToWei, createWalletBudget } from '../lib/wallet-budget.mjs';
 import { runBoundWalletTransaction } from '../lib/wallet-cli.mjs';
 
@@ -283,6 +283,35 @@ test('a killed executor is surfaced as unknown and competing reapers cannot over
     assert.equal(walletExecutionView(wallet, { root }).blocked, true, 'reconciliation reads never clear unknown transactions');
     await assert.rejects(withWalletExecution(wallet, async () => {}, { root }), /先核对/);
   } finally { crash.process.kill('SIGKILL'); await crash.done; rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a stale lock that disappears at the preflight lstat boundary is safely replaced', async () => {
+  const root = realpathSync(temp()), lock = join(root, 'fixture-stale.lock');
+  mkdirSync(lock); writeFileSync(join(lock, 'owner.json'), JSON.stringify({ pid: 2147483647, token: 'fixture-retired-owner' }));
+  // Pause the filesystem observation at exactly the failing interleaving: a
+  // competing reaper retires the stale generation after a waiter starts its
+  // path preflight. This really renames the directory; only timing is injected.
+  const script = `import assert from 'node:assert/strict';import fs from 'node:fs';import {syncBuiltinESMExports} from 'node:module';import {acquireWalletFileLock} from ${JSON.stringify(executorUrl)};
+const path=process.env.TASK_LOCK,original=fs.lstatSync;let retired=false;
+fs.lstatSync=(...args)=>{if(String(args[0])===path&&!retired){retired=true;fs.renameSync(path,path+'.fixture-retired');}return Reflect.apply(original,fs,args);};syncBuiltinESMExports();
+try{const release=await acquireWalletFileLock(path,{timeoutMs:3000,pollMs:1});assert.equal(retired,true);const owner=JSON.parse(fs.readFileSync(path+'/owner.json'));assert.equal(owner.pid,process.pid);assert.notEqual(owner.token,'fixture-retired-owner');assert.equal(JSON.parse(fs.readFileSync(path+'.fixture-retired/owner.json')).token,'fixture-retired-owner');release();assert.equal(fs.existsSync(path),false);assert.equal(fs.existsSync(path+'.fixture-retired'),true);console.log('REPLACEMENT_SAFE');}finally{fs.lstatSync=original;syncBuiltinESMExports();}`;
+  try {
+    const result = await child(script, { TASK_LOCK: lock }).done;
+    assert.equal(result.code, 0, result.errors); assert.equal(result.output.trim(), 'REPLACEMENT_SAFE');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('lock path preflight preserves access errors and refuses dangling symlinks', async () => {
+  const root = realpathSync(temp()), lock = join(root, 'fixture-denied.lock'); mkdirSync(lock);
+  const script = `import assert from 'node:assert/strict';import fs from 'node:fs';import {syncBuiltinESMExports} from 'node:module';import {acquireWalletFileLock} from ${JSON.stringify(executorUrl)};
+const path=process.env.TASK_LOCK,original=fs.lstatSync;fs.lstatSync=(...args)=>{if(String(args[0])===path)throw Object.assign(new Error('fixture access denied'),{code:'EACCES'});return Reflect.apply(original,fs,args);};syncBuiltinESMExports();
+try{await assert.rejects(acquireWalletFileLock(path,{timeoutMs:0}),{code:'EACCES'});console.log('ACCESS_DENIED');}finally{fs.lstatSync=original;syncBuiltinESMExports();}`;
+  try {
+    const result = await child(script, { TASK_LOCK: lock }).done;
+    assert.equal(result.code, 0, result.errors); assert.equal(result.output.trim(), 'ACCESS_DENIED');
+    const redirected = join(root, 'fixture-dangling.lock'); symlinkSync(join(root, 'missing-target'), redirected);
+    await assert.rejects(acquireWalletFileLock(redirected, { timeoutMs: 0 }), /符号链接/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('PID reuse does not make a stale transaction appear active', async () => {
