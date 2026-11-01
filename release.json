@@ -31,6 +31,7 @@
     "docs/legacy/windows-install.bat.txt": "541fa44635d66dae383ebc2e64bd140230ba93ca7f379b54e8b0092f430b1d2f",
     "docs/upstream-reviews/v2.7.9-38fb270fea2c.md": "0119b2bb78277405efee5a0df0634edb2c8f814fc4ebcd99876c57db325d1a37",
     "docs/upstream-reviews/v2.8.1-c11d8ef8342f.md": "2e41744c4dbc457faeebada5996b2324df8e23499a4212924ee4e48668f4abaa",
+    "docs/upstream-reviews/v2.8.2-ef741211780b.md": "afda77a869273f0e92b1ee690eab2e64512c53456b00063d61b6cd9efda1757f",
     "lib/agent-maturity.mjs": "0561900da7095e279321e1c15a6d040489e09bbe72d70f7300fc068773613a3f",
     "lib/config.mjs": "cd826e37572caef43d96ed1d837dd6afc8a230e0559bbd59b799007d2ea83fbf",
     "lib/control.mjs": "ce96a0ccb36fd613281a29c49b0a0086747d3ea6fa56b11687361b59ac1ab8bb",
