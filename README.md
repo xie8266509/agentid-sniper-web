@@ -1,6 +1,6 @@
 # Agent ID Sniper Web
 
-**v0.2.1 社区 Web 增强版 · 2026-11-01 正式发行**：在本机管理多个 Binance Agentic Wallet 的 Agent ID 铸造监控、持仓和卖出规则。
+**v0.2.2 社区 Web 增强版 · 2026-11-01 正式发行**：在本机管理多个 Binance Agentic Wallet 的 Agent ID 铸造监控、持仓和卖出规则。
 
 基于 [Nancy 的 Agent ID Sniper](https://github.com/nancyc0813-maker/agentid-sniper)。原作者 [@nancy_c813](https://x.com/nancy_c813)，Web 增强版维护 [@supra_bnb](https://x.com/supra_bnb)。这是社区维护项目，不是 Binance 官方产品。
 
@@ -53,6 +53,8 @@ NFT 自动卖出需要具备相应权限的 [Element API Key](https://element.ma
 「系统更新」随 Web 后台运行，启动时及每 30 分钟检查增强版的正式发布标签和 `release.json` 完整文件清单；安装由用户点击触发。发行仓库尚未配置时，不安装未知来源的代码。
 
 更新前停止扫描器并完成钱包/NFT 操作。候选版本通过校验和本地回归检查后，保存备份、应用代码并重启 Web；启动验证失败时尝试恢复旧代码。回退不恢复或覆盖钱包会话、配置、持仓和订单数据，也不会自动开启交易。冲突、发布校验不一致或更新期间出现外部源码改动时会停止并显示原因。
+
+v0.2.2 起，正式发行是否可用由 GitHub 发布状态、标签提交及完整源码清单确认，不用本机时钟判断发布时间；发布后无需等待时差。旧版客户端须先升级一次至 v0.2.2，之后正常使用一键更新，见 [一次迁移说明](README.local.md#旧版更新器的一次迁移)。
 
 Nancy 上游变更由维护者在独立分支合并，经审核和 CI 后发布增强版；用户更新不直接覆盖为上游的 `watch.mjs`。增强版版本和上游基线分别记录。
 

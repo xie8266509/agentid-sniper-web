@@ -42,6 +42,24 @@ function fixture(t, { upstream = '// upstream one\nexport const n = 1;\n// stabl
   return { root, git, put, updater, base, target, upstream, published, sealManifest };
 }
 
+// Exercise the production Release discovery branch without reaching GitHub.
+// The fixture already contains the tagged objects; only network transport and
+// that tag fetch are doubled. Validation, merge, source writes and rollback run.
+function publicReleaseUpdater(f, { now, published = () => f.published } = {}) {
+  const calls = [], requests = [];
+  const updater = createLocalUpdater({ root: f.root, ...(now ? { now } : {}),
+    fetchImpl: async (url, options) => { requests.push({ url, options }); return { ok: true, status: 200, text: async () => JSON.stringify(published()) }; },
+    runCommand: async (file, args, options = {}) => {
+      calls.push(args);
+      if (args.includes('fetch')) return { code: 0, stdout: '', stderr: '' };
+      if (args.includes('FETCH_HEAD^{commit}')) return { code: 0, stdout: f.target + '\n', stderr: '' };
+      try { return { code: 0, stdout: execFileSync(file, args, { cwd: options.cwd || f.root, env: { ...process.env, ...options.env }, encoding: options.encoding || 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }), stderr: '' }; }
+      catch (e) { return { code: e.status || 1, stdout: String(e.stdout || ''), stderr: String(e.stderr || '') }; }
+    },
+  });
+  return { updater, calls, requests };
+}
+
 test('check discovers update without changing tracked or local source, config, session or HEAD', async (t) => {
   const f = fixture(t), before = readFileSync(join(f.root, 'watch.mjs'), 'utf8');
   const view = await f.updater.check();
@@ -167,6 +185,83 @@ test('only a published stable Release tag can be selected, never main or a prere
     const updater = createLocalUpdater({ root: f.root, fetchLatest: async () => ({ ...f.published, ...patch }) });
     const checked = await updater.check(); assert.equal(checked.phase, 'manual-review'); assert.match(checked.error, /稳定版本标签/); assert.equal(f.git('rev-parse', 'HEAD'), f.base);
   }
+});
+
+test('a just-published Release an hour ahead of the default clock checks, updates and rolls back immediately', async t => {
+  const f = fixture(t), before = readFileSync(join(f.root, 'watch.mjs'), 'utf8');
+  f.published.published_at = new Date(Date.now() + 3600000).toISOString();
+  f.put('data/local_updates/status.json', JSON.stringify({ phase: 'manual-review', error: '旧的本机时钟拒绝', blockedReason: '旧的本机时钟拒绝' }));
+  const { updater, requests, calls } = publicReleaseUpdater(f); // No injected now or clock compensation.
+  for (let i = 0; i < 2; i++) {
+    const checked = await updater.check();
+    assert.equal(checked.phase, 'ready'); assert.equal(checked.available, true);
+    assert.equal(checked.error, null); assert.equal(checked.blockedReason, null);
+    assert.equal(checked.latest.publishedAt, f.published.published_at);
+    assert.equal(checked.latest.commit, f.target);
+    assert.equal(f.git('rev-parse', 'HEAD'), f.base);
+    assert.equal(readFileSync(join(f.root, 'watch.mjs'), 'utf8'), before);
+  }
+  const updated = await updater.update({ targetCommit: f.target });
+  assert.equal(updated.phase, 'succeeded'); assert.equal(f.git('rev-parse', 'HEAD'), f.target);
+  assert.equal(requests.length, 3, 'update must re-read and validate the Release after both checks');
+  for (const { url, options } of requests) {
+    assert.equal(url, 'https://api.github.com/repos/' + DEFAULT_RELEASE_REPOSITORY + '/releases/latest');
+    assert.equal(options.redirect, 'error');
+  }
+  assert.deepEqual(calls.filter(args => args.includes('fetch')).map(args => args.at(-1)), Array(3).fill('refs/tags/v0.1.1'));
+  assert.match(readFileSync(join(f.root, 'watch.mjs'), 'utf8'), /n = 2/);
+  assert.match(readFileSync(join(f.root, 'watch.mjs'), 'utf8'), /local wallet and NFT patch/);
+  assert.equal(readFileSync(join(f.root, 'config.json'), 'utf8'), '{"secret":"keep-private"}');
+  assert.equal(readFileSync(join(f.root, 'data/wallets/session.json'), 'utf8'), 'private-session');
+  f.put('config.json', '{"secret":"mock-written-after-update"}'); f.put('data/wallets/session.json', 'session-after-update');
+  const rolled = await updater.rollback({ backupId: updated.backupId });
+  assert.equal(rolled.phase, 'rolled-back'); assert.equal(f.git('rev-parse', 'HEAD'), f.base);
+  assert.equal(readFileSync(join(f.root, 'watch.mjs'), 'utf8'), before);
+  assert.equal(readFileSync(join(f.root, 'config.json'), 'utf8'), '{"secret":"mock-written-after-update"}');
+  assert.equal(readFileSync(join(f.root, 'data/wallets/session.json'), 'utf8'), 'session-after-update');
+});
+
+test('Release selection is independent of a client clock a day slow or fast and an equivalent timezone timestamp', async t => {
+  const f = fixture(t), publishedAt = '2032-03-15T13:30:00+05:30', timestamp = Date.parse(publishedAt);
+  f.published.published_at = publishedAt;
+  for (const offset of [-86400000, 86400000]) {
+    const { updater } = publicReleaseUpdater(f, { now: () => timestamp + offset });
+    const checked = await updater.check();
+    assert.equal(checked.phase, 'ready'); assert.equal(checked.available, true);
+    assert.equal(checked.latest.publishedAt, publishedAt); assert.equal(checked.latest.commit, f.target);
+    assert.equal(f.git('rev-parse', 'HEAD'), f.base);
+  }
+});
+
+test('missing or malformed publication timestamps remain rejected without source changes', async t => {
+  const f = fixture(t), before = readFileSync(join(f.root, 'watch.mjs'), 'utf8');
+  for (const publishedAt of [undefined, null, '', '   ', 'not-a-timestamp', '2032-03-15', '2032-03-15T08:00:00', 'March 15, 2032', 0, 1, true, false, {}, []]) {
+    const { updater, calls } = publicReleaseUpdater(f, { published: () => ({ ...f.published, published_at: publishedAt }) });
+    const checked = await updater.check();
+    assert.equal(checked.phase, 'manual-review'); assert.match(checked.error, /稳定版本标签/);
+    assert.equal(calls.filter(args => args.includes('fetch')).length, 0, 'invalid release metadata must stop before a tag fetch');
+    assert.equal(f.git('rev-parse', 'HEAD'), f.base); assert.equal(readFileSync(join(f.root, 'watch.mjs'), 'utf8'), before);
+  }
+});
+
+test('future timestamps never bypass published stable tags, repository identity or complete source hashes', async t => {
+  const f = fixture(t), before = readFileSync(join(f.root, 'watch.mjs'), 'utf8');
+  f.published.published_at = new Date(Date.now() + 3600000).toISOString();
+  for (const patch of [{ tag_name: 'main' }, { tag_name: 'v0.1.2-rc.1' }, { draft: true }, { prerelease: true }, { html_url: 'https://github.com/attacker/repo/releases/tag/v0.1.1' }, { tag_name: 'v0.1.2' }]) {
+    const { updater } = publicReleaseUpdater(f, { published: () => ({ ...f.published, ...patch }) });
+    const checked = await updater.check();
+    assert.equal(checked.phase, 'manual-review'); assert.equal(checked.available, false);
+    assert.equal(f.git('rev-parse', 'HEAD'), f.base); assert.equal(readFileSync(join(f.root, 'watch.mjs'), 'utf8'), before);
+  }
+  const tampered = fixture(t, { invalidManifest: 'web/index.html' });
+  tampered.published.published_at = f.published.published_at;
+  const checked = await publicReleaseUpdater(tampered).updater.check();
+  assert.equal(checked.phase, 'manual-review'); assert.match(checked.error, /校验不一致.*web\/index\.html/);
+  assert.equal(tampered.git('rev-parse', 'HEAD'), tampered.base);
+  f.git('remote', 'set-url', 'origin', 'https://attacker.invalid/repo');
+  const { updater, requests } = publicReleaseUpdater(f);
+  assert.match((await updater.check()).error, /发行仓库/); assert.equal(requests.length, 0);
+  assert.equal(f.git('rev-parse', 'HEAD'), f.base);
 });
 
 test('a missing release channel is disabled without fetching or changing source', async t => {
