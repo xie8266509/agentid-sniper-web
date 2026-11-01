@@ -46,7 +46,7 @@ test('social URL text is only a discovery hint and every extracted contract stil
   const accepted = await processSocialCandidates({ snapshot: snapshot([item('url', 'https://mock-project.test'), item('url', 'https://bscscan.com'), item('url', 'https://too-quiet.test', { groupCount: 1, senderCount: 2 })]), now: () => when,
     fetchBytes: async (url, options) => { requests.push({ url, options }); return { body: Buffer.from(`<script>${other}</script><p>mock fixture ${contract} ${other}</p>`) }; },
     verifyContract: async address => { verifies.push(address); return address === contract; } });
-  assert.deepEqual(accepted.map(record => record.address), [contract]); assert.deepEqual(verifies, [contract, other]);
+  assert.deepEqual(accepted.map(record => record.address), [contract]); assert.deepEqual(verifies, [other, contract]);
   assert.equal(requests.length, 1); assert.equal(requests[0].options.maxBytes, 262144); assert.equal(requests[0].options.kind, 'text');
 });
 
@@ -149,4 +149,29 @@ test('a hot verification cache still admits at most twenty-four candidates per s
   const state = { entries: Object.fromEntries(addresses.map(address => [createHash('sha256').update('contract:' + address).digest('hex'), { checkedAt: when, touchedAt: when, verified: true }])), scope: 'undefined:', vipHour: { hour: Math.floor(when / 3600000), keys: [] } }; let checks = 0;
   const accepted = await processSocialCandidates({ snapshot: snapshot(addresses.map(address => item('contract', address))), now: () => when, discoveryState: state, verifyContract: async () => { checks++; return true; } });
   assert.equal(checks, 0); assert.equal(accepted.length, 24);
+});
+
+
+test('address extraction ignores hashes and known infrastructure without truncating a hash into an address', () => {
+  const generic = ['0xca11bde05977b3631167028862be2a173976ca11', '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', '0xffffffffffffffffffffffffffffffffffffffff', '0x000000000022d473030f116ddee9f6b43ac78ba3', '0x0000000000000000000000000000000000000000', '0x55d398326f99059ff775485246999027b3197955', '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c'];
+  assert.deepEqual(extractSocialCandidates([...generic, '0x' + 'ab'.repeat(32), '0x' + 'cd'.repeat(21), contract].join(' ')).addresses, [contract]);
+});
+
+test('hidden addresses in observed same-origin JSON or script text are read without execution', async () => {
+  for (const path of ['/assets/config.json', '/assets/main.js']) {
+    const requests = [], checks = [];
+    const accepted = await processSocialCandidates({ snapshot: snapshot([item('url', 'https://mock-project.test')]), now: () => when,
+      fetchBytes: async (url, options) => { requests.push({ url, options }); return { body: Buffer.from(new URL(url).pathname === path ? `globalThis.mustNeverRun(); const contractAddress = '${contract}';` : `<script src="https://unrelated.test/outside.js"></script><script src="${path}"></script>`) }; },
+      verifyContract: async address => { checks.push(address); return address === contract; } });
+    assert.deepEqual(accepted.map(record => record.address), [contract]); assert.deepEqual(checks, [contract]);
+    assert.deepEqual(requests.map(request => request.url), ['https://mock-project.test/', 'https://mock-project.test' + path]);
+    assert.equal(requests[1].options.maxRedirects, 0); assert.equal(requests[1].options.maxBytes, 262144);
+  }
+});
+
+test('linked website resources and fixed metadata share the six-read limit and reject cross-origin results', async () => {
+  const requests = [], accepted = await processSocialCandidates({ snapshot: snapshot([item('url', 'https://mock-project.test')]), now: () => when,
+    fetchBytes: async url => { requests.push(url); return requests.length === 1 ? { body: Buffer.from('<script src="/a.js"></script><script src="/b.js"></script><script src="/c.js"></script>') } : { url: 'https://unrelated.test/result', body: Buffer.from(contract) }; },
+    verifyContract: async () => { throw Error('cross-origin content must be discarded'); } });
+  assert.deepEqual(accepted, []); assert.equal(requests.length, 6); assert.equal(requests.some(url => url.endsWith('/c.js')), false);
 });

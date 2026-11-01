@@ -27,27 +27,29 @@ test('a failed fresh participation read never sends a stale group progress annou
   await h.sandbox.run(target, 'mock-project', .8); assert.equal(h.sent.length, 0); assert.equal(h.S.g70[target], undefined);
 });
 
-test('background discovery heat ignores prior-day projects and checks new verified group signals first', async () => {
+test('background discovery heat keeps two-day projects and ignores expired or serial-blocked projects and checks new verified group signals first', async () => {
   const checked = [], learned = [], paid = {};
-  for (let i = 0; i < 20; i++) paid['old-' + i] = { at: when - 86400001, progress: .2, done: {} };
+  for (let i = 0; i < 20; i++) paid['old-' + i] = { at: when - 172800001, progress: .2, done: {} };
+  paid['day-old'] = { at: when - 86400001, progress: .2, done: {} };
+  paid['serial-blocked'] = { at: when - 500, progress: .2, serialLog: 1, done: {} };
   paid['recent-earlier'] = { at: when - 10000, progress: .2, done: {} };
   paid['recent-newer'] = { at: when - 5000, progress: .2, done: {} };
   paid['social-priority'] = { at: when - 15000, progress: .1, groupSignalAt: when, done: {} };
   const sandbox = { S: { paid }, WALLETS: [{ id: 'stable-wallet', name: 'renamed' }], INFRA: new Set(), Date: DateStub, hk: P => P.heatAt || 0, heatTier: () => 0, heatOf: async (c, P) => { checked.push(c); P.heatAt = when; }, learnReplay: async c => { learned.push(c); return null; }, observeFreeMint: async () => {}, log() {} };
   vm.runInNewContext(extract('async function heatWatch(', 'function freshDeadline(') + '\nglobalThis.run = heatWatch;', sandbox);
-  await sandbox.run(); assert.deepEqual(checked, ['social-priority', 'recent-newer', 'recent-earlier']); assert.deepEqual(learned, ['social-priority']);
+  await sandbox.run(); assert.deepEqual(checked, ['social-priority', 'recent-newer', 'recent-earlier', 'day-old']); assert.deepEqual(learned, ['social-priority']);
 });
 
-test('lightweight progress sweep excludes prior-day and completed wallet identities', async () => {
-  const checked = [], paid = { old: { at: when - 86400001, done: {} }, recent: { at: when - 1000, done: {} }, completed: { at: when - 1000, done: { 'stable-wallet': true } } };
+test('lightweight progress sweep excludes expired, serial-blocked and completed wallet identities', async () => {
+  const checked = [], paid = { old: { at: when - 172800001, done: {} }, recent: { at: when - 1000, done: {} }, dayOld: { at: when - 86400001, done: {} }, serial: { at: when - 500, serialLog: 1, done: {} }, completed: { at: when - 1000, done: { 'stable-wallet': true } } };
   const sandbox = { S: { paid }, Date: DateStub, WALLETS: [{ id: 'stable-wallet', name: 'renamed' }], freeProgress: async c => { checked.push(c); return .3; }, call: async () => null, log() {} };
   vm.runInNewContext(extract('async function progressSweep(', 'async function autoMint(') + '\nglobalThis.run = progressSweep;', sandbox);
-  await sandbox.run(); assert.deepEqual(checked, ['recent']); assert.equal(paid.old.progress, undefined);
+  await sandbox.run(); assert.deepEqual(checked, ['recent', 'dayOld']); assert.equal(paid.old.progress, undefined);
 });
 
-test('normal paid project queue excludes prior-day projects and prioritizes newer never-checked projects', async () => {
+test('normal paid project queue excludes expired projects and prioritizes newer never-checked projects', async () => {
   const paid = {};
-  for (let i = 0; i < 20; i++) paid['old-' + i] = { at: when - 86400001, done: {} };
+  for (let i = 0; i < 20; i++) paid['old-' + i] = { at: when - 172800001, done: {} };
   for (let i = 0; i < 20; i++) paid['recent-' + i] = { at: when - (20 - i) * 1000, done: {}, progress: .2 };
   const sandbox = { S: { paid, umReset: 3, refundReset: 1, progressFixV: 2, forceDone: {}, migrated2: 1, mixedPhaseV: 1 }, Date: DateStub, MONITOR_ONLY: false, WALLETS: [{ id: 'stable-wallet' }], CONFIG: {}, FORCE: new Set(), HOT: new Map(), fpCache: new Map(), syncWalletProfiles() {}, recoverScannerWallet: async () => {}, canWallet: () => true, paidFor: () => ({ goPct: .6, maxAgeH: 168 }), getPaidConfig: () => ({}), resetPaidBudgetDay() {} };
   const head = extract('async function paidLoop(', '  for (const [c, P] of ents) {');
@@ -79,4 +81,23 @@ test('unknown or malformed participation counts cannot authorize a group progres
     const h = broadcast({ heatError: true }); h.S.paid[target].heatAt = heatAt;
     await h.sandbox.run(target, 'mock-project', .8); assert.equal(h.sent.length, 0, String(heatAt));
   }
+});
+
+
+async function projectQueue(paid, mode, forced = []) {
+  const sandbox = { S: { paid, umReset: 3, refundReset: 1, progressFixV: 2, forceDone: {}, migrated2: 1, mixedPhaseV: 1 }, Date: DateStub, MONITOR_ONLY: false, WALLETS: [{ id: 'stable-wallet' }], CONFIG: {}, FORCE: new Set(forced), HOT: new Map(), fpCache: new Map(), syncWalletProfiles() {}, recoverScannerWallet: async () => {}, canWallet: () => true, paidFor: () => ({ goPct: .6, maxAgeH: 168 }), getPaidConfig: () => ({}), resetPaidBudgetDay() {} };
+  vm.runInNewContext(extract('async function paidLoop(', '  for (const [c, P] of ents) {') + 'return ents.map(([c]) => c); }\nglobalThis.run = paidLoop;', sandbox);
+  return Array.from(await sandbox.run(mode));
+}
+
+test('the ordinary queue retains day-old projects until the exact two-day expiry and skips known serial deployers', async () => {
+  const paid = { dayOld: { at: when - 86400001, progress: .2, done: {} }, inside: { at: when - 172799999, progress: .2, done: {} }, expired: { at: when - 172800000, progress: .2, done: {} }, serial: { at: when - 1000, progress: .2, serialLog: 1, done: {} } };
+  assert.deepEqual(await projectQueue(paid, 'rest'), ['dayOld', 'inside']);
+});
+
+test('forceMint occupies the first fast-queue slot while ordinary serial-blocked projects consume no slot', async () => {
+  const paid = { forced: { at: when - 1000, progress: .01, serialLog: 1, done: {} }, serial: { at: when - 1000, progress: .99, serialLog: 1, done: {} } };
+  for (let i = 0; i < 15; i++) paid['hot-' + i] = { at: when - 1000, progress: .5 + i / 100, done: {} };
+  const ids = await projectQueue(paid, 'hot', ['forced']);
+  assert.equal(ids.length, 12); assert.equal(ids[0], 'forced'); assert.ok(!ids.includes('serial')); assert.equal(ids[1], 'hot-14');
 });
