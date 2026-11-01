@@ -467,7 +467,7 @@ export function createApp(overrides = {}) {
           const current = config();
           if (current.wallets.length >= 16) throw failure(400, '最多配置 16 个钱包');
           const id = 'wallet-' + randomUUID();
-          const wallet = { id, name: typeof body.name === 'string' ? body.name.trim() : `钱包 ${current.wallets.length + 1}`, address: '', agentId: '', bawDir: 'data/wallets/' + id, instanceId: id, mode: 'monitor', paused: true, archived: false, draft: true, autoMint: true, autoSellTokens: true, autoSellNfts: true, paid: { maxBnbPerDay: 0 } };
+          const wallet = { id, name: typeof body.name === 'string' ? body.name.trim() : `钱包 ${current.wallets.length + 1}`, address: '', agentId: '', bawDir: 'data/wallets/' + id, instanceId: id, mode: 'monitor', paused: false, archived: false, draft: true, autoMint: true, autoSellTokens: true, autoSellNfts: true, paid: { maxBnbPerDay: 0 } };
           const saved = saveWallets({ ...current, wallets: [...current.wallets, wallet] });
           data = { wallet: saved.wallets.find(entry => entry.id === id), config: saved };
         } else if (req.method === 'POST' && path === '/api/wallets/pause') {
@@ -606,7 +606,7 @@ export function createApp(overrides = {}) {
             }
             if (budget) await budget.view(config());
             const next = structuredClone(config()), currentIndex = identity.id === 'bootstrap-wallet' ? 0 : indexOf(identity.id);
-            next.wallets[currentIndex] = { ...next.wallets[currentIndex], name: next.wallets[currentIndex]?.name || `钱包 ${currentIndex + 1}`, address: identity.address || wallet.address, agentId, agentIdVerified: true, ...(identity.draft || identity.id === 'bootstrap-wallet' ? { draft: false, paused: true, mode: 'monitor', bawDir: identity.bawDir } : {}) };
+            next.wallets[currentIndex] = { ...next.wallets[currentIndex], name: next.wallets[currentIndex]?.name || `钱包 ${currentIndex + 1}`, address: identity.address || wallet.address, agentId, agentIdVerified: true, ...(identity.draft || identity.id === 'bootstrap-wallet' ? { draft: false, mode: 'monitor', bawDir: identity.bawDir } : {}) };
             data = { config: saveWallets(next, { allowWalletBinding: true }), wallet }; invalidateWallet(key);
           } finally { busy.delete(key); }
         } else if (req.method === 'POST' && path === '/api/wallet/logout') {

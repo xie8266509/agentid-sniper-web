@@ -1,6 +1,6 @@
 # Agent ID Sniper Web
 
-**v0.4.5 社区 Web 增强版 · 2026-11-01 正式发行**：在本机管理多个 Binance Agentic Wallet 的 Agent ID 铸造监控、持仓和卖出规则。
+**v0.4.6 社区 Web 增强版 · 2026-11-01 正式发行**：在本机管理多个 Binance Agentic Wallet 的 Agent ID 铸造监控、持仓和卖出规则。
 
 基于 [Nancy 的 Agent ID Sniper](https://github.com/nancyc0813-maker/agentid-sniper)。原作者 [@nancy_c813](https://x.com/nancy_c813)，Web 增强版维护 [@supra_bnb](https://x.com/supra_bnb)。这是社区维护项目，不是 Binance 官方产品。
 
@@ -39,7 +39,7 @@ npm run web:start
 
 `setup` 会安装项目内的 Binance 官方 CLI，并在配置不存在时创建只读默认配置：空钱包、`monitorOnly: true`、每钱包每日付费预算为 `0`，`portfolioBudget.maxBnbPerDay: null` 表示未设全部钱包总上限。已有配置会保留。启动 Web 不会自动启动扫描器或启用交易。
 
-首次使用，在「钱包」点击「添加钱包」→「创建并配对」，用对应币安 App 核对配对码，再核验并绑定真实 BSC 地址。已领取的 Agent ID 使用官方返回的真实 handle，未领取时留空。新钱包绑定后仍为 `paused: true`、`mode: monitor`，不会自动启用。需要签名或交易时，在 App 的 Agentic Wallet 设置中开启开发者模式。项目不要求输入私钥或助记词。
+首次使用，在「钱包」点击「添加钱包」→「创建并配对」，用对应币安 App 核对配对码，再核验并绑定真实 BSC 地址。已领取的 Agent ID 使用官方返回的真实 handle，未领取时留空。新钱包默认不勾选暂停（`paused: false`），绑定后仍为 `mode: monitor`，不会自动启用；手动选择的暂停状态保持不变。需要签名或交易时，在 App 的 Agentic Wallet 设置中开启开发者模式。项目不要求输入私钥或助记词。
 
 首发使用 Git 克隆安装；Download ZIP 缺少 `.git`，不承诺一键更新可用。根目录的旧 Windows 安装/启动入口已停用，只显示支持范围和 README 提示；原脚本已作为不可执行的文本归档于 [docs/legacy](docs/legacy/)。这些入口不会安装依赖、启动扫描器或执行交易。
 

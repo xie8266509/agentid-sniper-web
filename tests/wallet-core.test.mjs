@@ -59,17 +59,18 @@ test('new draft wallets cannot transact and bind address once through the contro
   const root = temp(), path = join(root, 'config.json');
   try {
     const config = structuredClone(DEFAULT_CONFIG);
-    config.wallets = [{ id: 'draft-1', name: '新钱包', address: '', draft: true, paused: true, mode: 'monitor' }];
+    config.wallets = [{ id: 'draft-1', name: '新钱包', address: '', draft: true, paused: false, mode: 'monitor' }];
     const validated = validateConfig(config);
     assert.equal(validated.wallets[0].bawDir, 'data/wallets/draft-1');
-    assert.equal(walletCanAutomate({ ...validated, monitorOnly: false }, validated.wallets[0]), false);
+    assert.equal(validated.wallets[0].paused, false);
+    for (const kind of ['mint', 'token-sell', 'nft-sell']) assert.equal(walletCanAutomate({ ...validated, monitorOnly: false }, validated.wallets[0], kind), false);
     writeFileSync(path, JSON.stringify(validated));
     const bound = { ...validated.wallets[0], address: address(1), agentId: 'new.ai', draft: false };
     assert.throws(() => saveConfig({ wallets: [bound] }, { path }), /已绑定/);
     saveConfig({ wallets: [bound] }, { path, allowWalletBinding: true });
-    assert.equal(readConfig({ path }).wallets[0].id, 'draft-1');
+    assert.equal(readConfig({ path }).wallets[0].id, 'draft-1'); assert.equal(readConfig({ path }).wallets[0].paused, false);
     assert.throws(() => saveConfig({ wallets: [{ ...readConfig({ path }).wallets[0], address: address(2) }] }, { path, allowWalletBinding: true }), /已绑定/);
-    assert.throws(() => validateConfig({ ...config, wallets: [{ ...config.wallets[0], paused: false }] }), /必须暂停/);
+    for (const mode of ['auto', 'sell-only']) assert.throws(() => validateConfig({ ...config, wallets: [{ ...config.wallets[0], mode }] }), /必须保持监控模式/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
