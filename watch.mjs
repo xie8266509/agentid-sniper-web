@@ -329,7 +329,7 @@ const save = (strict = false) => {
 const ENTRY_POLICY = ensureEntryPolicy(S);
 const MINT_MEDIA = createMintMedia({ state: S, save });
 const SAFE_WEB = createSafeWeb();
-const MINT_RISK = createMintRisk({ state: S, rpc, call, fullCode, nftMediaCheck: (contract, uri) => MINT_MEDIA.check(contract, uri), save, timeZone: CONFIG.timeZone || 'Asia/Taipei', usdt: USDT, wrappedBnb: WBNB, factory: FACTORY });
+const MINT_RISK = createMintRisk({ state: S, rpc, call, fullCode, nftMediaCheck: (contract, uri) => MINT_MEDIA.check(contract, uri), bnbUsd, save, timeZone: CONFIG.timeZone || 'Asia/Taipei', usdt: USDT, wrappedBnb: WBNB, factory: FACTORY });
 S.mintPolicy = { ...ENTRY_POLICY, version: '2.7.4', schemaVersion: 3, freeMode: 'notify-only', participants: 'transaction-senders', limits: { ...MINT_RISK_LIMITS }, wallets: {} };
 if (S.agentsV !== 2) { S.agentsV = 2; for (const P of Object.values(S.paid || {})) { delete P.agents; delete P.burst; delete P.heatAt; } }
 function entryFor(W, nft = false) {
@@ -1174,7 +1174,7 @@ async function freeProgress(c) { /* 免費項目的進度：已鑄造／總量�
   fpCache.set(c, { t: Date.now(), p }); return p;
 }
 async function progressSweep() { /* 使用者 10/31 23:21 查 Pulsepanther 沒打到：追蹤名單 500 多個，一般檢查每輪只看 16 個、一個要 10~30 秒，低進度的項目要 2~3 小時才回頭看一次，10% 直接漲到 100% 都沒發現。改成每分鐘用輕量方式只讀進度（最多 80 個、6 個同時），進度過 45% 就會進快速名單，每 15 秒檢查 */
-  const now = Date.now(); const list = Object.entries(S.paid || {}).filter(([c, P]) => !P.unmintable && (P.progress || 0) < 0.999 && now - (P.at || 0) < 86400e3 && !WALLETS.every((W) => P.done?.[W.id])).sort((x, y) => (y[1].groupSignalAt && !y[1].sweepAt ? 1 : 0) - (x[1].groupSignalAt && !x[1].sweepAt ? 1 : 0) || (x[1].sweepAt || 0) - (y[1].sweepAt || 0) || (y[1].at || 0) - (x[1].at || 0)).slice(0, 80);
+  const now = Date.now(); const list = Object.entries(S.paid || {}).filter(([c, P]) => !P.unmintable && (P.progress || 0) < 0.999 && now - (P.at || 0) < 172800e3 && !P.serialLog && !WALLETS.every((W) => P.done?.[W.id])).sort((x, y) => (y[1].groupSignalAt && !y[1].sweepAt ? 1 : 0) - (x[1].groupSignalAt && !x[1].sweepAt ? 1 : 0) || (x[1].sweepAt || 0) - (y[1].sweepAt || 0) || (y[1].at || 0) - (x[1].at || 0)).slice(0, 80);
   let i = 0; await Promise.all(Array.from({ length: 6 }, async () => { while (i < list.length) { const [c, P] = list[i++]; try { if (P.progAt && Date.now() - P.progAt < 180e3) { P.sweepAt = Date.now(); continue; } /* 除錯：正式檢查 3 分鐘內剛讀過的不覆蓋（避免讀法不同把已賣完的又拉回快速名單、佔名額） */ let fp = null; if (P.soldSel) { /* 除錯 11/1：bibiai AGENT ID 用「已售／總量」才讀得到（已售 a2309ff8、總量 a0e23ebd），一般免費讀法讀不到 → 卡在 0% 兩小時沒回頭看，漲到 92% 都不知道 */ const sr = await call(c, P.soldSel); const sold = sr && sr.length >= 66 ? Number(BigInt(sr.slice(0, 66))) : null; if (sold > 0) { if (P.capSel === undefined) P.capSel = (await findCapSel(c, await fullCode(c, await codeOf(c)).catch(() => ''), sold).catch(() => '')) || ''; if (P.capSel) { const cr = await call(c, '0x' + P.capSel); const cap = cr && cr.length >= 66 ? Number(BigInt(cr.slice(0, 66))) : 0; if (cap >= sold && cap > 0) fp = sold / cap; } } }
       if (fp == null) fp = await freeProgress(c); P.sweepAt = Date.now(); if (fp != null && fp > 0) { if (fp >= 0.45 && (P.progress || 0) < 0.45 && !P.swLog) { P.swLog = 1; log(`進度掃描：${P.name || c} 進度 ${Math.round(fp * 100)}%，移到快速檢查`); } P.progress = Math.min(fp, 0.99); /* 審查 11/1：免費合約正式檢查不會讀進度，賣完的會永遠卡 99% 佔快速名單 → 直接記 100% */ /* 100% 交給快速檢查用正式讀法確認，避免讀錯就永遠不看 */ } } catch {} } }));
 }
@@ -1326,9 +1326,21 @@ const PAID = getPaidConfig(CONFIG); // 配置中的零预算明确关闭付费�
 const codeCache = new Map();
 async function codeOf(a) { if (!codeCache.has(a)) codeCache.set(a, ((await rpc('eth_getCode', [a, 'latest']).catch(() => '')) || '').toLowerCase()); return codeCache.get(a); }
 async function bnbUsd() {
-  const p = await call(FACTORY, '0xe6a43905' + wa(WBNB) + wa(USDT)); const pair = '0x' + (p || '').slice(26); const r = await call(pair, '0x0902f1ac'); const t0 = await call(pair, '0x0dfe1681');
-  if (!r || !t0 || r.length < 130) return 0; const a = BigInt(r.slice(0, 66)), b = BigInt('0x' + r.slice(66, 130)); const price = t0.slice(26) === WBNB.slice(2) ? Number(b) / Number(a) : Number(a) / Number(b);
-  if (Number.isFinite(price) && price > 0) { S.lastBnbUsd = price; S.lastBnbUsdAt = Date.now(); return price; } return 0;
+  // Funding evidence needs a fresh official-pair quote. Malformed ABI replies
+  // cannot become a reciprocal price or refresh an older cached observation.
+  try {
+    const result = await call(FACTORY, '0xe6a43905' + wa(WBNB) + wa(USDT));
+    if (typeof result !== 'string' || !/^0x0{24}[0-9a-f]{40}$/i.test(result)) return 0;
+    const pair = '0x' + result.slice(26).toLowerCase(); if (/^0x0{40}$/.test(pair)) return 0;
+    const reserves = await call(pair, '0x0902f1ac'), token0 = await call(pair, '0x0dfe1681');
+    if (typeof reserves !== 'string' || !/^0x[0-9a-f]{192}$/i.test(reserves) || typeof token0 !== 'string' || !/^0x0{24}[0-9a-f]{40}$/i.test(token0)) return 0;
+    const first = '0x' + token0.slice(26).toLowerCase(); if (first !== WBNB && first !== USDT) return 0;
+    const a = BigInt(reserves.slice(0, 66)), b = BigInt('0x' + reserves.slice(66, 130)), timestamp = BigInt('0x' + reserves.slice(130));
+    if (a <= 0n || b <= 0n || a >= 1n << 112n || b >= 1n << 112n || timestamp >= 1n << 32n) return 0;
+    const price = first === WBNB ? Number(b) / Number(a) : Number(a) / Number(b);
+    if (Number.isFinite(price) && price > 0) { S.lastBnbUsd = price; S.lastBnbUsdAt = Date.now(); return price; }
+  } catch {}
+  return 0;
 }
 const tokStr = (r) => { try { const h = r.slice(2); const len = Number(BigInt('0x' + h.slice(64, 128))); return noLink(Buffer.from(h.slice(128, 128 + len * 2), 'hex').toString('utf8')); } catch { return ''; } };
 async function readLimit(W, c) {
@@ -1398,6 +1410,14 @@ function mintQuantity(data, sim, W) {
   return null;
 }
 function simulationNftGain(sim, W) { return (sim?.balanceChanges || []).some(change => String(change.owner).toLowerCase() === W.addr && /Erc721|Erc1155/i.test(change.tokenType || '') && /^\d+$/.test(String(change.change)) && BigInt(String(change.change)) > 0n); }
+function applyManualMintCompletion(W, pending, txHash) {
+  const project = pending.manualMintProject;
+  if (!project) return;
+  if (pending.kind !== 'contract' || pending.walletId !== W.id || pending.walletAddress !== W.addr || !validMintAddress(project) || pending.expected?.to?.toLowerCase() !== project || !validMintCalldata(pending.expected?.inputData, true) || badSel(pending.expected.inputData) || !/^0x[0-9a-f]{64}$/i.test(txHash || '')) throw new Error('手动铸造完成凭证无法绑定原钱包与项目');
+  S.paid ||= {}; const P = S.paid[project] ||= { at: Date.now(), name: '', done: {} }; P.done ||= {}; P.done[W.id] = 'minted';
+  if (FORCE.has(project) && WALLETS.every(wallet => P.done[wallet.id] === 'minted')) { S.forceDone ||= {}; S.forceDone[project] = 1; }
+  save(true);
+}
 async function previewExec(W, to, data, valueWei, check, recheck = null, kind = 'mint', opts = {}) {
   if (MONITOR_ONLY || !canWallet(W, kind)) throw new Error(MONITOR_NOTE);
   return withWalletExecution(W.profile, async () => {
@@ -1430,6 +1450,7 @@ async function previewExecInner(W, to, data, valueWei, check, recheck, opts = {}
   const paymentUsd = Number(valueWei) / 1e18 * paymentPrice + (opts.paymentToken === USDT ? Number(opts.paymentWei || 0n) / 1e18 : 0);
   const riskQuote = W.operationKind === 'token-sell' ? null : await MINT_RISK.quoteTransaction(W, { to, data, valueWei, keepBnb: PAID.keepBnb, paid: true, manual: opts.manual === true, project: !isApproval, paymentToken: opts.paymentToken, paymentWei: opts.paymentWei ?? valueWei, paymentUsd, quantity: mintQuantity(data, sim, W), nftEvidence: !isApproval && simulationNftGain(sim, W) });
   if (riskQuote && valueWei > 0n) riskQuote.paymentUsdMicros = usdBudgetMicros(paymentUsd);
+  if (riskQuote && !isApproval && opts.manual === true && opts.manualMintProject === to.toLowerCase() && W.operationKind !== 'token-sell') riskQuote.manualMintProject = to.toLowerCase();
   if (riskQuote && !isApproval) riskQuote.mintTracking = mintTrackingPlan(W, sim, paymentUsd, riskQuote.mintToken || opts.fallbackToken);
   INFLIGHT++; let x; try { x = await runPaidCommand(W, ['contract-call', 'execute', '--requestId', rid], valueWei, { from: W.addr, to, value: valueWei.toString(), inputData: data }, riskQuote); } finally { INFLIGHT--; }
   if (mintExecutionUnknown(x)) throw new Error('結果不明：送出逾時或响应中断，可能已上鏈，先不重打');
@@ -1498,7 +1519,7 @@ async function confirmWalletResult(W, scope = null) {
   if (!pending) throw new Error('結果不明：缺少已保存的交易意图');
   for (let attempt = 0; attempt < 12; attempt++) {
     const result = await reconcileScannerPending({ wallet: W.profile, pending, runWallet: async (args) => (await W.baw(args, 30000)).j, rpc, budget: scope ? { settle: async () => {} } : scannerBudget(), root: DIR });
-    if (result.resolved) { await settleConfirmedMintRisk(pending, result); if (result.status === 'confirmed') { applyMintTracking(W, pending, result.txHash); pending.txHash = result.txHash; } return result.status === 'confirmed'; }
+    if (result.resolved) { await settleConfirmedMintRisk(pending, result); if (result.status === 'confirmed') { applyMintTracking(W, pending, result.txHash); applyManualMintCompletion(W, pending, result.txHash); pending.txHash = result.txHash; } return result.status === 'confirmed'; }
     if (result.status === 'review') break;
     await sleep(2000);
   }
@@ -1523,7 +1544,7 @@ function recoverScannerWallet(W) {
     const result = await reconcileScannerPending({ wallet: W.profile, pending, runWallet: async args => (await W.baw(args, 30000)).j, rpc, budget: scannerBudget(), root: DIR });
     if (result.resolved && S.walletPending[W.id] === pending) {
       await settleConfirmedMintRisk(pending, result);
-      if (result.status === 'confirmed') applyMintTracking(W, pending, result.txHash);
+      if (result.status === 'confirmed') { applyMintTracking(W, pending, result.txHash); applyManualMintCompletion(W, pending, result.txHash); }
       if (pending.reservationDay === S.paidSpend?.day) S.paidSpend[W.id] = Math.max(0, (S.paidSpend[W.id] || 0) - Number(pending.reservedAmountWei || 0) / 1e18 + Number(result.spentWei || 0) / 1e18);
       delete S.walletPending[W.id];
       S.walletRuntime ||= {}; S.walletRuntime[W.id] ||= {};
@@ -1554,7 +1575,7 @@ async function runPaidCommand(W, args, amountWei = 0n, expected = null, riskQuot
   let mintRiskReservation;
   try { mintRiskReservation = riskQuote ? MINT_RISK.reserve(riskQuote) : null; }
   catch (error) { if (reservation) await scannerBudget().settle(reservation.id, { spentWei: 0n, spentUsdMicros: '0' }); throw error; }
-  const pending = { version: 1, walletId: W.id, walletAddress: W.addr, walletIndex: W.index, kind, createdAt: Date.now(), amountWei: amountWei.toString(), expected: kind !== 'market-order' ? expected : { fromToken: field('--fromToken'), toToken: field('--toToken'), fromTokenQty: field('--fromTokenQty') }, ...(allocation ? { reservationId: allocation.id, reservationDay: allocation.day, reservedAmountWei: allocation.amountWei, ...(allocation.amountUsdMicros !== undefined ? { reservedAmountUsdMicros: allocation.amountUsdMicros } : {}) } : { reservedAmountWei: '0' }), ...(mintRiskReservation ? { mintRiskReservation } : {}), ...(riskQuote?.mintTracking ? { mintTracking: { ...riskQuote.mintTracking, costUsdMicros: successUsd.toString() } } : {}), settlement: { successSpentWei: successSpent.toString(), failureSpentWei: failureSpent.toString(), ...(allocation?.amountUsdMicros !== undefined ? { successSpentUsdMicros: successUsd.toString(), failureSpentUsdMicros: failureUsd.toString() } : {}) } };
+  const pending = { version: 1, walletId: W.id, walletAddress: W.addr, walletIndex: W.index, kind, createdAt: Date.now(), amountWei: amountWei.toString(), expected: kind !== 'market-order' ? expected : { fromToken: field('--fromToken'), toToken: field('--toToken'), fromTokenQty: field('--fromTokenQty') }, ...(allocation ? { reservationId: allocation.id, reservationDay: allocation.day, reservedAmountWei: allocation.amountWei, ...(allocation.amountUsdMicros !== undefined ? { reservedAmountUsdMicros: allocation.amountUsdMicros } : {}) } : { reservedAmountWei: '0' }), ...(mintRiskReservation ? { mintRiskReservation } : {}), ...(riskQuote?.manualMintProject ? { manualMintProject: riskQuote.manualMintProject } : {}), ...(riskQuote?.mintTracking ? { mintTracking: { ...riskQuote.mintTracking, costUsdMicros: successUsd.toString() } } : {}), settlement: { successSpentWei: successSpent.toString(), failureSpentWei: failureSpent.toString(), ...(allocation?.amountUsdMicros !== undefined ? { successSpentUsdMicros: successUsd.toString(), failureSpentUsdMicros: failureUsd.toString() } : {}) } };
   S.walletPending ||= {}; S.walletPending[W.id] = pending; save(true);
   let result;
   try {
@@ -1637,7 +1658,7 @@ async function executeUsdtMint(W, options) {
   if (MONITOR_ONLY || !canWallet(W, 'mint')) throw new Error(MONITOR_NOTE);
   return withWalletExecution(W.profile, () => executeUsdtMintInner(W, options), { root: DIR, kind: 'scanner-usdt-mint' });
 }
-async function executeUsdtMintInner(W, { to, data, need, value = 0n, recheck = null, manual = false }) {
+async function executeUsdtMintInner(W, { to, data, need, value = 0n, recheck = null, manual = false, manualMintProject = null }) {
   const PAID = paidFor(W);
   if (!validMintAddress(to) || !validMintCalldata(data) || badSel(data)) throw new Error('铸造地址或调用数据无效');
   need = mintUint(need); value = mintUint(value);
@@ -1673,7 +1694,7 @@ async function executeUsdtMintInner(W, { to, data, need, value = 0n, recheck = n
       if (usdtBalance < need) throw new Error('USDT 未到账');
     }
     await previewExec(W, USDT, '0x095ea7b3' + wa(to) + w(need), 0n, (sim) => approvalSimulationCheck(sim, W, to), null, 'mint', { manual });
-    const result = await revokeOnFail(W, USDT, to, () => previewExec(W, to, data, value, (sim) => mintSimulationCheck(sim, W, { bnbWei: value, usdtWei: need }), recheck, 'mint', { manual, paymentToken: USDT, paymentWei: need }));
+    const result = await revokeOnFail(W, USDT, to, () => previewExec(W, to, data, value, (sim) => mintSimulationCheck(sim, W, { bnbWei: value, usdtWei: need }), recheck, 'mint', { manual, manualMintProject, paymentToken: USDT, paymentWei: need }));
     scope.spentWei = bnbBudgetWei(chargeBnb); scope.spentUsdMicros = BigInt(usdBudgetMicros(chargeUsd));
     await scannerBudget().settle(reservation.id, { spentWei: scope.spentWei, spentUsdMicros: scope.spentUsdMicros.toString() });
     if (S.walletPending[W.id]?.reservationId === reservation.id && S.walletPending[W.id].phase === 'verified') delete S.walletPending[W.id];
@@ -1804,7 +1825,7 @@ async function observeFreeMint(c, P) {
 async function heatWatch() { // 背景：替追蹤中的付費項目算熱度，看不懂的合約順便學別人的打法（不拖慢 15 秒的快速檢查）
   const signal = P => P.groupSignalAt && Date.now() - P.groupSignalAt < 86400e3;
   const signalFirst = P => signal(P) && !P.heatAt ? 1 : 0;
-  const ents = Object.entries(S.paid || {}).filter(([c, P]) => !INFRA.has(c) && !P.unmintable && (P.progress || 0) < 0.999 && !WALLETS.every((W) => P.done?.[W.id]) && Date.now() - (P.at || 0) < 86400e3)
+  const ents = Object.entries(S.paid || {}).filter(([c, P]) => !INFRA.has(c) && !P.unmintable && !P.serialLog && (P.progress || 0) < 0.999 && !WALLETS.every((W) => P.done?.[W.id]) && Date.now() - (P.at || 0) < 172800e3)
     .sort((a, b) => signalFirst(b[1]) - signalFirst(a[1]) || ((b[1].needLearn && (b[1].progress || 0) >= 0.45) - (a[1].needLearn && (a[1].progress || 0) >= 0.45)) || hk(a[1]) - hk(b[1]) || (b[1].at || 0) - (a[1].at || 0)).slice(0, 8); // 快滿或很熱的約每分鐘更新，其他約 10 分鐘；快到門檻又還不會打的排最前面（除錯 11/1：BNBCAT 57% 一直排不到）
   for (const [c, P] of ents) {
     try {
@@ -1892,9 +1913,9 @@ async function paidLoop(mode = 'all', shard = null) {
   if (S.mixedPhaseV !== 1) { S.mixedPhaseV = 1; for (const [c, at] of Object.entries(S.freeNote || {}).slice(-100)) if (validMintAddress(c) && !S.paid[c] && typeof at === 'number' && Date.now() - at < PAID.maxAgeH * 3600000) S.paid[c] = { at, name: '', done: {}, needLearn: 1 }; for (const P of Object.values(S.paid)) for (const [id, status] of Object.entries(P.done || {})) if (status === 'free-notify') delete P.done[id]; }
   const all = Object.entries(S.paid);
 
-  const hotP = all.filter(([c, P]) => FORCE.has(c) || ((Date.now() - (P.groupSignalAt || 0) < 86400e3 || (P.progress || 0) >= 0.45 || (fpCache.get(c)?.p || 0) >= 0.45 || (!(P.progress > 0) && Math.max(P.agents || 0, HOT.get(c)?.from.size || 0) >= 70)) && (P.progress || 0) < 0.999 && !P.unmintable)).filter(([c, P]) => !WALLETS.every((W) => P.done[W.id])).sort((a, b) => (b[1].progress || 0) - (a[1].progress || 0) || (b[1].agents || 0) - (a[1].agents || 0)).slice(0, 12); /* 已通过链上身份候选检查的群组热议项目也加入15秒快查，自动交易门槛不变。 */
+  const hotP = all.filter(([c, P]) => FORCE.has(c) || ((Date.now() - (P.groupSignalAt || 0) < 86400e3 || (P.progress || 0) >= 0.45 || (fpCache.get(c)?.p || 0) >= 0.45 || (!(P.progress > 0) && Math.max(P.agents || 0, HOT.get(c)?.from.size || 0) >= 70)) && (P.progress || 0) < 0.999 && !P.unmintable)).filter(([c, P]) => (!P.serialLog || FORCE.has(c)) && !WALLETS.every((W) => P.done[W.id])).sort((a, b) => Number(FORCE.has(b[0])) - Number(FORCE.has(a[0])) || (b[1].progress || 0) - (a[1].progress || 0) || (b[1].agents || 0) - (a[1].agents || 0)).slice(0, 12); /* 已通过链上身份候选检查的群组热议项目也加入15秒快查，自动交易门槛不变。 */
   // 快速檢查（mode='hot'）每 15 秒只看快滿／很熱的；一般檢查（mode='rest'）另外在背景約每分鐘輪流看其他的，互不拖慢
-  const rest = mode === 'hot' ? [] : all.filter((e) => !hotP.includes(e) && Date.now() - (e[1].at || 0) < 86400e3).sort((a, b) => (a[1].lastTry || 0) - (b[1].lastTry || 0) || (b[1].at || 0) - (a[1].at || 0)).slice(0, 16);
+  const rest = mode === 'hot' ? [] : all.filter((e) => !hotP.includes(e) && (!e[1].serialLog || FORCE.has(e[0])) && Date.now() - (e[1].at || 0) < 172800e3).sort((a, b) => (a[1].lastTry || 0) - (b[1].lastTry || 0) || (b[1].at || 0) - (a[1].at || 0)).slice(0, 16);
   const ents = mode === 'rest' ? rest : mode === 'hot' ? (shard == null ? hotP : hotP.filter((e, i) => i % 3 === shard)) : hotP.concat(rest); /* 快速檢查分 3 組同時跑（審查修正：一個一個查要 1 分多鐘） */
   for (const [c, P] of ents) {
     if (INFRA.has(c)) { delete S.paid[c]; continue; } // Agent ID 登記合約本身不是項目（註冊 .ai 身份），不打
@@ -1902,6 +1923,7 @@ async function paidLoop(mode = 'all', shard = null) {
     try {
     P.lastTry = Date.now(); if (WALLETS.every((W) => P.done[W.id])) { if (FORCE.has(c)) { S.forceDone = S.forceDone || {}; S.forceDone[c] = 1; } delete S.paid[c]; continue; }
     if (Date.now() - P.at > PAID.maxAgeH * 3600e3) { delete S.paid[c]; continue; }
+    if (P.serialLog && !FORCE.has(c)) continue;
     const code = await codeOf(c);
     // 發現時還沒開的「免費」鑄造：之後每分鐘重試，一開就自動打
     const fcd = (P.progress || 0) >= ENTRY_POLICY.goPct - 0.02 || Math.max(P.agents || 0, HOT.get(c)?.from.size || 0) >= 70 ? 20e3 : 120e3; /* 除錯 11/1：快到 60% 的免費項目改成 20 秒重試一次（之前固定 2 分鐘，0xa69adf 在這 2 分鐘內從 63% 賣完） */
@@ -2221,7 +2243,7 @@ async function manualMints() {
       if (J.usdt !== undefined) {
         try {
           const need = BigInt(Math.ceil(J.usdt * 1e6)) * 10n ** 12n;
-          const result = await executeUsdtMint(W, { to: J.c, data: J.data, need, manual: true });
+          const result = await executeUsdtMint(W, { to: J.c, data: J.data, need, manual: true, manualMintProject: J.c });
           trackFromSim(W, result.sim, J.name || 'TOKEN', result.usd, result.tx, J.tok);
           return `[${W.name}] ✅ 打到（支出预算约 ${result.usd.toFixed(2)}U）交易 ${result.tx}`;
         } catch (e) { return `[${W.name}] ❌ 没打到（${e.message.slice(0, 100)}）`; }
@@ -2234,7 +2256,7 @@ async function manualMints() {
         for (let i = 0; i < J.n; i++) {
           const data = J.randArg ? J.sel + w(BigInt(Math.floor(Math.random() * 65536))) : J.data;
           try {
-            const minted = await previewExec(W, J.c, data, value, (sim) => mintSimulationCheck(sim, W, { bnbWei: value }), null, 'mint', { manual: true, fallbackToken: J.tok });
+            const minted = await previewExec(W, J.c, data, value, (sim) => mintSimulationCheck(sim, W, { bnbWei: value }), null, 'mint', { manual: true, manualMintProject: J.c, fallbackToken: J.tok });
             trackFromSim(W, minted.sim, J.name || '', Number(value) / 1e18 * price, minted.tx, J.tok);
             ok++; S.paidSpend[W.id] = spent + Number(value) / 1e18 * ok; save();
           } catch (e) { err = e.message.slice(0, 80); break; }
@@ -2249,7 +2271,7 @@ async function manualMints() {
 }
 // ── TG 指令：使用者直接在機器人打「賣 XXX」「賣 XXX 一半」「餘額」，幾秒內執行，不經過 Claude ──
 // ── 更新提醒（開源版才開；使用者 11/1 00:47：不自動更新，只提醒；用戶回 /update 才更新，更新前安檢＋sha256＋備份，新版起不來自動換回）──
-const UPD = { on: false, ver: '2.7.6', repo: 'nancyc0813-maker/agentid-sniper', group: 't.me/nancy_c0813' }; /* Web 增强版仅由 Web 后台检查自己的正式发行；扫描器不查询或安装 Nancy 上游版本。 */
+const UPD = { on: false, ver: '2.7.9', repo: 'nancyc0813-maker/agentid-sniper', group: 't.me/nancy_c0813' }; /* Web 增强版仅由 Web 后台检查自己的正式发行；扫描器不查询或安装 Nancy 上游版本。 */
 const verGt = (a, b) => { const x = String(a).split('.').map(Number), y = String(b).split('.').map(Number); for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0); return false; };
 async function updCheck(quiet = false) {
   if (!UPD.on) return null;

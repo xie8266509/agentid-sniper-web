@@ -99,12 +99,13 @@ function riskHarness(options = {}) {
       if (data === walletLimitSelector || data === transactionLimitSelector) return '0x' + word(options.limitValue ?? 10);
       if (data.startsWith('0xc87b56dd')) return encodedString(options.uri ?? 'https://example.org/metadata/1.json');
       if (data === '0xfc0c546a') return '0x';
+      if (to.toLowerCase() === '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c' && data.startsWith('0x70a08231')) return '0x' + word(0);
       if (to.toLowerCase() === usdt && data.startsWith('0x70a08231')) return '0x' + word(100n * 10n ** 18n);
       if (data.startsWith('0xe6a43905')) return '0x' + word(0);
     }
     throw new Error('Unexpected mocked RPC ' + method);
   };
-  const api = createMintRisk({ state, rpc, fullCode: options.fullCode, nftMediaCheck: options.nftMediaCheck, now: options.now || (() => when), save: strict => writes.push({ strict, state: structuredClone(state) }), usdt });
+  const api = createMintRisk({ state, rpc, bnbUsd: options.bnbUsd, fullCode: options.fullCode, nftMediaCheck: options.nftMediaCheck, now: options.now || (() => when), save: strict => writes.push({ strict, state: structuredClone(state) }), usdt });
   return { api, state, requests, writes };
 }
 
@@ -246,6 +247,7 @@ for (const [name, slot] of [
 
 test('USDT acquisition checks contract token funds even though its native value is zero', async () => {
   const h = riskHarness({ rpc(method, params) {
+    if (method === 'eth_getBalance') return '0x0';
     if (method === 'eth_call' && params[0].to.toLowerCase() === usdt && params[0].data.startsWith('0x70a08231')) return '0x' + word(0);
   } });
   await assert.rejects(h.api.projectCheck(contract, { paymentToken: usdt, paymentWei: 10n ** 18n }), /资金留存|流动性不足/);
@@ -256,6 +258,7 @@ test('a pair address alone is insufficient when reserves are empty or cannot be 
   for (const reserves of ['0x' + word(0) + word(0) + word(0), '0x']) {
     const h = riskHarness({ rpc(method, params) {
       if (method === 'eth_getBalance') return '0x0';
+      if (method === 'eth_call' && params[0].to.toLowerCase() === usdt && params[0].data.startsWith('0x70a08231')) return '0x' + word(0);
       if (method === 'eth_call' && params[0].data.startsWith('0xe6a43905')) return '0x' + addressWord(pair);
       if (method === 'eth_call' && params[0].data === '0x0902f1ac') return reserves;
     } });

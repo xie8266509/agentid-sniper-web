@@ -107,7 +107,7 @@ function harness(options = {}) {
   Object.assign(sandbox, scannerRuntimeDouble({ sandbox, wallet: W, state: S, events }));
   sandbox.MINT_RISK = createMintRisk({ state: S, rpc: (...args) => sandbox.rpc(...args), fullCode: (...args) => sandbox.fullCode(...args), nftMediaCheck: async () => ({ verified: true }), save: (...args) => sandbox.save(...args), now: () => clock, timeZone: 'Asia/Shanghai', usdt: USDT });
   const context = vm.createContext(sandbox);
-  vm.runInContext((options.trackBasis ? extract('function trackFromSim(', 'function positionFor(') : extract('function mintTrackingPlan(', 'function positionFor(')) + helpers + addressSafety + policyHelpers + learner + paid + manual + autoMint + (options.realPreview ? extract('async function previewExec(', 'async function poolOut(') : '') + (options.withQueue ? extract('const MQK =', '// 每個錢包可以打多份的') : '') + '\nglobalThis.api = { executeUsdtMint, prepareUsdtReplay, mintSimulationCheck, approvalSimulationCheck, validateFileJob, manualMints, paidLoop, learnReplay, safeAddrs, revokeOnFail, hasPositiveMintGain, autoMint, previewExec, settleConfirmedMintRisk, recoverScannerWallet, othersPay, verifyAgentProject, queuePaidPhase, queueMint: typeof queueMint === \'function\' ? queueMint : null };', context);
+  vm.runInContext((options.trackBasis ? extract('function trackFromSim(', 'function positionFor(') : extract('function mintTrackingPlan(', 'function positionFor(')) + helpers + addressSafety + policyHelpers + learner + paid + manual + autoMint + (options.realPreview ? extract('async function previewExec(', 'async function poolOut(') : '') + (options.withQueue ? extract('const MQK =', '// 每個錢包可以打多份的') : '') + '\nglobalThis.api = { executeUsdtMint, prepareUsdtReplay, mintSimulationCheck, approvalSimulationCheck, validateFileJob, manualMints, paidLoop, learnReplay, safeAddrs, revokeOnFail, hasPositiveMintGain, autoMint, previewExec, settleConfirmedMintRisk, recoverScannerWallet, applyManualMintCompletion, othersPay, verifyAgentProject, queuePaidPhase, queueMint: typeof queueMint === \'function\' ? queueMint : null };', context);
   return { api: sandbox.api, context, sandbox, events, P, S, W };
 }
 
@@ -357,6 +357,7 @@ test('an explicitly enabled manual free mint remains possible after automatic fr
   await h.api.manualMints();
   assert.equal(calls.filter(args => args[1] === 'execute').length, 1);
   assert.equal(h.S.paidSpend.test, 0);
+  assert.equal(h.P.done.test, 'minted'); assert.equal(h.S.forceDone[target], 1);
 });
 
 test('USDT project risk failures occur before recharge, approval, or any mint preview', async () => {
@@ -718,4 +719,72 @@ test('a replay price increase cannot escape the saved project spend cap', async 
   h.P.replay = { data: '0x12345678' + word(original), value: original.toString(), sampleData: '0x12345678' + word(original), sampleValue: original.toString(), learned: 1, learnedAt: h.sandbox.Date.now() };
   const calls = attachMintWallet(h); await h.api.paidLoop();
   assert.equal(calls.length, 0); assert.equal(h.events.reservationCalls?.length || 0, 0); assert.equal(h.P.done.test, undefined);
+});
+
+
+for (const value of ['0', '100000000000000']) test(`a confirmed manual mint persists completion by wallet ID after unknown-result recovery (${value} wei)`, async () => {
+  const h = harness({ realPreview: true, fileEnabled: true, jobs: [{ schemaVersion: 1, c: target, data: '0x12345678', value, n: 1 }] }), hash = '0x' + 'ab'.repeat(32);
+  const calls = attachMintWallet(h, { executeResult: { j: { success: false, data: { txHash: hash }, error: { name: 'TIMEOUT', message: 'mock response interrupted' } } } });
+  await h.api.manualMints();
+  const pending = structuredClone(h.S.walletPending.test);
+  assert.equal(pending.manualMintProject, target); assert.equal(h.P.done.test, undefined); assert.equal(h.S.forceDone?.[target], undefined);
+  h.W.name = 'renamed-wallet'; h.W.profile.name = 'renamed-wallet';
+  assert.equal((await h.api.recoverScannerWallet(h.W)).status, 'confirmed');
+  assert.equal(h.P.done.test, 'minted'); assert.equal(h.P.done['renamed-wallet'], undefined); assert.equal(h.S.forceDone[target], 1); assert.equal(h.S.walletPending.test, undefined);
+  h.S.walletPending.test = pending; await h.api.recoverScannerWallet(h.W);
+  assert.equal(h.P.done.test, 'minted'); assert.equal(calls.filter(args => args[1] === 'execute').length, 1);
+});
+
+test('manual completion requires a bound mint intent and never counts another wallet unknown state as success', () => {
+  const h = harness(), hash = '0x' + 'ab'.repeat(32);
+  const pending = { manualMintProject: target, kind: 'contract', walletId: h.W.id, walletAddress, expected: { to: target, inputData: '0x12345678' } };
+  h.sandbox.WALLETS.push({ id: 'second-wallet', addr: reward }); h.P.done['second-wallet'] = 'unknown';
+  h.api.applyManualMintCompletion(h.W, pending, hash);
+  assert.equal(h.P.done.test, 'minted'); assert.equal(h.S.forceDone?.[target], undefined);
+  for (const invalid of [{ kind: 'approval' }, { walletId: 'other-wallet' }, { walletAddress: reward }, { expected: { to: reward, inputData: '0x12345678' } }, { expected: { to: target, inputData: '0x095ea7b3' + word(1) } }]) {
+    h.P.done.test = undefined;
+    assert.throws(() => h.api.applyManualMintCompletion(h.W, { ...pending, ...invalid }, hash), /无法绑定/); assert.equal(h.P.done.test, undefined);
+  }
+  h.P.done['second-wallet'] = 'minted'; h.api.applyManualMintCompletion(h.W, pending, hash); assert.equal(h.S.forceDone[target], 1);
+});
+
+for (const status of ['unknown', 'reverted']) test(`manual pending ${status} outcome never marks the project completed`, async () => {
+  const h = harness({ realPreview: true, fileEnabled: true, jobs: [{ schemaVersion: 1, c: target, data: '0x12345678', value: '0', n: 1 }] });
+  attachMintWallet(h, { executeResult: { j: { success: false, data: { txHash: '0x' + 'ab'.repeat(32) }, error: { name: 'TIMEOUT', message: 'mock response interrupted' } } } });
+  await h.api.manualMints();
+  h.context.reconcileScannerPending = async () => ({ resolved: status === 'reverted', status, txHash: h.S.walletPending.test.txHash, spentWei: '0' });
+  await h.api.recoverScannerWallet(h.W); assert.equal(h.P.done.test, undefined); assert.equal(h.S.forceDone?.[target], undefined);
+  assert.equal(Boolean(h.S.walletPending.test), status === 'unknown');
+});
+
+
+test('forceMint priority never bypasses serial-deployer or configured progress gates', async () => {
+  for (const options of [{ serialReason: 'mock serial deployer' }, { freeProgress: 0.1, contractCall: async (_c, data) => data === '0x192fc516' ? '0x' + word(10) : undefined }]) {
+    const h = harness(options); h.P.serialLog = options.serialReason ? 1 : undefined;
+    await h.api.paidLoop('hot');
+    assert.equal(h.events.previews.length, 0); assert.equal(h.events.swaps.length, 0); assert.equal(h.P.done.test, undefined);
+  }
+});
+
+test('manual USDT approval cannot complete the project, but the bound final mint recovers exactly once', async () => {
+  const h = harness({ realPreview: true, fileEnabled: true, jobs: [{ schemaVersion: 1, c: target, data: '0x12345678', value: '0', usdt: 1 }] }), submissions = [];
+  h.W.baw = async args => {
+    if (args[1] === 'preview') {
+      const to = args[args.indexOf('--to') + 1], approval = to === USDT;
+      if (!approval) assert.equal(h.P.done.test, undefined, 'verified allowance must not mark project minted');
+      return { j: { success: true, data: { requestId: approval ? 'approve' : 'mint', simulationResult: {
+        balanceChanges: approval ? [] : [{ owner: walletAddress, contractAddress: reward, change: '1', tokenType: 'Erc20' }],
+        allowanceChanges: approval ? [{ owner: walletAddress, contractAddress: USDT, spender: target }] : [], authorityChanges: [],
+      } } } };
+    }
+    const requestId = args[args.indexOf('--requestId') + 1]; submissions.push(requestId);
+    assert.equal(h.P.done.test, undefined);
+    if (requestId === 'approve') { assert.equal(h.S.walletPending.test.manualMintProject, undefined); return { j: { success: true, data: { txHash: '0x' + 'aa'.repeat(32) } } }; }
+    assert.equal(h.S.walletPending.test.manualMintProject, target);
+    return { j: { success: false, data: { txHash: '0x' + 'ab'.repeat(32) }, error: { name: 'TIMEOUT', message: 'mock interrupted mint' } } };
+  };
+  await h.api.manualMints();
+  assert.deepEqual(submissions, ['approve', 'mint']); assert.equal(h.P.done.test, undefined); assert.equal(h.S.walletPending.test.manualMintProject, target);
+  assert.equal((await h.api.recoverScannerWallet(h.W)).status, 'confirmed'); assert.equal(h.P.done.test, 'minted'); assert.equal(h.S.walletPending.test, undefined);
+  await h.api.recoverScannerWallet(h.W); assert.deepEqual(submissions, ['approve', 'mint']);
 });
