@@ -1,6 +1,6 @@
 # Agent ID Sniper Web
 
-**v0.4.4 社区 Web 增强版 · 2026-11-01 正式发行**：在本机管理多个 Binance Agentic Wallet 的 Agent ID 铸造监控、持仓和卖出规则。
+**v0.4.5 社区 Web 增强版 · 2026-11-01 正式发行**：在本机管理多个 Binance Agentic Wallet 的 Agent ID 铸造监控、持仓和卖出规则。
 
 基于 [Nancy 的 Agent ID Sniper](https://github.com/nancyc0813-maker/agentid-sniper)。原作者 [@nancy_c813](https://x.com/nancy_c813)，Web 增强版维护 [@supra_bnb](https://x.com/supra_bnb)。这是社区维护项目，不是 Binance 官方产品。
 

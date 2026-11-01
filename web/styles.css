@@ -162,15 +162,16 @@ td strong { color: #45663b; font-size: 11px; font-weight: 550; }
 .overview-wallet-table { min-width: 620px; }
 .overview-wallet-table td:first-child { min-width: 150px; }
 .panel-actions { display: flex; align-items: center; gap: 13px; flex-wrap: wrap; justify-content: flex-end; }
-.wallet-balance-summary { min-width: 110px; max-width: 185px; }
-.wallet-balance-line { display: flex; align-items: baseline; gap: 6px; line-height: 1.8; }
-.wallet-balance-line strong { color: #344b3f; font-size: 12px; font-weight: 550; overflow-wrap: anywhere; }
-.wallet-balance-line > span { font-size: 10px; color: #7c8980; }
+.wallet-balance-summary { min-width: 155px; }
+.wallet-balance-line { display: flex; align-items: baseline; gap: 6px; line-height: 1.8; white-space: nowrap; }
+.wallet-balance-line strong { color: #344b3f; font-size: 12px; font-weight: 550; }
+.wallet-balance-line > span { font-size: 10px; color: #7c8980; flex-shrink: 0; }
 .balance-detail-link { border: 0; background: none; color: #818c82; font: inherit; font-size: 9px; padding: 4px 0 0; text-align: left; cursor: pointer; display: inline-flex; gap: 4px; align-items: center; }
 .balance-detail-link svg { width: 10px; height: 10px; }
 .balance-detail-link:hover { color: var(--green); }
 .balance-asset-detail { padding: 16px 0; border-bottom: 1px solid var(--line); }
 .balance-asset-detail .section-heading-inline { margin-bottom: 4px; gap: 12px; }
+.balance-exact-amount { overflow-wrap: anywhere; text-align: right; min-width: 0; }
 .discovery-table .address { font-size: 9px; margin-top: 3px; }
 .wallet-summary-strip { display: flex; align-items: center; gap: 22px; margin: -4px 0 22px; font-size: 11px; color: #7c9170; flex-wrap: wrap; }
 .wallet-summary-strip > span { display: flex; align-items: center; gap: 6px; }
@@ -612,7 +613,8 @@ th { color: #7c8980; background: #f8faf6; }
   .wallet-table .wallet-name-cell .address { font-size: 10px; margin-top: 4px; }
   .wallet-table td:nth-child(3)::before, .wallet-table td:nth-child(4)::before, .wallet-table td:nth-child(5)::before, .wallet-table td:nth-child(6)::before { display: block; font-size: 10px; line-height: 1.5; color: #84917c; margin-bottom: 7px; }
   .wallet-table td:nth-child(3)::before { content: '连接与权限'; }
-  .wallet-table td:nth-child(4)::before { content: '钱包余额'; }
+  .wallet-table td:nth-child(4)::before { content: 'BSC 余额'; }
+  .wallet-table td:nth-child(4) { grid-column: 1/-1; }
   .wallet-table td:nth-child(5)::before { content: '执行模式'; }
   .wallet-table td:nth-child(6)::before { content: '今日付费'; }
   .wallet-table td:nth-child(6) { grid-column: 1/-1; }
@@ -631,6 +633,8 @@ th { color: #7c8980; background: #f8faf6; }
   .overview-wallet-table td:first-child, .overview-wallet-table td:last-child { width: auto; min-width: 0; grid-column: 1/-1; }
   .overview-wallet-table td:first-child { padding-bottom: 12px; border-bottom: 1px solid var(--line); }
   .overview-wallet-table td:nth-child(2) { grid-column: 1/-1; }
+  .overview-wallet-table td:nth-child(3) { grid-column: 1/-1; }
+  .wallet-balance-summary { min-width: 0; max-width: 100%; overflow-x: auto; }
   .overview-wallet-table td[data-label]:not(:first-child)::before { content: attr(data-label); display: block; color: #84917c; font-size: 10px; line-height: 1.5; margin-bottom: 7px; }
   .overview-wallet-table td:last-child { padding-top: 10px; border-top: 1px solid var(--line); }
 }
