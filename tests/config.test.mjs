@@ -23,7 +23,7 @@ test('paid settings honor explicit values and zero budgets', () => {
   assert.deepEqual([paid.goPct, paid.earlyPct, paid.riseDelta, paid.maxUsd, paid.maxBnbPerDay, paid.keepBnb], [0.8, 0.65, 0, 0, 0, 0]);
   assert.equal(getPaidConfig({ paid: { goPct: 0 } }).goPct, 0);
   assert.equal(getPaidConfig({}).maxBnbPerDay, 0);
-  assert.equal(getPaidConfig({}).goPct, 0.6);
+  assert.equal(getPaidConfig({}).goPct, 0.8);
   assert.equal(getPaidConfig({ paid: { goPct: 0.8 } }).goPct, 0.8);
   for (const invalid of [-1, Infinity, NaN, '20', null]) assert.throws(() => getPaidConfig({ paid: { maxUsd: invalid } }), /数值/);
   assert.throws(() => getPaidConfig({ paid: { goPct: 0.5, earlyPct: 0.6 } }), /不能大于/);

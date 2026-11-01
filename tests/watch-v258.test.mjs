@@ -16,7 +16,7 @@ const beacon = '0x4444444444444444444444444444444444444444';
 const registry = '60b9262456de011f7d15a54cdd8c48baaa8b022f';
 const word = value => BigInt(value).toString(16).padStart(64, '0');
 
-function freeProgressHarness({ decimals, supply, cap, fallback = 0 } = {}) {
+function freeProgressHarness({ decimals, supply, minted, cap, fallback = null } = {}) {
   const seen = [];
   const sandbox = {
     Date,
@@ -24,6 +24,7 @@ function freeProgressHarness({ decimals, supply, cap, fallback = 0 } = {}) {
       seen.push(data);
       if (data === '0x313ce567') return decimals === undefined ? '0x' : '0x' + word(decimals);
       if (data === '0x18160ddd') return supply === undefined ? '0x' : '0x' + word(supply);
+      if (data === '0xa2309ff8') return minted === undefined ? '0x' : '0x' + word(minted);
       if (data === '0xd5abeb01') return cap === undefined ? '0x' : '0x' + word(cap);
       return '0x';
     },
@@ -51,6 +52,19 @@ test('pre-issued ERC20 total supply never becomes a false 100% mint progress', a
 test('missing free progress remains unknown instead of becoming zero or full', async () => {
   const h = freeProgressHarness();
   assert.equal(await h.read(target), null);
+});
+
+test('reserved NFT supply cannot inflate progress when totalMinted is available', async () => {
+  const h = freeProgressHarness({ supply: 10000, minted: 72, cap: 10000 });
+  assert.equal(await h.read(target), 0.0072);
+  assert.ok(h.seen.includes('0xa2309ff8'));
+  assert.equal(h.seen.includes('0x18160ddd'), false, 'totalSupply includes reserved units and must not override actual mint count');
+});
+
+test('an available zero totalMinted remains zero even when totalSupply is full', async () => {
+  const h = freeProgressHarness({ supply: 10000, minted: 0, cap: 10000 });
+  assert.equal(await h.read(target), 0);
+  assert.equal(h.seen.includes('0x18160ddd'), false);
 });
 
 function proxyHarness({ storageImpl = false, storageBeacon = false } = {}) {

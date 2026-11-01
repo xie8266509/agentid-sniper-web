@@ -12,8 +12,8 @@
   },
   "timeZone": "Asia/Shanghai",
   "paid": {
-    "goPct": 0.6,
-    "earlyPct": 0.6,
+    "goPct": 0.8,
+    "earlyPct": 0.8,
     "riseDelta": 0.02,
     "maxUsd": 20,
     "maxBnbPerDay": 0,

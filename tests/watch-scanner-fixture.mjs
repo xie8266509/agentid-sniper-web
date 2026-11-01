@@ -11,6 +11,7 @@ import { createHash } from 'node:crypto';
 import { decodeAbiUint } from '../lib/nft-codec.mjs';
 import * as sellRules from '../lib/sell-rules.mjs';
 import * as walletModel from '../lib/wallet-model.mjs';
+import * as mintPolicy from '../lib/mint-policy.mjs';
 
 export const raw = readFileSync(new URL('../watch.mjs', import.meta.url), 'utf8');
 export const VIRTUAL_ROOT = '/isolated/watch-monitor';
@@ -37,6 +38,7 @@ globalThis.api = {
   getState: () => S, getMe: () => ME, getWallets: () => WALLETS,
   getMintQueueSize: () => MQ.size,
   canWallet, paidFor, rulesFor, syncWalletProfiles, runtimeWallet, tokenCostFor,
+  heatOf, freeProgress, getInflight: () => INFLIGHT,
   setHoldingsWorker: fn => { holdW = fn; },
 };`);
   const config = { monitorOnly, enableFileCommands, wallets, tokens, telegram: {}, timeZone: 'Asia/Shanghai', forceMint: [target], ...configOverrides };
@@ -44,7 +46,7 @@ globalThis.api = {
   const seen = { cliFactories: [], cliCalls: [], network: [], writes: [], directories: [], logs: [], errors: [] };
   const timers = [];
   const sandbox = {
-    Buffer, structuredClone, dirname, join, fileURLToPath, withinPaidBudget, decodeAbiUint, createHash, ...sellRules,
+    Buffer, structuredClone, dirname, join, fileURLToPath, withinPaidBudget, decodeAbiUint, createHash, ...sellRules, ...mintPolicy,
     normalizeWalletConfig: input => walletModel.normalizeWalletConfig(JSON.parse(JSON.stringify(input))),
     getWalletId: walletModel.getWalletId,
     effectiveWalletConfig: (config, wallet) => walletModel.effectiveWalletConfig(JSON.parse(JSON.stringify(config)), JSON.parse(JSON.stringify(wallet))),

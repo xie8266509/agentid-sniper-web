@@ -17,6 +17,7 @@ function harness({ fast = false, hold, rpc, scan } = {}) {
   const S = { tokens: fast ? { position: { openAt: clock - 1000, stage: 0, done: false } } : {}, holdingsUpdatedAt: 123 };
   const sandbox = {
     Date: Clock, S, RULE: { fastMin: 30 }, DIR: '/isolated', SELF: '/isolated/watch.mjs', SELF_MT: 1, MONITOR_ONLY: true,
+    ENTRY_POLICY: { goPct: 0.85, minAgents: 175 },
     join: (...parts) => parts.join('/'), existsSync: path => path === '/isolated/WATCH_STOP' && stopFile, statSync: () => ({ mtimeMs: 1 }),
     async rpc(...args) { return rpc ? rpc(...args) : '0x64'; },
     async holdings(head, onlyFast) { seen.calls.push({ head, onlyFast, at: clock }); return hold?.(head, onlyFast); },

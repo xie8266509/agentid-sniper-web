@@ -228,7 +228,7 @@ function executionHarness({ decimals = 6, status = 'PENDING', after, submit, ref
     save(strict) { if (strict && storageFail) throw new Error('disk full'); seen.saved.push(structuredClone(S)); }, log() {}, blacklist() {},
     async findPair() { return { pair: tokenAddress }; }, async valueUsd() { return value; },
   });
-  vm.runInContext(executionSource + '\nglobalThis.api = { sell, reconcileSell, holdW, positionFor };', context);
+  vm.runInContext('let INFLIGHT = 0;\n' + executionSource + '\nglobalThis.api = { sell, reconcileSell, holdW, positionFor, getInflight: () => INFLIGHT };', context);
   const st = { hist: [], stage: 0, done2: [], peak: value, pricePeak: value, openAt: Date.now() - 60000, pair: tokenAddress, ...seed };
   S.tokens[positionStateKey(wallet, tokenAddress)] = st;
   return { api: context.api, context, token, W, st, S, seen, balance: () => balance, setBalance(value) { balance = value; }, setStatus(value) { statusValue = value; } };
@@ -242,6 +242,21 @@ test('actual sell persists an intent before swap and never resubmits a pending o
   assert.equal(h.st.pendingSell.orderId, 'order-1'); assert.deepEqual(h.st.done2, []); assert.equal(h.S.trades.length, 0);
   await h.api.sell(h.token, h.st, 40_000_000n, 'test', h.W, { id: 'back', full: false });
   assert.equal(h.seen.swaps.length, 1); assert.equal(h.seen.lists.length, 2);
+});
+
+test('selling remains in flight until the submission completes and always clears after interruption', async () => {
+  let release;
+  const waiting = new Promise(resolve => { release = resolve; });
+  const h = executionHarness({ submit: async () => { await waiting; throw new Error('mock interrupted sell'); } });
+  const pending = h.api.sell(h.token, h.st, 40_000_000n, 'test', h.W, { id: 'back', full: false });
+  for (let index = 0; index < 40; index++) await Promise.resolve();
+  assert.equal(h.seen.swaps.length, 1);
+  assert.equal(h.api.getInflight(), 1, 'code-update restart must wait while this sell is being submitted');
+  release();
+  await pending;
+  assert.equal(h.api.getInflight(), 0);
+  assert.ok(h.st.submissionIntent, 'interrupted sell remains blocked by the original intent after in-flight work ends');
+  assert.equal(h.st.eligibility, 'blocked');
 });
 
 test('actual sell confirms only FINISHED plus token balance reduction, once', async () => {

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { runBoundWalletTransaction } from '../lib/wallet-cli.mjs';
-import { isolatedWatch, target } from './watch-scanner-fixture.mjs';
+import { isolatedWatch, target, word } from './watch-scanner-fixture.mjs';
 
 const addressA = '0x1111111111111111111111111111111111111111';
 const addressB = '0x2222222222222222222222222222222222222222';
@@ -30,6 +30,49 @@ test('wallet policies and paid/sell rules are independent and pause closes the l
   assert.equal(h.api.canWallet(c, 'token-sell'), true);
   h.config.monitorOnly = true;
   assert.equal(h.api.canWallet(c, 'token-sell'), false);
+});
+
+test('a lower-threshold wallet never opens the higher-threshold peer mint gate', async () => {
+  const calls = [];
+  const wallets = profiles().slice(0, 2).map((profile, index) => ({ ...profile, mode: 'auto', agentId: index ? 'second.ai' : 'first.ai', agentIdVerified: true, paid: { maxBnbPerDay: 0.1, goPct: index ? 0.95 : 0.8 } }));
+  const h = isolatedWatch({
+    monitorOnly: false, wallets, configOverrides: { forceMint: [] },
+    state: { agentsV: 2, entryPolicy: { goPct: 0.85, minAgents: 175 }, migrated2: 1, refundReset: 1, paid: { [target]: {
+      at: Date.now(), name: 'TEST', done: {}, agents: 175, wallets: 1000,
+      replay: { data: '0x12345678', value: String(10n ** 15n), learned: 1, learnedAt: Date.now() },
+    } } },
+    cliFactory(profile) {
+      return async args => {
+        calls.push({ id: profile.id, args });
+        assert.equal(args[0], 'contract-call'); assert.equal(args[1], 'preview');
+        return { j: { success: true, data: { requestId: 'reviewed-' + profile.id, simulationResult: { balanceChanges: [{ owner: profile.address, contractAddress: addressC, change: '1', tokenType: 'Erc20' }], allowanceChanges: [], authorityChanges: [] } } } };
+      };
+    },
+    rpcResponse({ method, params }) {
+      if (method === 'eth_getCode') return '0x63590e1ae3';
+      if (method === 'eth_getBalance') return '0x' + (10n ** 18n).toString(16);
+      if (method === 'eth_getStorageAt') return '0x' + word(0);
+      if (method === 'eth_estimateGas') return '0x5208';
+      if (method === 'eth_gasPrice') return '0x3b9aca00';
+      if (method === 'eth_call') {
+        const data = params[0].data;
+        if (data.startsWith('0xe6a43905')) return '0x' + addressC.slice(2).padStart(64, '0');
+        if (data === '0x0902f1ac') return '0x' + word(10n ** 18n) + word(1000n * 10n ** 18n) + word(1);
+        if (data === '0x0dfe1681') return '0x' + 'bb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c'.padStart(64, '0');
+        if (data === '0x192fc516' || data === '0xa2309ff8') return '0x' + word(90);
+        if (data === '0xd8f93498') return '0x' + word(100);
+        return '0x';
+      }
+      if (method === 'eth_getLogs') return [];
+      throw new Error('Unexpected isolated RPC ' + method);
+    },
+  });
+  await h.api.paidLoop();
+  assert.ok(calls.some(call => call.id === 'wallet-a'), 'the 90% project should reach the eligible wallet preview');
+  assert.equal(calls.some(call => call.id === 'wallet-b'), false, 'peer requires 95% even though the shared scan floor has passed');
+  // The existing fixture deliberately stops before constructing a real budget
+  // ledger, so this integration test cannot submit either wallet transaction.
+  assert.equal(calls.some(call => call.args[1] === 'execute'), false);
 });
 
 test('legacy names migrate once while reordering and renaming keep session, identity and cost ownership', async () => {

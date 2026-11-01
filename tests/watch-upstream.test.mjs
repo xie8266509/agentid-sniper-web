@@ -5,6 +5,8 @@ import vm from 'node:vm';
 import { getPaidConfig, withinPaidBudget } from '../lib/config.mjs';
 import { marketOrderRecord, marketOrderState } from '../lib/sell-rules.mjs';
 import { scannerRuntimeDouble } from './watch-runtime-fixture.mjs';
+import { createMintRisk, effectiveEntryPolicy, entryGate } from '../lib/mint-policy.mjs';
+import { decodeAbiUint } from '../lib/nft-codec.mjs';
 
 // Only evaluate the reviewed function bodies. Every RPC, CLI, file, and Telegram
 // dependency is an isolated double; no real wallet or network can be reached.
@@ -20,6 +22,7 @@ const autoMint = extract('async function autoMint(c,', '// ---------- AIDROP');
 const learner = extract('async function learnReplay(', 'async function repeatDevOk(');
 const paid = extract('const heatTier =', '\nasync function loginCheck()');
 const manual = extract('function validateFileJob(', '// ── TG 指令');
+const policyHelpers = extract('function entryFor(', '// ---------- 持倉');
 const walletAddress = '0x1111111111111111111111111111111111111111';
 const target = '0x2222222222222222222222222222222222222222';
 const reward = '0x3333333333333333333333333333333333333333';
@@ -32,16 +35,17 @@ const bad = new Set(['0xa9059cbb', '0x095ea7b3', '0x23b872dd', '0x42842e0e', '0x
 function harness(options = {}) {
   let clock = Date.now();
   class Clock extends Date { constructor(...args) { super(...(args.length ? args : [clock])); } static now() { return clock; } }
-  const events = { previews: [], swaps: [], writes: [], logs: [], reads: 0, learned: 0 };
+  const events = { previews: [], swaps: [], writes: [], logs: [], notifications: [], reads: 0, learned: 0 };
   const day = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai' }).format(new Clock());
-  const P = { at: clock, name: 'TEST', done: {}, old: false, wallets: 20, ph: [], replay: { data: '0x12345678', value: '0', payTok: USDT, payAmt: String(10n * 10n ** 18n), hot: 15, learned: 1, learnedAt: clock } };
-  const S = { paid: { [target]: P }, dyn: [], migrated2: 1, paidSpend: { day, test: options.spent || 0 }, seenMints: {} };
+  const P = { at: clock, name: 'TEST', done: {}, old: false, wallets: 20, agents: 175, ph: [], replay: { data: '0x12345678', value: '0', payTok: USDT, payAmt: String(10n * 10n ** 18n), hot: 15, learned: 1, learnedAt: clock } };
+  const S = { paid: { [target]: P }, agentsV: 2, mintPolicy: { wallets: {} }, dyn: [], migrated2: 1, paidSpend: { day, test: options.spent || 0 }, seenMints: {} };
   const W = { id: 'test', name: 'test', profile: { id: 'test', address: walletAddress }, addr: walletAddress, async baw(args) { events.swaps.push(args); return { j: { success: true, data: { txHash: '0x' + 'ab'.repeat(32) } } }; } };
   const balanceChanges = options.noReward ? [] : [{ owner: walletAddress, contractAddress: reward, change: '1', tokenType: 'Erc20' }];
   const sandbox = {
     Date: Clock, MONITOR_ONLY: options.monitorOnly === true, FILE_COMMANDS_ENABLED: options.fileEnabled === true, MONITOR_NOTE: '仅监控',
-    CONFIG: { timeZone: 'Asia/Shanghai' }, PAID: getPaidConfig({ paid: { maxUsd: options.maxUsd ?? 20, maxBnbPerDay: options.maxBnbPerDay ?? 0.05, keepBnb: 0.006 } }),
-    S, WALLETS: [W], FORCE: new Set(options.hotGo ? [] : [target]), HOT: new Map(),
+    CONFIG: { timeZone: 'Asia/Shanghai' }, PAID: getPaidConfig({ paid: { goPct: options.goPct ?? 0.8, maxUsd: options.maxUsd ?? 20, maxBnbPerDay: options.maxBnbPerDay ?? 0.05, keepBnb: 0.006 } }),
+    ENTRY_POLICY: { goPct: 0.85, minAgents: 175 }, effectiveEntryPolicy, entryGate, decodeAbiUint,
+    S, WALLETS: [W], FORCE: new Set(options.hotGo || options.forced === false ? [] : [target]), HOT: new Map(),
     USDT, NATIVE_BNB: BNB, WBNB: reward, FACTORY: reward, T_TRANSFER: transferTopic,
     CANDS: [['mint-test', '0x12345678']], INFRA: new Set(), CLAIM: new Set(), REGISTRY: '60b9262456de011f7d15a54cdd8c48baaa8b022f',
     getPaidConfig, marketOrderRecord, marketOrderState, withinPaidBudget, w: word, wa: (a) => a.slice(2).padStart(64, '0'), big: (value) => value && value !== '0x' ? BigInt(value) : 0n,
@@ -57,14 +61,19 @@ function harness(options = {}) {
     async autoMintMax(c, name, wallet, value) { return sandbox.api.autoMint(c, name, wallet, value); },
     async progressOf() { return { progress: 0 }; }, async deployerOf() { return ''; }, isRepeatDev() { return false; }, isSerial() { return false; },
     async logsRpc(params) { return sandbox.rpc('eth_getLogs', params); },
-    async poolOut() { return 0n; }, async groupProgress() {}, async tg() {}, async tgSay() {}, async sleep() {},
+    async poolOut() { return 0n; }, async groupProgress() {}, async tg(message) { events.notifications.push(message); }, async tgSay() {}, async sleep() {},
     ts: () => 'mock-time',
     log(text) { events.logs.push(text); }, save() { events.writes.push('state'); },
-    async rpc(method) {
-      if (options.rpc) return options.rpc(method, events);
-      if (method === 'eth_getTransactionReceipt') return { status: '0x1', blockNumber: '0x10' };
+    async rpc(method, params) {
+      if (options.rpc) { const result = await options.rpc(method, events, params); if (result !== undefined) return result; }
+      if (method === 'eth_getTransactionReceipt') return { status: '0x1', blockNumber: '0x10', gasUsed: '0x5208', effectiveGasPrice: '0x3b9aca00' };
       if (method === 'eth_getBalance') return '0x' + word(10n ** 18n);
+      if (method === 'eth_estimateGas') return '0x5208';
+      if (method === 'eth_gasPrice') return '0x3b9aca00';
+      if (method === 'eth_getStorageAt') return '0x' + word(0);
+      if (method === 'eth_getCode') return '0x6000';
       if (method === 'eth_getBlockNumber' || method === 'eth_blockNumber') return '0x1000';
+      if (method === 'eth_call' && params?.[0]?.data?.startsWith('0x70a08231')) return '0x' + word(1000n * 10n ** 18n);
       if (method === 'eth_call') return '0x';
       if (method === 'eth_getLogs') return [];
       throw new Error('Unmocked RPC ' + method);
@@ -92,8 +101,9 @@ function harness(options = {}) {
     writeFileSync(path, data) { events.writes.push({ path, data }); },
   };
   Object.assign(sandbox, scannerRuntimeDouble({ sandbox, wallet: W, state: S, events }));
+  sandbox.MINT_RISK = createMintRisk({ state: S, rpc: (...args) => sandbox.rpc(...args), fullCode: (...args) => sandbox.fullCode(...args), save: (...args) => sandbox.save(...args), now: () => clock, timeZone: 'Asia/Shanghai', usdt: USDT });
   const context = vm.createContext(sandbox);
-  vm.runInContext(helpers + addressSafety + learner + paid + manual + autoMint + (options.realPreview ? extract('async function previewExec(', 'async function poolOut(') : '') + (options.withQueue ? extract('const MQK =', '// 每個錢包可以打多份的') : '') + '\nglobalThis.api = { executeUsdtMint, prepareUsdtReplay, mintSimulationCheck, approvalSimulationCheck, validateFileJob, manualMints, paidLoop, learnReplay, safeAddrs, revokeOnFail, hasPositiveMintGain, autoMint, previewExec, queueMint: typeof queueMint === \'function\' ? queueMint : null };', context);
+  vm.runInContext(helpers + addressSafety + policyHelpers + learner + paid + manual + autoMint + (options.realPreview ? extract('async function previewExec(', 'async function poolOut(') : '') + (options.withQueue ? extract('const MQK =', '// 每個錢包可以打多份的') : '') + '\nglobalThis.api = { executeUsdtMint, prepareUsdtReplay, mintSimulationCheck, approvalSimulationCheck, validateFileJob, manualMints, paidLoop, learnReplay, safeAddrs, revokeOnFail, hasPositiveMintGain, autoMint, previewExec, settleConfirmedMintRisk, queueMint: typeof queueMint === \'function\' ? queueMint : null };', context);
   return { api: sandbox.api, context, sandbox, events, P, S, W };
 }
 
@@ -175,8 +185,9 @@ test('file queues reject legacy schemas, unknown fields, unsafe calldata and qua
 
 test('unlearned replay records refresh, and hot fallback without a usable history base does not throw', async () => {
   const h = harness({ hotGo: true });
+  h.sandbox.progressOf = async () => ({ progress: null });
   h.P.replay = { data: '0x12345678', value: String(10n ** 16n) }; h.P.ph = [];
-  h.P.agents = 100; h.P.burst = 15; // unreadable progress requires 100 verified Agent ID wallets
+  h.P.agents = 175; h.P.burst = 15; // unreadable progress still requires the verified-sender threshold
   h.sandbox.learnReplay = async () => { h.events.learned++; return { data: '0x12345678', value: String(10n ** 16n), hot: 15, learned: 1, learnedAt: h.sandbox.Date.now() }; };
   await h.api.paidLoop();
   assert.equal(h.events.learned, 1);
@@ -234,7 +245,7 @@ test('a failed mint revokes only the intended approval and keeps the original fa
   assert.equal(unsafeRevokeExecuted, false);
 });
 
-test('free mint does not execute for zero net gains or assets received by another wallet; positive NFT passes', async () => {
+test('fee-bearing mint does not execute for zero net gains or assets received by another wallet; positive NFT passes', async () => {
   const seedHot = (h) => { h.sandbox.HOT.set(target, { from: new Set(Array.from({ length: 15 }, (_, i) => '0x' + String(i).padStart(40, '0'))) }); };
   for (const changes of [[], [{ owner: walletAddress, contractAddress: reward, change: '0', tokenType: 'Erc20' }], [{ owner: walletAddress, contractAddress: reward, change: '0', tokenType: 'Erc721' }], [{ owner: target, contractAddress: reward, change: '1', tokenType: 'Erc721' }]]) {
     const h = harness(); seedHot(h); let executes = 0;
@@ -242,7 +253,7 @@ test('free mint does not execute for zero net gains or assets received by anothe
       if (args[1] === 'execute') { executes++; return { j: { success: true, data: {} } }; }
       return { j: { success: true, data: { requestId: 'mock-preview', simulationResult: { balanceChanges: changes, allowanceChanges: [], authorityChanges: [] } } } };
     };
-    const result = await h.api.autoMint(target, 'mint-test', h.W, 0n);
+    const result = await h.api.autoMint(target, 'mint-test', h.W, 10n ** 14n);
     assert.equal(executes, 0); assert.match(result, /没有铸|沒有鑄/);
   }
   const h = harness(); seedHot(h); let executes = 0;
@@ -250,8 +261,40 @@ test('free mint does not execute for zero net gains or assets received by anothe
     if (args[1] === 'execute') { executes++; return { j: { success: true, data: { txHash: '0x' + 'ab'.repeat(32) } } }; }
     return { j: { success: true, data: { requestId: 'mock-preview', simulationResult: { balanceChanges: [{ owner: walletAddress, contractAddress: reward, change: '1', tokenType: 'Erc721' }], allowanceChanges: [], authorityChanges: [] } } } };
   };
-  assert.match(await h.api.autoMint(target, 'mint-test', h.W, 0n), /^🤖/);
+  assert.match(await h.api.autoMint(target, 'mint-test', h.W, 10n ** 14n), /^🤖/);
   assert.equal(executes, 1);
+});
+
+test('fee-bearing mint rejects even one wei of excess native debit and malformed wei amounts', async () => {
+  const fee = 10n ** 14n;
+  for (const debit of ['-' + (fee + 1n), '-100000000000000.5', 'NaN']) {
+    const h = harness(); let executes = 0;
+    h.W.baw = async args => {
+      if (args[1] === 'execute') { executes++; throw new Error('unsafe mint must never submit'); }
+      return { j: { success: true, data: { requestId: 'unsafe-preview', simulationResult: {
+        balanceChanges: [
+          { owner: walletAddress, contractAddress: reward, change: '1', tokenType: 'Erc721' },
+          { owner: walletAddress, contractAddress: BNB, change: debit },
+        ], allowanceChanges: [], authorityChanges: [],
+      } } } };
+    };
+    const result = await h.api.autoMint(target, 'mint-test', h.W, fee);
+    assert.equal(executes, 0, debit);
+    assert.match(result, /没有铸|沒有鑄/);
+    assert.equal(h.S.walletPending.test, undefined);
+  }
+});
+
+test('the common contract preview refuses malformed native changes even with a permissive caller check', async () => {
+  const h = harness({ realPreview: true }); let executes = 0;
+  h.W.baw = async args => {
+    if (args[1] === 'execute') { executes++; throw new Error('invalid native amount must never submit'); }
+    return { j: { success: true, data: { requestId: 'bad-amount', simulationResult: {
+      balanceChanges: [{ owner: walletAddress, contractAddress: BNB, change: '-1.5' }], allowanceChanges: [], authorityChanges: [],
+    } } } };
+  };
+  await assert.rejects(h.api.previewExec(h.W, target, '0x12345678', 10n ** 14n, () => ''), /金额无效/);
+  assert.equal(executes, 0);
 });
 
 function attachMintWallet(h, { executeResult } = {}) {
@@ -285,36 +328,119 @@ test('fee-bearing free mint accounts native payment in the same saved daily paid
   assert.ok(h.events.writes.length > 0, 'fee cost must be persisted rather than only accumulated in memory');
 });
 
-test('only-gas free mint remains available when paid mint budgets are zero', async () => {
+test('only-gas free projects notify once without wallet preview, even when paid budgets are zero', async () => {
   const h = harness({ maxUsd: 0, maxBnbPerDay: 0, refund: false }), calls = attachMintWallet(h);
-  assert.match(await h.api.autoMint(target, 'mint-test', h.W, 0n), /^🤖/);
+  assert.match(await h.api.autoMint(target, 'mint-test', h.W, 0n), /^🔔/);
+  assert.match(await h.api.autoMint(target, 'mint-test', h.W, 0n), /^✅/);
+  assert.equal(calls.length, 0, 'free notifications must not preview or submit a transaction');
+  assert.equal(h.events.notifications.filter(message => /只通知/.test(message)).length, 1);
+  assert.equal(h.S.paidSpend.test, 0);
+});
+
+test('the background free-mint queue never spends gas or marks a completed mint', async () => {
+  const h = harness({ withQueue: true }), calls = attachMintWallet(h);
+  assert.match(h.api.queueMint(target, 'mint-test', h.W, 0n), /^⏳/);
+  await Promise.all([...h.sandbox.MQ.values()]);
+  assert.equal(calls.length, 0);
+  assert.equal(h.P.done.test, undefined);
+  assert.equal(h.S.mintCount, undefined);
+  assert.ok(h.events.notifications.some(message => /只通知/.test(message)));
+});
+
+test('an explicitly enabled manual free mint remains possible after automatic free minting is disabled', async () => {
+  const h = harness({ realPreview: true, fileEnabled: true, jobs: [{ schemaVersion: 1, c: target, data: '0x12345678', value: '0', n: 1 }] });
+  const calls = attachMintWallet(h);
+  await h.api.manualMints();
   assert.equal(calls.filter(args => args[1] === 'execute').length, 1);
   assert.equal(h.S.paidSpend.test, 0);
 });
 
-test('known mint progress below 60% cannot be bypassed by crowd heat; 60% can proceed', async () => {
-  for (const progress of [0.01, 0.59, 0.6]) {
-    const h = harness({ freeProgress: progress }), calls = attachMintWallet(h);
-    h.P.agents = 1000;
-    const result = await h.api.autoMint(target, 'mint-test', h.W, 0n);
-    assert.equal(calls.filter(args => args[1] === 'execute').length, progress >= 0.6 ? 1 : 0);
-    assert.match(result, progress >= 0.6 ? /^🤖/ : /60%/);
+test('USDT project risk failures occur before recharge, approval, or any mint preview', async () => {
+  for (const failure of ['storage', 'funds']) {
+    const h = harness({ usdtBalance: 0n, rpc(method, _events, params) {
+      if (failure === 'storage' && method === 'eth_getStorageAt') throw new Error('mock storage unavailable');
+      if (failure === 'funds' && method === 'eth_call' && (params[0].data?.startsWith('0x70a08231') || params[0].data?.startsWith('0xe6a43905'))) return '0x' + word(0);
+    } });
+    await assert.rejects(h.api.executeUsdtMint(h.W, { to: target, data: '0x12345678', need: 10n ** 18n }), /unavailable|资金留存|流动性不足/);
+    assert.equal(h.events.swaps.length, 0);
+    assert.equal(h.events.previews.length, 0);
+    assert.equal(h.events.reservations.size, 0);
   }
 });
 
-test('unreadable progress requires 100 Agent ID wallets and no existing pool', async () => {
-  for (const [agents, poolOpen, expected] of [[99, false, false], [100, false, true], [100, true, false]]) {
+test('known low mint progress cannot be bypassed by crowd heat; the installation threshold can proceed', async () => {
+  for (const progress of [0, 0.01, 0.79, 0.849, 0.85]) {
+    const h = harness({ freeProgress: progress }), calls = attachMintWallet(h);
+    h.P.agents = 1000;
+    const result = await h.api.autoMint(target, 'mint-test', h.W, 10n ** 14n);
+    assert.equal(calls.filter(args => args[1] === 'execute').length, progress >= 0.85 ? 1 : 0);
+    assert.match(result, progress >= 0.85 ? /^🤖/ : /85%/);
+  }
+});
+
+test('unreadable progress requires verified transaction senders and no existing pool', async () => {
+  for (const [agents, poolOpen, expected] of [[174, false, false], [175, false, true], [175, true, false]]) {
     const h = harness({ freeProgress: null, poolOpen }), calls = attachMintWallet(h);
     h.P.agents = agents;
     h.sandbox.HOT.set(target, { from: new Set(Array.from({ length: 300 }, (_, i) => 'hot-' + i)) });
-    const result = await h.api.autoMint(target, 'mint-test', h.W, 0n);
+    const result = await h.api.autoMint(target, 'mint-test', h.W, 10n ** 14n);
     assert.equal(calls.filter(args => args[1] === 'execute').length, expected ? 1 : 0);
     assert.match(result, expected ? /^🤖/ : /^⏸/);
   }
 });
 
-test('serial deployment block applies to free and fee-bearing mint before wallet access', async () => {
-  for (const value of [0n, 10n ** 14n]) {
+test('paidLoop cannot use old 20-wallet rules when progress passes but verified senders do not', async () => {
+  const h = harness({ forced: false });
+  h.P.agents = 174; h.P.wallets = 1000;
+  await h.api.paidLoop();
+  assert.equal(h.events.previews.length, 0);
+  assert.equal(h.events.swaps.length, 0);
+  assert.equal(h.P.done.test, undefined);
+});
+
+test('paidLoop preserves the configured stricter per-wallet progress threshold', async () => {
+  const h = harness({ forced: false, goPct: 0.95 });
+  await h.api.paidLoop();
+  assert.equal(h.P.progress, 0.9);
+  assert.equal(h.events.previews.length, 0);
+  assert.equal(h.P.done.test, undefined);
+  h.sandbox.call = async (_contract, data) => {
+    if (data === '0x192fc516') return '0x' + word(96);
+    if (data === '0xd8f93498') return '0x' + word(100);
+    if (data.startsWith('0x70a08231')) return '0x' + word(1000n * 10n ** 18n);
+    return '0x';
+  };
+  await h.api.paidLoop();
+  assert.equal(h.P.progress, 0.96);
+  assert.equal(h.P.done.test, 'minted');
+  assert.equal(h.events.previews.length, 2);
+});
+
+test('paidLoop cannot let a large crowd override known low progress', async () => {
+  const h = harness({ forced: false, contractCall(_contract, data) {
+    if (data === '0x192fc516') return '0x' + word(20);
+    if (data === '0xd8f93498') return '0x' + word(100);
+  } });
+  h.P.agents = 1000;
+  await h.api.paidLoop();
+  assert.equal(h.P.progress, 0.2);
+  assert.equal(h.events.previews.length, 0);
+  assert.equal(h.events.swaps.length, 0);
+});
+
+test('free replay in paidLoop never approves or submits even when force-tracked', async () => {
+  for (const forced of [false, true]) {
+    const h = harness({ forced });
+    h.P.replay = { data: '0x12345678', value: '0', learned: 1, learnedAt: h.sandbox.Date.now() };
+    await h.api.paidLoop();
+    assert.equal(h.events.previews.length, 0, 'force-tracking is not an instruction to spend gas on a free mint');
+    assert.equal(h.events.swaps.length, 0);
+    assert.ok(h.events.notifications.some(message => /只通知/.test(message)));
+  }
+});
+
+test('serial deployment block applies to fee-bearing mint before wallet access', async () => {
+  for (const value of [10n ** 14n]) {
     const h = harness({ serialReason: '同一個部署者 24 小時內部署了 10 個項目' }), calls = attachMintWallet(h);
     assert.match(await h.api.autoMint(target, 'mint-test', h.W, value), /10 個項目/);
     assert.equal(calls.length, 0);
@@ -363,6 +489,27 @@ test('ambiguous fee mint response retains its pre-send daily budget reservation'
   assert.equal(calls.filter(args => args[1] === 'execute').length, 1);
   assert.ok(Math.abs(h.S.paidSpend.test - 0.0001) < 1e-12);
   assert.ok(h.events.writes.length > 0);
+  const pending = h.S.walletPending.test;
+  assert.ok(pending?.mintRiskReservation);
+  assert.equal(h.S.mintRisk.reservations[pending.mintRiskReservation]?.walletId, 'test');
+  assert.ok(BigInt(h.S.mintRisk.reservations[pending.mintRiskReservation].amountWei) > 10n ** 14n, 'unknown gas and fee remain reserved together');
+});
+
+test('fee recovery cannot settle a reservation with an unrelated transaction receipt', async () => {
+  const h = harness(), expected = '0x' + 'ab'.repeat(32), unrelated = '0x' + 'cd'.repeat(32);
+  const quote = await h.sandbox.MINT_RISK.quoteTransaction(h.W, { to: target, data: '0x12345678', valueWei: 10n ** 14n, feeLike: true });
+  const id = h.sandbox.MINT_RISK.reserve(quote), pending = { mintRiskReservation: id };
+  h.sandbox.rpc = async (method, params) => {
+    assert.equal(method, 'eth_getTransactionReceipt'); assert.equal(params[0], expected);
+    return { transactionHash: unrelated, status: '0x1', gasUsed: '0x5208', effectiveGasPrice: '0x3b9aca00' };
+  };
+  await h.api.settleConfirmedMintRisk(pending, { resolved: true, status: 'confirmed', txHash: expected });
+  assert.ok(h.S.mintRisk.reservations[id]);
+  assert.equal(Object.keys(h.S.mintRisk.spent).length, 0);
+  h.sandbox.rpc = async () => ({ transactionHash: expected, status: '0x1', gasUsed: '0x5208', effectiveGasPrice: '0x3b9aca00' });
+  await h.api.settleConfirmedMintRisk(pending, { resolved: true, status: 'confirmed', txHash: expected });
+  assert.equal(h.S.mintRisk.reservations[id], undefined);
+  assert.equal(Object.values(h.S.mintRisk.spent)[0], '121000000000000');
 });
 
 for (const errorName of ['TIMEOUT', 'CANCELLED', 'CLI_PROCESS_ERROR', 'CLI_INVALID_OUTPUT']) {
