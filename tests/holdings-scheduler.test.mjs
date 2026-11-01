@@ -105,3 +105,29 @@ test('opening checks run every fifteen seconds through the same non-overlapping 
   await h.advance(1000); assert.equal(h.seen.calls.at(-1).onlyFast, false, 'opening discovery does not postpone the due full round');
   await h.advance(14000); assert.equal(h.seen.calls.at(-1).onlyFast, 'open'); scheduler.stop();
 });
+
+test('provider cooldown suspends even fast holdings polls, then a successful check clears retry state', async () => {
+  let attempts = 0;
+  const h = harness({ fast: true, rpc: async () => {
+    if (++attempts === 1) throw Object.assign(new Error('RPC 节点限流'), { retryAfterMs: 20000 });
+    return '0x64';
+  } });
+  const scheduler = h.api.startHoldingsScheduler(); await flush();
+  assert.equal(attempts, 1); assert.equal(h.S.holdingsRetryAt, h.now() + 20000);
+  for (let index = 0; index < 19; index++) await h.advance(1000);
+  assert.equal(attempts, 1); assert.equal(h.seen.logs.length, 1); assert.equal(h.S.holdingsUpdatedAt, 123);
+  await h.advance(1000);
+  assert.equal(attempts, 2); assert.equal(h.S.holdingsRetryAt, undefined); assert.equal(h.S.holdingsError, undefined);
+  assert.equal(h.S.holdingsUpdatedAt, h.now()); scheduler.stop();
+});
+
+test('repeated failures back off rather than retrying an unhealthy pool every second', async () => {
+  let attempts = 0;
+  const h = harness({ fast: true, rpc: async () => { attempts++; throw new Error('RPC unavailable'); } });
+  const scheduler = h.api.startHoldingsScheduler(); await flush();
+  await h.advance(4000); assert.equal(attempts, 1);
+  await h.advance(1000); assert.equal(attempts, 2); assert.equal(h.S.holdingsRetryAt, h.now() + 10000);
+  await h.advance(9000); assert.equal(attempts, 2);
+  await h.advance(1000); assert.equal(attempts, 3); assert.equal(h.S.holdingsRetryAt, h.now() + 20000);
+  scheduler.stop();
+});

@@ -157,7 +157,7 @@ for (const stage of ['approval', 'mint']) test(`a verified USDT ${stage} revert 
   const from = source.indexOf('async function executeUsdtMintInner('), to = source.indexOf('// 鑄造進度：', from), settleFrom = source.indexOf('function settleMintParticipation('), settleTo = source.indexOf('function applyManualMintCompletion(', settleFrom);
   assert.ok(from >= 0 && to > from && settleFrom >= 0 && settleTo > settleFrom);
   const USDT = '0x55d398326f99059ff775485246999027b3197955', W = { id: 'wallet-a', addr: A }, S = { paidSpend: { day: 'mock-day' }, walletPending: {} }, settled = [];
-  const sandbox = { S, USDT, NATIVE_BNB: '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', MONITOR_ONLY: false, MINT_PARTICIPATION: h.api,
+  const sandbox = { S, USDT, NATIVE_BNB: '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', MONITOR_ONLY: false, MINT_PARTICIPATION: h.api, decodeAbiUint,
     paidFor: () => ({ maxUsd: 20, maxBnbPerDay: 1, keepBnb: .006 }), validMintAddress: () => true, validMintCalldata: () => true, badSel: () => false,
     mintUint: BigInt, bnbUsd: async () => 1000, resetPaidBudgetDay: () => S.paidSpend, rpc: async () => hex(10n ** 18n), call: async () => word(10n * 10n ** 18n), big: BigInt,
     withinPaidBudget: () => true, safeAddrs: async (_wallet, _to, data) => data, MINT_RISK: { projectCheck: async () => ({}) }, mintQuantity: () => 1,

@@ -3,28 +3,30 @@ import { test } from 'node:test';
 import vm from 'node:vm';
 import { readFileSync } from 'node:fs';
 import { decodeAbiUint } from '../lib/nft-codec.mjs';
+import { createRpcClient } from '../lib/rpc-client.mjs';
 
 const source = readFileSync(new URL('../watch.mjs', import.meta.url), 'utf8');
 const section = (start, end) => { const a = source.indexOf(start), b = source.indexOf(end, a); assert.ok(a >= 0 && b > a); return source.slice(a, b); };
 const A = '0x1111111111111111111111111111111111111111', C = '0x2222222222222222222222222222222222222222';
+const batchPool = fetchImpl => createRpcClient({ urls: ['https://one.invalid', 'https://two.invalid', 'https://three.invalid'], fetchImpl, minIntervalMs: 0 });
 
 test('batch evidence rejects duplicate, nonnumeric, and out-of-slice response IDs before returning any proof', async () => {
   for (const bad of [[{ id: 0, result: '0x8' }, { id: 0, result: '0x9' }], [{ id: '0', result: '0x8' }], [{ id: 2, result: '0x8' }], [{ id: -1, result: '0x8' }], [{ id: '__proto__', result: '0x8' }]]) {
     let attempts = 0;
-    const sandbox = { AbortSignal: { timeout: () => ({}) }, fetch: async () => { attempts++; return { json: async () => bad }; } };
+    const sandbox = { RPC_CLIENT: batchPool(async () => { attempts++; return { ok: true, json: async () => bad }; }) };
     vm.runInNewContext(section('async function rpcBatch(', 'async function heatOf(') + '\nglobalThis.run = rpcBatch;', sandbox);
-    const result = await sandbox.run([{ method: 'eth_getTransactionCount', params: [A, 'latest'] }]);
-    assert.deepEqual(Array.from(result), []); assert.equal(attempts, 3);
+    await assert.rejects(sandbox.run([{ method: 'eth_getTransactionCount', params: [A, 'latest'] }]));
+    assert.equal(attempts, 3);
   }
 });
 
 test('an invalid batch may fall back to a clean endpoint, but missing results remain absent rather than fabricated', async () => {
   let attempts = 0;
-  const sandbox = { AbortSignal: { timeout: () => ({}) }, fetch: async (_url, options) => {
+  const sandbox = { RPC_CLIENT: batchPool(async (_url, options) => {
     attempts++; const requests = JSON.parse(options.body);
     assert.deepEqual(requests.map(item => item.id), [0, 1]);
     return { json: async () => attempts === 1 ? [{ id: 0, result: '0x8' }, { id: 0, result: '0x9' }] : [{ id: 1, result: '0x8' }] };
-  } };
+  }) };
   vm.runInNewContext(section('async function rpcBatch(', 'async function heatOf(') + '\nglobalThis.run = rpcBatch;', sandbox);
   const result = await sandbox.run([{ method: 'eth_getTransactionCount', params: [A, 'latest'] }, { method: 'eth_getTransactionCount', params: [C, 'latest'] }]);
   assert.equal(result[0], undefined); assert.equal(result[1], '0x8'); assert.equal(attempts, 2);

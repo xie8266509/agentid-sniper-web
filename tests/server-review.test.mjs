@@ -199,7 +199,7 @@ test('holdings of a secondary-wallet-only token use that wallet state', async ()
   const source = readFileSync(join(root, 'lib', 'control.mjs'), 'utf8').replace(/^import .*;\n/gm, '').replace(/^export /gm, '').replaceAll('import.meta.url', JSON.stringify('file:///mock/lib/control.mjs')) + '\nserviceInfo = async () => ({running:false}); globalThis.getHoldings = holdingsData;';
   const config = { wallets: [{ name: 'first', address: A }, { name: 'second', address: B }], tokens: [{ sym: 'SAME', addr: A, only: B }] };
   const state = { tokens: { SAME: { lastBal: '111', last: { v: 11 } }, 'second:SAME': { lastBal: '222', last: { v: 22 } } } };
-  const sandbox = { dirname, join, fileURLToPath, normalizeWalletConfig, buildStrategyStatus, positionState, createNftMarket: () => ({ snapshot: () => ({ markets: {}, marketSync: {} }) }), execFile() { throw new Error('Unexpected process'); }, promisify() { return () => { throw new Error('Unexpected process'); }; }, readConfig: () => config, readFileSync: () => JSON.stringify(state) };
+  const sandbox = { dirname, join, fileURLToPath, normalizeWalletConfig, buildStrategyStatus, positionState, nftRpc: async () => { throw new Error('Unexpected RPC'); }, createNftMarket: () => ({ snapshot: () => ({ markets: {}, marketSync: {} }) }), execFile() { throw new Error('Unexpected process'); }, promisify() { return () => { throw new Error('Unexpected process'); }; }, readConfig: () => config, readFileSync: () => JSON.stringify(state) };
   vm.runInNewContext(source, sandbox);
   const holding = (await sandbox.getHoldings()).tokens[0];
   assert.equal(holding.wallet, 'second'); assert.equal(holding.quantity, '222'); assert.equal(holding.value, 22);

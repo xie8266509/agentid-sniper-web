@@ -53,13 +53,16 @@ test('NFT registry is shown immediately and ERC721 ownership is verified per wal
   assert.equal(mock.seen.filter((r) => r.method === 'eth_call' && r.params[0].data.startsWith('0x01ffc9a7')).length, 1);
 });
 
-test('automatic polling uses cached balances and manual refresh actually rechecks', async () => {
+test('automatic polling uses cached balances and manual refresh observes the minimum refresh interval', async () => {
   let timestamp = 1000;
   const mock = mockRpc(), inventory = createNftInventory({ rpc: mock.rpc, now: () => timestamp });
   inventory.snapshot(input()); await inventory.whenIdle();
   const count = mock.seen.length;
   for (let i = 0; i < 5; i++) inventory.snapshot(input());
   assert.equal(mock.seen.length, count);
+  inventory.snapshot({ ...input(), force: true }); await inventory.whenIdle();
+  assert.equal(mock.seen.length, count);
+  timestamp += 30000;
   inventory.snapshot({ ...input(), force: true }); await inventory.whenIdle();
   assert.ok(mock.seen.length > count);
   const nextCount = mock.seen.length;
@@ -76,7 +79,7 @@ test('RPC failure is not reported as a zero NFT balance and recovery clears the 
   const bad = inventory.snapshot(input());
   assert.equal(bad.nfts[0].status, 'error');
   assert.equal(bad.nfts[0].quantity, null);
-  failing = false; timestamp += 1;
+  failing = false; timestamp += 30000;
   inventory.snapshot({ ...input(), force: true }); await inventory.whenIdle();
   const recovered = inventory.snapshot(input());
   assert.equal(recovered.nfts[0].status, 'held');
@@ -134,7 +137,7 @@ test('nonstandard ERC721 requires both a receipt event and current ownerOf proof
 });
 
 test('ERC721 listing ID is verified with ownerOf, and cleared after transfer', async () => {
-  let held = true;
+  let held = true, timestamp = 1000;
   const receipt = { status: '0x1', logs: [{ address: C, topics: [NFT_EVENT_TOPICS.ERC721_TRANSFER, addressTopic(B), addressTopic(A), uint(0)], data: '0x' }] };
   const base = mockRpc({ receipt, balances: { [A]: 1n } });
   const rpc = async (method, params) => {
@@ -142,10 +145,11 @@ test('ERC721 listing ID is verified with ownerOf, and cleared after transfer', a
     return base.rpc(method, params);
   };
   // The transaction target is a factory, but receipt emitter is the NFT.
-  const inventory = createNftInventory({ rpc, logLines: () => [`${B} 已自動鑄造 mint() ${HASH}`] });
+  const inventory = createNftInventory({ rpc, now: () => timestamp, logLines: () => [`${B} 已自動鑄造 mint() ${HASH}`] });
   inventory.snapshot(input()); await inventory.whenIdle();
   assert.equal(inventory.snapshot(input()).nfts[0].ownedTokenId, '0');
   held = false;
+  timestamp += 30000;
   inventory.snapshot({ ...input(), force: true }); await inventory.whenIdle();
   const result = inventory.snapshot(input()).nfts[0];
   assert.equal(result.ownedTokenId, null);
@@ -153,17 +157,18 @@ test('ERC721 listing ID is verified with ownerOf, and cleared after transfer', a
 });
 
 test('a later factory mint discovers the new owned ID even when a transferred ID was cached', async () => {
-  let generation = 1;
+  let generation = 1, timestamp = 1000;
   const secondHash = '0x' + 'b'.repeat(64), base = mockRpc({ balances: { [A]: 1n } });
   const rpc = async (method, params) => {
     if (method === 'eth_getTransactionReceipt') return { status: '0x1', logs: [{ address: C, topics: [NFT_EVENT_TOPICS.ERC721_TRANSFER, addressTopic(B), addressTopic(A), uint(params[0] === HASH ? 1 : 2)], data: '0x' }] };
     if (method === 'eth_call' && params[0].data.startsWith('0x6352211e')) return addressTopic(BigInt('0x' + params[0].data.slice(10)) === BigInt(generation) ? A : B);
     return base.rpc(method, params);
   };
-  const inventory = createNftInventory({ rpc, logLines: () => generation === 1 ? [`${C} 已自動鑄造 ${HASH}`] : [`${C} 已自動鑄造 ${HASH}`, `${B} 已自動鑄造 ${secondHash}`] });
+  const inventory = createNftInventory({ rpc, now: () => timestamp, logLines: () => generation === 1 ? [`${C} 已自動鑄造 ${HASH}`] : [`${C} 已自動鑄造 ${HASH}`, `${B} 已自動鑄造 ${secondHash}`] });
   inventory.snapshot(input()); await inventory.whenIdle();
   assert.equal(inventory.snapshot(input()).nfts[0].ownedTokenId, '1');
   generation = 2;
+  timestamp += 30000;
   inventory.snapshot({ ...input(), force: true }); await inventory.whenIdle();
   assert.equal(inventory.snapshot(input()).nfts[0].ownedTokenId, '2');
 });
@@ -196,4 +201,43 @@ test('registry entries are not fabricated when no wallet is configured', async (
   const mock = mockRpc(), inventory = createNftInventory({ rpc: mock.rpc });
   assert.deepEqual(inventory.snapshot(input([])).nfts, []);
   assert.equal(mock.seen.length, 0);
+});
+
+test('zero inventories use a five-minute TTL while held balances keep the normal ninety-second cadence', async () => {
+  let timestamp = 1000;
+  const mock = mockRpc({ balances: { [A]: 0n, [B]: 2n } }), inventory = createNftInventory({ rpc: mock.rpc, now: () => timestamp });
+  const args = input([{ name: 'zero', address: A }, { name: 'held', address: B }]);
+  const reads = address => mock.seen.filter(row => row.method === 'eth_call' && row.params[0].data === '0x70a08231' + address.slice(2).padStart(64, '0')).length;
+  inventory.snapshot(args); await inventory.whenIdle(); assert.equal(reads(A), 1); assert.equal(reads(B), 1);
+  timestamp += 90000; inventory.snapshot(args); await inventory.whenIdle(); assert.equal(reads(A), 1); assert.equal(reads(B), 2);
+  timestamp = 301000; inventory.snapshot(args); await inventory.whenIdle(); assert.equal(reads(A), 2); assert.equal(reads(B), 3);
+});
+
+test('missing and failed receipts have a short shared negative cache, expire and permit later factory discovery', async () => {
+  for (const throwing of [false, true]) {
+    let timestamp = 1000, ready = false, receiptReads = 0, logReads = 0;
+    const receipt = { status: '0x1', logs: [{ address: C, topics: [NFT_EVENT_TOPICS.ERC1155_TRANSFER_SINGLE, addressTopic(B), addressTopic('0x' + '0'.repeat(40)), addressTopic(A)], data: uint(7) + word(3) }] };
+    const base = mockRpc({ standard: 'ERC1155', balances: { [A]: 3n } });
+    const inventory = createNftInventory({ now: () => timestamp, minRefreshMs: 0,
+      logLines: () => { logReads++; return [`${B} 已自動鑄造 ${HASH}`]; },
+      rpc: async (method, params) => { if (method !== 'eth_getTransactionReceipt') return base.rpc(method, params); receiptReads++; if (ready) return receipt; if (throwing) throw Error('transient receipt failure'); return null; },
+    });
+    const args = input([{ name: 'A', address: A }, { name: 'B', address: B }]);
+    inventory.snapshot(args); await inventory.whenIdle(); assert.equal(receiptReads, 1); assert.equal(logReads, 1); assert.equal(inventory.snapshot(args).nfts[0].quantity, null);
+    timestamp++; inventory.snapshot({ ...args, force: true }); await inventory.whenIdle(); assert.equal(receiptReads, 1); assert.equal(logReads, 2);
+    ready = true; timestamp += 30000; inventory.snapshot({ ...args, force: true }); await inventory.whenIdle();
+    const result = inventory.snapshot(args).nfts[0]; assert.equal(receiptReads, 2); assert.equal(logReads, 3); assert.equal(result.quantity, '3'); assert.equal(result.ownedTokenId, '7');
+  }
+});
+
+test('forced inventory refresh respects provider retry hints and repeated-error backoff without inventing zero', async () => {
+  let timestamp = 1000, limited = true;
+  const base = mockRpc(), inventory = createNftInventory({ now: () => timestamp, rpc: async (method, params) => {
+    if (limited && method === 'eth_call' && params[0].data.startsWith('0x70a08231')) throw Object.assign(Error('temporarily limited'), { retryAfterMs: 120000 });
+    return base.rpc(method, params);
+  } });
+  inventory.snapshot(input()); await inventory.whenIdle(); const first = inventory.snapshot(input()).nfts[0];
+  assert.equal(first.status, 'error'); assert.equal(first.quantity, null); assert.equal(first.retryAt, 121000);
+  limited = false; timestamp = 31000; inventory.snapshot({ ...input(), force: true }); await inventory.whenIdle(); assert.equal(inventory.snapshot(input()).nfts[0].status, 'error');
+  timestamp = 121000; inventory.snapshot({ ...input(), force: true }); await inventory.whenIdle(); assert.equal(inventory.snapshot(input()).nfts[0].status, 'held');
 });
