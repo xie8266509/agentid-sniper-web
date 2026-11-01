@@ -1,6 +1,8 @@
 const $ = (s, root = document) => root.querySelector(s);
 const content = $('#content'), modal = $('#modal'), modalContent = $('#modal-content');
-const state = { view: 'overview', status: null, config: null, csrf: '', logs: [], walletStatus: new Map(), balances: new Map(), samples: [], autoLogs: true, search: '', preview: null, disconnected: false, walletId: localStorage.getItem('agentid.wallet') || '', walletSearch: '', showArchived: false, walletRegistry: new Map() };
+function readLocalStorage(key) { try { return localStorage.getItem(key); } catch { return null; } }
+function writeLocalStorage(key, value) { try { if (value === null) localStorage.removeItem(key); else localStorage.setItem(key, value); } catch {} }
+const state = { view: 'overview', status: null, config: null, csrf: '', logs: [], walletStatus: new Map(), balances: new Map(), samples: [], autoLogs: true, search: '', preview: null, disconnected: false, walletId: readLocalStorage('agentid.wallet') || '', walletSearch: '', showArchived: false, walletRegistry: new Map() };
 let sessionRenewal = null, routeGeneration = 0, nftAssetGeneration = 0;
 const walletBalanceRequests = new Map();
 let nftTradingData = null, nftTradingError = null, nftTradingRequest = null;
@@ -105,12 +107,16 @@ function confirmAction(name, description, label = '确认', { checkbox, danger =
 }
 async function loadConfig() { const data = await api('/api/config'); state.config = data.config || data; syncWalletScope(); return state.config; }
 async function refreshStatus({ passive = false } = {}) {
-  const data = await api('/api/status'); state.status = data; state.disconnected = false;
+  const data = await api('/api/status'), previousMint = state.status?.mintSuccess;
+  if (previousMint?.available && data.mintSuccess?.available && mintLedgerKey(previousMint) === mintLedgerKey(data.mintSuccess) && previousMint.asOf > data.mintSuccess.asOf) data.mintSuccess = previousMint;
+  state.status = data; state.disconnected = false;
   if (Number.isFinite(Number(data.scan?.head || data.scan?.lastBlock))) {
     const b = Number(data.scan?.lastBlock); const last = state.samples.at(-1); if (!last || b !== last.value) state.samples.push({ at: Date.now(), value: b }); state.samples = state.samples.slice(-30);
   }
   updateChrome();
   paintWalletExecution();
+  paintWalletMintCounts();
+  void mintNotifications.consume(data.mintSuccess);
   paintUpdates();
   $('#updated-at').textContent = '最近同步 ' + date(Date.now());
   const version = typeof data.release?.version === 'string' ? data.release.version : '';
@@ -175,6 +181,100 @@ function paintWalletExecution() {
     if (wallet && cell.dataset.walletAddress === wallet.address?.toLowerCase()) replace(cell, ...walletExecutionCell(wallet).childNodes);
   }
 }
+function mintLedgerKey(summary) {
+  if (summary?.version !== 1 || summary.available !== true || !Number.isFinite(summary.trackingSince) || summary.trackingSince < 0) return null;
+  const id = String(summary.ledgerId ?? summary.trackingSince);
+  return id && id.length <= 200 ? `agentid.mint-success.v1.${encodeURIComponent(id)}.${summary.trackingSince}` : null;
+}
+function mintEventWallet(event) {
+  if (!event || event.chainId !== 56 || typeof event.id !== 'string' || !event.id || event.id.length > 200 || /[\u0000-\u001f\u007f]/.test(event.id) || !/^0x[a-f0-9]{64}$/i.test(event.txHash || '')) return null;
+  if (event.id !== '56:' + event.txHash.toLowerCase()) return null;
+  const wallet = walletById(event.walletId);
+  return wallet?.address && /^0x[a-f0-9]{40}$/i.test(event.walletAddress || '') && wallet.address.toLowerCase() === event.walletAddress.toLowerCase() ? wallet : null;
+}
+function walletMintStats(wallet) {
+  const summary = state.status?.mintSuccess;
+  if (!mintLedgerKey(summary) || !/^0x[a-f0-9]{40}$/i.test(wallet.address || '')) return null;
+  const matches = (Array.isArray(summary.wallets) ? summary.wallets : []).filter(row => row.walletId === wallet.id && String(row.walletAddress || '').toLowerCase() === String(wallet.address || '').toLowerCase());
+  const row = matches.length === 1 ? matches[0] : null;
+  return row && ['total', 'today'].every(key => Number.isSafeInteger(row[key]) && row[key] >= 0) ? row : null;
+}
+function mintCountParts(wallet) {
+  const counts = walletMintStats(wallet);
+  return [el('button', { type: 'button', class: 'mint-count-button', onclick: () => openMintSuccessDetails(wallet.id), 'aria-label': wallet.name + '成功 Mint 统计' }, el('strong', { class: 'mono' }, counts ? fmt(counts.total) + ' 笔' : '—'), el('span', { class: 'table-muted' }, counts ? `今日确认 ${fmt(counts.today)} 笔` : '统计暂不可用'))];
+}
+function walletMintCell(wallet) { return el('div', { class: 'wallet-mint-count', 'data-wallet-mints': wallet.id, 'data-wallet-address': wallet.address?.toLowerCase() || '' }, mintCountParts(wallet)); }
+function paintWalletMintCounts() {
+  for (const cell of content.querySelectorAll('[data-wallet-mints]')) {
+    const wallet = walletById(cell.dataset.walletMints);
+    if (wallet && cell.dataset.walletAddress === wallet.address?.toLowerCase() && !cell.contains(document.activeElement)) replace(cell, mintCountParts(wallet));
+  }
+}
+function mintNftAmount(event) {
+  let total = 0n;
+  for (const asset of Array.isArray(event.assets) ? event.assets : []) if (['ERC721', 'ERC1155'].includes(asset.standard) && /^\d{1,78}$/.test(asset.amountBaseUnits || '') && /^0x[a-f0-9]{40}$/i.test(asset.address || '')) total += BigInt(asset.amountBaseUnits);
+  return total > 0n ? total.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') : null;
+}
+function mintProjectName(event) { const value = typeof event.name === 'string' && event.name.trim() ? event.name : typeof event.project === 'string' ? event.project : ''; return value.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 160) || '未命名项目'; }
+function mintTransactionLink(event) { return /^0x[a-f0-9]{64}$/i.test(event.txHash || '') ? el('a', { href: 'https://bscscan.com/tx/' + event.txHash, target: '_blank', rel: 'noopener noreferrer', title: event.txHash, class: 'text-link' }, '查看交易 ', event.txHash.slice(0, 8) + '…' + event.txHash.slice(-6), icon('external')) : el('span', { class: 'table-muted' }, '交易哈希不可用'); }
+function openMintSuccessDetails(id = null) {
+  const wallet = id ? walletById(id) : null; if (id && !wallet) return;
+  const summary = state.status?.mintSuccess, available = Boolean(mintLedgerKey(summary)), counts = wallet && walletMintStats(wallet);
+  const events = (Array.isArray(summary?.recent) ? summary.recent : []).filter(event => mintEventWallet(event) && (!wallet || event.walletId === wallet.id && event.walletAddress.toLowerCase() === wallet.address.toLowerCase()));
+  const note = available ? `统计自 ${date(summary.trackingSince, true)} 启用；仅计已核验成功的 Mint 交易，启用前的历史不计入。每笔交易计一次，不等同 NFT 张数。` : '成功 Mint 统计暂时无法读取，未将未知数量记为零。';
+  openModal(wallet ? wallet.name + ' · 成功 Mint' : '最近成功 Mint', el('div', {}, wallet && walletLabel(wallet), el('p', { class: 'help section-spacer' }, note), counts && el('p', { class: 'mint-count-detail' }, `累计 ${fmt(counts.total)} 笔 · 今日确认 ${fmt(counts.today)} 笔`), el('p', { class: 'help' }, '仅显示后台返回的最近 50 笔成功记录；更早记录不在此列表中。'), events.length ? el('div', { class: 'mint-event-list' }, events.map(event => el('div', { class: 'mint-event-row' }, el('strong', {}, mintProjectName(event)), !wallet && el('div', { class: 'table-muted' }, mintEventWallet(event).name), el('div', { class: 'table-muted' }, date(event.confirmedAt, true), mintNftAmount(event) && ` · ${mintNftAmount(event)} 张 NFT`), /^0x[a-f0-9]{40}$/i.test(event.project || '') && el('div', { class: 'address' }, event.project), mintTransactionLink(event)))) : el('p', { class: 'table-muted' }, available ? '当前返回的最近 50 笔记录中，暂无' + (wallet ? '此钱包的' : '') + '成功 Mint 记录。' : '暂时无法读取成功记录。')), [button('关闭', null, closeModal)]);
+}
+function createMintNotificationTracker({ readStorage, writeStorage, withLock, visible, currentEvent, notify }) {
+  const memory = new Map(); let pending = Promise.resolve();
+  const validId = id => typeof id === 'string' && id.length > 0 && id.length <= 200 && !/[\u0000-\u001f\u007f]/.test(id);
+  function saved(value, key) { return value?.version === 1 && value.key === key && Number.isFinite(value.baselineAt) && Array.isArray(value.seenIds) ? value : null; }
+  function process(summary, key) {
+    if (!visible()) return;
+    let stored = null;
+    try { const raw = readStorage(key); if (typeof raw === 'string' && raw.length <= 1000000) stored = saved(JSON.parse(raw), key); } catch {}
+    const documents = [stored, saved(memory.get(key), key)].filter(Boolean).sort((a, b) => (a.lastAsOf || 0) - (b.lastAsOf || 0));
+    const first = documents.length === 0, ids = new Map();
+    for (const document of documents) for (const id of document.seenIds.slice(-2000)) if (validId(id)) { ids.delete(id); ids.set(id, true); }
+    const baselineAt = first ? Number.isFinite(summary.asOf) ? summary.asOf : summary.trackingSince : Math.min(...documents.map(document => document.baselineAt));
+    const events = (Array.isArray(summary.recent) ? summary.recent : []).slice(0, 50).filter(event => validId(event?.id)).sort((a, b) => (a.recordedAt || 0) - (b.recordedAt || 0) || a.id.localeCompare(b.id));
+    const fresh = [];
+    for (const event of events) {
+      if (ids.has(event.id)) continue;
+      ids.set(event.id, true);
+      if (!first && event.source === 'live' && Number.isFinite(event.recordedAt) && event.recordedAt >= baselineAt && currentEvent(event)) fresh.push(event);
+    }
+    const document = { version: 1, key, baselineAt, lastAsOf: Math.max(Number(summary.asOf) || 0, ...documents.map(value => value.lastAsOf || 0)), seenIds: [...ids.keys()].slice(-2000) };
+    memory.delete(key); memory.set(key, document); while (memory.size > 4) memory.delete(memory.keys().next().value);
+    try { writeStorage(key, JSON.stringify(document)); } catch {}
+    if (fresh.length) notify(fresh);
+  }
+  return { consume(summary) {
+    const key = mintLedgerKey(summary); if (!key) return Promise.resolve();
+    const work = async () => { if (!visible()) return; try { return await withLock(key, () => process(summary, key)); } catch { return process(summary, key); } };
+    pending = pending.catch(() => {}).then(work).catch(() => {}); return pending;
+  } };
+}
+const mintToastQueue = [], activeMintToasts = new Set();
+function enqueueMintNotifications(events) {
+  for (const event of events) mintToastQueue.push({ events: [event], count: 1 });
+  if (mintToastQueue.length > 3) { const count = mintToastQueue.reduce((sum, item) => sum + item.count, 0), recent = mintToastQueue.flatMap(item => item.events).slice(-50); mintToastQueue.splice(0, mintToastQueue.length, { events: recent, count }); }
+  paintMintNotifications();
+}
+function paintMintNotifications() {
+  if (document.hidden) return;
+  while (activeMintToasts.size < 3 && mintToastQueue.length) {
+    const item = mintToastQueue.shift(), event = item.events.at(-1), wallet = mintEventWallet(event); if (!wallet) continue;
+    const nftAmount = mintNftAmount(event), summary = item.count > 1;
+    const names = [...new Set(item.events.map(value => mintEventWallet(value)?.name).filter(Boolean))], walletNames = names.slice(0, 3).join('、') + (names.length > 3 ? `等 ${names.length} 个钱包` : '');
+    const body = el('div', { class: 'mint-toast-body' }, el('strong', {}, summary ? `${fmt(item.count)} 笔 Mint 已确认` : 'Mint 成功'), el('div', {}, summary ? walletNames : wallet.name), el('div', { class: 'mint-toast-project' }, summary ? '最近项目：' + mintProjectName(event) : mintProjectName(event)), el('div', { class: 'table-muted' }, summary ? '已计入成功统计，可查看最近记录。' : nftAmount ? `已确认 ${nftAmount} 张 NFT` : '链上交易已确认'), summary ? el('button', { type: 'button', class: 'text-link mint-toast-details', onclick: () => openMintSuccessDetails() }, '查看最近成功记录') : mintTransactionLink(event));
+    const card = el('div', { class: 'toast mint-toast' }, icon('check'), body);
+    let timer;
+    const dismiss = () => { clearTimeout(timer); card.remove(); activeMintToasts.delete(card); paintMintNotifications(); };
+    card.append(el('button', { type: 'button', class: 'icon-button mint-toast-close', 'aria-label': '关闭 Mint 成功提示', onclick: dismiss }, icon('close')));
+    activeMintToasts.add(card); $('#toasts').append(card); timer = setTimeout(dismiss, 10000);
+  }
+}
+const mintNotifications = createMintNotificationTracker({ readStorage: key => localStorage.getItem(key), writeStorage: (key, value) => localStorage.setItem(key, value), withLock: (key, work) => globalThis.navigator?.locks?.request ? navigator.locks.request(key, work) : work(), visible: () => !document.hidden, currentEvent: mintEventWallet, notify: enqueueMintNotifications });
 function balanceEntry(wallet) { const entry = state.balances.get(wallet.id); return entry?.walletAddress === wallet.address?.toLowerCase() ? entry : null; }
 function balanceAmount(value, symbol) {
   if (typeof value !== 'string' || !/^\d+(?:\.\d+)?$/.test(value)) return '—';
@@ -239,7 +339,7 @@ function openBalanceDetails(id) {
 }
 function walletLabel(wallet) { return el('div', { class: 'wallet-identity' }, el('strong', {}, wallet.name || '未命名钱包'), el('span', { class: 'address', title: wallet.address || '' }, wallet.address || '配对后绑定 BSC 地址')); }
 function syncWalletScope() {
-  if (state.walletId && !walletById(state.walletId)) { state.walletId = ''; localStorage.removeItem('agentid.wallet'); }
+  if (state.walletId && !walletById(state.walletId)) { state.walletId = ''; writeLocalStorage('agentid.wallet', null); }
   const select = $('#global-wallet'); if (!select) return;
   const managing = state.view === 'wallets';
   replace(select, el('option', { value: '' }, managing ? '管理全部钱包' : '全部钱包'), (state.config?.wallets || []).filter(w => !w.archived || w.id === state.walletId).map((w, i) => el('option', { value: walletKey(w, i) }, w.name + (w.archived ? ' · 已归档' : ''))));
@@ -251,7 +351,7 @@ function syncWalletScope() {
 }
 async function changeWalletScope(id) {
   if (content.querySelector('form[data-dirty="true"]') && !await confirmAction('切换钱包', '当前表单有未保存的修改。切换后将放弃这些修改。', '放弃并切换')) { syncWalletScope(); return; }
-  state.walletId = id; localStorage.setItem('agentid.wallet', id); state.preview = null; state.logs = []; logsGeneration++;
+  state.walletId = id; writeLocalStorage('agentid.wallet', id); state.preview = null; state.logs = []; logsGeneration++;
   if (modal.open) closeModal(); holdingsView = null; syncWalletScope(); await route();
 }
 function updateChrome() {
@@ -308,16 +408,16 @@ function renderOverview() {
   const body = el('div', { class: 'panel-content service-summary' }, el('div', { class: 'service-status-row' }, badge(running ? '运行中' : '已停止', running ? '' : 'muted', true), el('span', { class: 'table-muted' }, 'BSC · 共享扫描')),
     el('div', { class: 'detail-grid' }, dataDetail('最新区块', fmt(scan.head), true), dataDetail('已扫描至', fmt(scan.lastBlock), true), dataDetail('最近心跳', s.service?.heartbeatAgeSec == null ? '尚未运行' : `${Math.round(s.service.heartbeatAgeSec)} 秒前`), dataDetail('执行总闸', state.config?.monitorOnly === false ? '允许按钱包策略执行' : '全局只读')),
     sparkline(), el('div', { class: 'service-actions' }, button(running ? '重启扫描器' : '启动扫描器', running ? 'refresh' : 'play', () => serviceAction(running ? 'restart' : 'start'), 'primary'), running && button('停止扫描器', 'stop', () => serviceAction('stop')), button('查看日志', 'logs', () => go('logs'), 'ghost')));
-  const walletRows = wallets.length ? el('div', { class: 'table-wrap overview-wallet-wrap', tabindex: '0', 'aria-label': '钱包余额与执行状态' }, el('table', { class: 'work-table overview-wallet-table' }, el('thead', {}, el('tr', {}, ['钱包', '执行状态', 'BSC 余额', '每日付费上限', ''].map(h => el('th', {}, h)))), el('tbody', {}, wallets.map((w, i) => {
+  const walletRows = wallets.length ? el('div', { class: 'table-wrap overview-wallet-wrap', tabindex: '0', 'aria-label': '钱包余额与执行状态' }, el('table', { class: 'work-table overview-wallet-table' }, el('thead', {}, el('tr', {}, ['钱包', '执行状态', 'BSC 余额', '每日付费上限', '成功 Mint', ''].map(h => el('th', {}, h)))), el('tbody', {}, wallets.map((w, i) => {
     const id = walletKey(w, (state.config.wallets || []).indexOf(w)), p = { ...state.config.paid, ...w.paid };
-    return el('tr', {}, el('td', { 'data-label': '钱包' }, el('div', { class: 'wallet-name-cell' }, el('span', { class: 'wallet-avatar' }, String(i + 1).padStart(2, '0')), el('div', {}, el('strong', {}, w.name), el('div', { class: 'address', title: w.address }, shortAddress(w.address))))), el('td', { 'data-label': '执行状态' }, walletExecutionCell(w)), el('td', { 'data-label': 'BSC 余额' }, walletBalanceCell(w)), el('td', { class: 'mono', 'data-label': '每日付费上限' }, `${p.maxBnbPerDay ?? 0} BNB`), el('td', {}, button('设置', 'sliders', () => openWalletSettings(id), 'small ghost')));
+    return el('tr', {}, el('td', { 'data-label': '钱包' }, el('div', { class: 'wallet-name-cell' }, el('span', { class: 'wallet-avatar' }, String(i + 1).padStart(2, '0')), el('div', {}, el('strong', {}, w.name), el('div', { class: 'address', title: w.address }, shortAddress(w.address))))), el('td', { 'data-label': '执行状态' }, walletExecutionCell(w)), el('td', { 'data-label': 'BSC 余额' }, walletBalanceCell(w)), el('td', { class: 'mono', 'data-label': '每日付费上限' }, `${p.maxBnbPerDay ?? 0} BNB`), el('td', { class: 'mint-stat-cell', 'data-label': '成功 Mint' }, walletMintCell(w)), el('td', {}, button('设置', 'sliders', () => openWalletSettings(id), 'small ghost')));
   })))) : empty('添加第一个钱包', '配对后可查看资产，并为钱包单独设置策略。', 'wallet', button('添加钱包', 'plus', addWalletDialog, 'primary'));
   const projects = s.recentProjects || [];
   const discovery = projects.length ? el('div', { class: 'table-wrap' }, el('table', { class: 'work-table discovery-table' }, el('thead', {}, el('tr', {}, ['项目 / 合约', '来源', '发现时间'].map(h => el('th', {}, h)))), el('tbody', {}, projects.slice(0, 7).map(p => el('tr', {}, el('td', {}, el('strong', {}, p.name || 'Agent ID 合约'), el('div', { class: 'address' }, p.address)), el('td', { class: 'table-muted' }, p.source || '链上事件'), el('td', { class: 'mono' }, date(p.at))))))) : empty('暂无新的项目记录', '扫描器发现项目后会在这里更新。', 'radar');
   replace(content, title('总览', '扫描进度、钱包执行状态与最近的链上记录。', [button('添加钱包', 'plus', addWalletDialog, 'primary')]),
     state.disconnected && el('div', { class: 'connection-error-banner' }, '本地服务连接中断，当前显示最近一次数据。'), modeBanner(),
     el('div', { class: 'metrics-grid' }, metric('当前范围钱包', wallets.length, `/ ${all.length}`, '顶栏可切换查看范围', 'wallet'), metric('已配置执行', automatic.length, '个钱包', state.config?.monitorOnly !== false ? '全局只读，暂不发送自动交易' : '按各钱包模式与权限执行', 'sliders'), metric('扫描落后', fmt(scan.lag), '区块', '所有钱包共用同一条扫描流', 'clock', scan.lag === 0), metric('累计发现', fmt(scan.seenCount), '个项目', '共享扫描器的本地记录', 'radar')),
-    el('div', { class: 'overview-workspace' }, panel('钱包执行', null, walletRows, el('div', { class: 'panel-actions' }, button('刷新余额', 'refresh', () => refreshWalletBalanceSummaries({ refresh: true }), 'small ghost'), el('a', { class: 'text-link', href: '#wallets' }, '管理全部钱包'))), panel('扫描器', null, body)),
+    el('div', { class: 'overview-workspace' }, panel('钱包执行', null, el('div', {}, el('p', { class: 'mint-stats-note' }, '成功 Mint 自功能启用后统计，旧版历史不计入。'), walletRows), el('div', { class: 'panel-actions' }, button('刷新余额', 'refresh', () => refreshWalletBalanceSummaries({ refresh: true }), 'small ghost'), el('a', { class: 'text-link', href: '#wallets' }, '管理全部钱包'))), panel('扫描器', null, body)),
     el('div', { class: 'overview-bottom' }, panel('最近发现', null, discovery), renderOverviewUpdates()));
 }
 async function refreshWallet(input, { quiet = false } = {}) {
@@ -365,7 +465,7 @@ function renderWallets() {
     for (const id of selected) if (!visible.has(id)) selected.delete(id);
     updateSelection();
     if (!wallets.length) { replace(result, empty(query ? '没有匹配的钱包' : state.showArchived ? '暂无钱包' : '暂无可用钱包', query ? '尝试其他名称或地址。' : '添加钱包后，通过币安 App 完成独立配对。', 'wallet', !query && button('添加钱包', 'plus', addWalletDialog, 'primary'))); return; }
-    replace(result, el('div', { class: 'table-wrap wallet-table-wrap', tabindex: '0', 'aria-label': '钱包列表，余额、连接状态和预算可横向滚动查看' }, el('table', { class: 'work-table wallet-table' }, el('thead', {}, el('tr', {}, el('th', { class: 'select-col' }, el('input', { type: 'checkbox', 'aria-label': '选择当前列表中的钱包', checked: wallets.every(w => selected.has(idOf(w))), onchange: e => { for (const w of wallets) e.target.checked ? selected.add(idOf(w)) : selected.delete(idOf(w)); paint(); } })), ...['钱包', '连接与权限', 'BSC 余额', '执行模式', '今日付费', '操作'].map(h => el('th', {}, h)))), el('tbody', {}, wallets.map((w, i) => {
+    replace(result, el('div', { class: 'table-wrap wallet-table-wrap', tabindex: '0', 'aria-label': '钱包列表，余额、连接状态和预算可横向滚动查看' }, el('table', { class: 'work-table wallet-table' }, el('thead', {}, el('tr', {}, el('th', { class: 'select-col' }, el('input', { type: 'checkbox', 'aria-label': '选择当前列表中的钱包', checked: wallets.every(w => selected.has(idOf(w))), onchange: e => { for (const w of wallets) e.target.checked ? selected.add(idOf(w)) : selected.delete(idOf(w)); paint(); } })), ...['钱包', '连接与权限', 'BSC 余额', '执行模式', '今日付费', '成功 Mint', '操作'].map(h => el('th', {}, h)))), el('tbody', {}, wallets.map((w, i) => {
       const id = idOf(w), info = walletConnectionInfo(w), connected = info?.status === 'CONNECTED', runtime = state.walletRegistry.get(id)?.runtime;
       return el('tr', { class: w.archived ? 'archived-row' : '' }, el('td', {}, el('input', { type: 'checkbox', 'aria-label': '选择 ' + w.name, checked: selected.has(id), onchange: e => { e.target.checked ? selected.add(id) : selected.delete(id); updateSelection(); } })),
         el('td', {}, el('div', { class: 'wallet-name-cell' }, el('span', { class: 'wallet-avatar' }, String(i + 1).padStart(2, '0')), el('div', {}, el('strong', {}, w.name), el('div', { class: 'address', title: w.address }, shortAddress(w.address)), el('div', { class: 'table-muted' }, agentIdLabel(w))))),
@@ -373,6 +473,7 @@ function renderWallets() {
         el('td', {}, walletBalanceCell(w)),
         el('td', {}, walletExecutionCell(w), walletRunState(w) !== walletModes[walletMode(w)] && el('div', { class: 'table-muted' }, walletModes[walletMode(w)]), runtime?.blocked && el('div', { class: 'table-error' }, runtime.reason || '有待核对的操作'), runtime?.busy && el('div', { class: 'table-muted' }, '正在处理操作')),
         el('td', {}, budgetCell(w)),
+        el('td', { class: 'mint-stat-cell', 'data-label': '成功 Mint' }, walletMintCell(w)),
         el('td', {}, el('div', { class: 'row-actions' }, button('设置', 'sliders', () => openWalletSettings(id), 'small'), !w.archived && (info ? button(connected ? '连接详情' : '登录', connected ? 'info' : 'wallet', () => connected ? openWalletConnection(id) : startLogin(id), 'small ghost') : button('检查连接', 'refresh', async () => { await refreshWallet(id, { quiet: true }); if (state.view === 'wallets') renderWallets(); }, 'small ghost')), runtime?.blocked && (runtime.canReconcile === true || runtime.details?.source === 'manual' || runtime.source === 'manual') && button('核对交易', 'shield', () => reconcileWalletDialog(id), 'small'), !w.archived && !w.paused && button('暂停', 'stop', () => pauseWallet(id), 'small ghost'))));
     })))));
   };
@@ -380,7 +481,7 @@ function renderWallets() {
   archived.addEventListener('change', () => { state.showArchived = archived.checked; paint(); void refreshWalletBalanceSummaries(); });
   root.append(title('钱包', '此页管理全部钱包。持仓和策略仍按顶部选择的钱包展示。', [button('刷新余额', 'refresh', () => refreshWalletBalanceSummaries({ refresh: true })), button('检查连接', 'wallet', async () => { await loadWalletRegistry(); await forWalletsLimited(managedWallets({ includeArchived: false }), w => refreshWallet(w.id, { quiet: true })); if (state.view === 'wallets') { renderWallets(); void refreshWalletBalanceSummaries(); } }), button('添加钱包', 'plus', addWalletDialog, 'primary')]),
     el('div', { class: 'wallet-summary-strip' }, el('span', {}, el('strong', {}, (state.config?.wallets || []).filter(w => !w.archived).length), ' 个钱包'), el('span', {}, el('span', { class: 'status-dot' }), `${(state.config?.wallets || []).filter(w => !w.archived && walletConnectionInfo(w)?.status === 'CONNECTED').length} 个已核验连接`), el('span', { class: 'table-muted' }, state.config?.monitorOnly === false ? '全局允许按钱包策略执行' : '全局只读：所有钱包暂不自动交易'), button('全部暂停', 'stop', async () => { if (!await confirmAction('暂停全部钱包', '停止所有钱包的新自动操作，继续核对已经提交的订单。市场上的 NFT 挂单不会自动撤销。', '暂停全部')) return; await api('/api/wallets/pause', { method: 'POST', body: { walletIds: [] } }); await loadConfig(); renderWallets(); toast('全部钱包已暂停'); }, 'small ghost')),
-    panel('钱包列表', null, [el('div', { class: 'wallet-toolbar' }, el('div', { class: 'log-search' }, icon('search'), search), el('label', { class: 'checkbox-row' }, archived, '显示已归档')), el('div', { class: 'batch-toolbar' }, selection, batchTemplate, batchPause), result], badge('BSC', 'muted')),
+    panel('钱包列表', null, [el('p', { class: 'mint-stats-note' }, '成功 Mint 自功能启用后统计，旧版历史不计入。'), el('div', { class: 'wallet-toolbar' }, el('div', { class: 'log-search' }, icon('search'), search), el('label', { class: 'checkbox-row' }, archived, '显示已归档')), el('div', { class: 'batch-toolbar' }, selection, batchTemplate, batchPause), result], badge('BSC', 'muted')),
     el('p', { class: 'page-footnote' }, '暂停停止新自动操作，已发送交易继续核对；已挂 NFT 订单须单独撤单。'));
   replace(content, root); updateSelection(); paint();
 }
@@ -1281,7 +1382,7 @@ setInterval(() => { if (!document.hidden && state.csrf && state.view === 'holdin
 setInterval(() => { if (!document.hidden && state.csrf && ['overview', 'wallets'].includes(state.view)) void refreshWalletBalanceSummaries(); }, 30000);
 setInterval(() => { if (!document.hidden && state.csrf && state.view === 'config') loadNftTrading({ quiet: true }); }, 15000);
 setInterval(() => { if (document.hidden || !state.csrf) return; const value = updateSnapshot(); const interval = updateAwaitingResult || value.active ? 2000 : state.view === 'updates' ? 15000 : 60000; if (Date.now() - updatePollAt >= interval) void loadUpdates({ quiet: true }); }, 2000);
-document.addEventListener('visibilitychange', () => { if (!document.hidden && state.csrf && state.view === 'holdings') refreshHoldings(); if (!document.hidden && state.csrf && ['overview', 'wallets'].includes(state.view)) void refreshWalletBalanceSummaries(); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) paintMintNotifications(); if (!document.hidden && state.csrf && state.view === 'holdings') refreshHoldings(); if (!document.hidden && state.csrf && ['overview', 'wallets'].includes(state.view)) void refreshWalletBalanceSummaries(); });
 boot();
 
 function scopedStrategy(strategy) {
