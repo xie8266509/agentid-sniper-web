@@ -38,8 +38,8 @@ test('a lower-threshold wallet never opens the higher-threshold peer mint gate',
   const wallets = profiles().slice(0, 2).map((profile, index) => ({ ...profile, mode: 'auto', agentId: index ? 'second.ai' : 'first.ai', agentIdVerified: true, paid: { maxBnbPerDay: 0.1, goPct: index ? 0.95 : 0.8 } }));
   const h = isolatedWatch({
     monitorOnly: false, wallets, configOverrides: { forceMint: [] },
-    state: { agentsV: 2, entryPolicy: { version: 3, goPct: 0.65, minAgents: 115 }, migrated2: 1, refundReset: 1, paid: { [target]: {
-      at: Date.now(), name: 'TEST', done: {}, agents: 175, wallets: 1000, old: false,
+    state: { agentsV: 3, entryPolicy: { version: 3, goPct: 0.65, minAgents: 115 }, migrated2: 1, refundReset: 1, paid: { [target]: {
+      at: Date.now(), name: 'TEST', done: {}, agents: 175, heatAt: Date.now(), wallets: 1000, old: false,
       replay: { data: '0x12345678', value: String(10n ** 15n), sampleData: '0x12345678', sampleValue: String(10n ** 15n), learned: 1, learnedAt: Date.now() },
     } } },
     cliFactory(profile) {

@@ -83,7 +83,7 @@ test('manual completion binds the wallet and does not call other unknown wallets
   assert.ok(start >= 0 && end > start);
   const owner = '0x1111111111111111111111111111111111111111', wallet = { id: 'fixture-a', addr: owner }, writes = [];
   const S = { paid: { [C]: { done: { 'fixture-b': 'unknown' } } } };
-  const sandbox = { S, FORCE: new Set([C]), WALLETS: [wallet, { id: 'fixture-b' }], validMintAddress: address => /^0x[0-9a-f]{40}$/.test(address), validMintCalldata: data => /^0x(?:[0-9a-f]{2})*$/.test(data), badSel: () => false, save: strict => writes.push(strict) };
+  const sandbox = { S, MINT_PARTICIPATION: { markUnknown() {} }, FORCE: new Set([C]), WALLETS: [wallet, { id: 'fixture-b' }], validMintAddress: address => /^0x[0-9a-f]{40}$/.test(address), validMintCalldata: data => /^0x(?:[0-9a-f]{2})*$/.test(data), badSel: () => false, save: strict => writes.push(strict) };
   vm.runInNewContext(source.slice(start, end) + '\nglobalThis.complete = applyManualMintCompletion;', sandbox);
   const pending = { kind: 'contract', walletId: wallet.id, walletAddress: owner, manualMintProject: C, expected: { to: C, inputData: '0x12345678' } }, tx = '0x' + 'a'.repeat(64);
   assert.throws(() => sandbox.complete(wallet, { ...pending, walletId: 'fixture-b' }, tx), /无法绑定/);

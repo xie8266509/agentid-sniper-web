@@ -1,12 +1,13 @@
 # Agent ID Sniper Web
 
-**v0.4.1 社区 Web 增强版 · 2026-11-01 正式发行**：在本机管理多个 Binance Agentic Wallet 的 Agent ID 铸造监控、持仓和卖出规则。
+**v0.4.2 社区 Web 增强版 · 2026-11-01 正式发行**：在本机管理多个 Binance Agentic Wallet 的 Agent ID 铸造监控、持仓和卖出规则。
 
 基于 [Nancy 的 Agent ID Sniper](https://github.com/nancyc0813-maker/agentid-sniper)。原作者 [@nancy_c813](https://x.com/nancy_c813)，Web 增强版维护 [@supra_bnb](https://x.com/supra_bnb)。这是社区维护项目，不是 Binance 官方产品。
 
 ## 功能
 
-- 同步上游 v2.7.9：每钱包每日最多 60 USD，NFT 更严门槛；完全免费项目只通知，首份免费、后续付费按已验证付款识别。保留多钱包执行、成本记录和原子预算。
+- 同步上游 v2.8.1：每钱包每日最多 60 USD，NFT 更严门槛；完全免费项目只通知，首份免费、后续付费按已验证付款识别。保留多钱包执行、成本记录和原子预算。
+- 参与人数只计历史与当前 Agent ID、交易次数均可核验的钱包；自动付费铸造检查小盘和全钱包累计 2% 上限，新开池优先检查与常规持仓共用执行保护。
 - 可选 TG 已选群线索监控，默认关闭，需用户在本机手动安装依赖、登录并选群；候选还须通过链上检查。
 - 钱包中心直接创建、App 配对、核验绑定；全局钱包筛选覆盖持仓、策略与交易记录。
 - 每个钱包使用稳定 `walletId` 和独立 CLI 会话；旧钱包保留原会话目录与 `instanceId`，改名或重排不更换身份。

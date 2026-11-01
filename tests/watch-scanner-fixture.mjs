@@ -13,6 +13,8 @@ import * as sellRules from '../lib/sell-rules.mjs';
 import * as walletModel from '../lib/wallet-model.mjs';
 import { socialSelectionHash } from '../lib/social-candidates.mjs';
 import * as mintPolicy from '../lib/mint-policy.mjs';
+import { createAgentMaturity } from '../lib/agent-maturity.mjs';
+import { createMintParticipation } from '../lib/mint-participation.mjs';
 
 export const raw = readFileSync(new URL('../watch.mjs', import.meta.url), 'utf8');
 export const VIRTUAL_ROOT = '/isolated/watch-monitor';
@@ -47,7 +49,7 @@ globalThis.api = {
   const seen = { cliFactories: [], cliCalls: [], network: [], writes: [], directories: [], logs: [], errors: [] };
   const timers = [];
   const sandbox = {
-    socialSelectionHash, Buffer, structuredClone, dirname, join, fileURLToPath, withinPaidBudget, decodeAbiUint, createHash, ...sellRules, ...mintPolicy,
+    socialSelectionHash, createAgentMaturity, createMintParticipation, Buffer, structuredClone, dirname, join, fileURLToPath, withinPaidBudget, decodeAbiUint, createHash, ...sellRules, ...mintPolicy,
     normalizeWalletConfig: input => walletModel.normalizeWalletConfig(JSON.parse(JSON.stringify(input))),
     getWalletId: walletModel.getWalletId,
     effectiveWalletConfig: (config, wallet) => walletModel.effectiveWalletConfig(JSON.parse(JSON.stringify(config)), JSON.parse(JSON.stringify(wallet))),
@@ -82,6 +84,8 @@ globalThis.api = {
     },
     appendFileSync(path, value) { seen.logs.push({ path, value }); },
     writeFileSync(path, value) { if (path !== join(VIRTUAL_ROOT, 'data', 'watch.lock')) seen.writes.push({ path, value }); memoryFiles.set(path, String(value)); },
+    renameSync(from, to) { if (!memoryFiles.has(from)) throw new Error('Missing mock temporary file'); memoryFiles.set(to, memoryFiles.get(from)); memoryFiles.delete(from); },
+    rmSync(path) { memoryFiles.delete(path); },
     mkdirSync(path, options) { seen.directories.push({ path, recursive: options.recursive }); },
     readFileSync(path) {
       if (path === join(VIRTUAL_ROOT, 'config.json')) return JSON.stringify(config);

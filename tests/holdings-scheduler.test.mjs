@@ -96,3 +96,12 @@ test('the actual main starts independent holdings even while scanNew remains pen
   assert.equal(h.S.holdingsUpdatedAt, h.now());
   h.seen.listeners.get('exit')(); assert.equal(h.intervals.size, 0);
 });
+
+
+test('opening checks run every fifteen seconds through the same non-overlapping holdings scheduler', async () => {
+  const h = harness(), scheduler = h.api.startHoldingsScheduler(); await flush();
+  await h.advance(15000);
+  assert.equal(h.seen.calls.at(-1).onlyFast, 'open'); assert.equal(h.S.holdingsScope, 'opening');
+  await h.advance(1000); assert.equal(h.seen.calls.at(-1).onlyFast, false, 'opening discovery does not postpone the due full round');
+  await h.advance(14000); assert.equal(h.seen.calls.at(-1).onlyFast, 'open'); scheduler.stop();
+});
