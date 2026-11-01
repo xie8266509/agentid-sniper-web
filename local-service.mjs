@@ -4,6 +4,9 @@ import { spawn, spawnSync } from 'node:child_process';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { runWallet } from './lib/wallet-cli.mjs';
+import { normalizeWalletConfig } from './lib/wallet-model.mjs';
+import { collectWalletReadiness, readWalletReadinessSession, assertAnyWalletReady, readinessConfigKey } from './lib/wallet-readiness.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const DIR = dirname(SELF), DATA = join(DIR, 'data');
@@ -45,13 +48,19 @@ if (!WEB && ['start', 'run'].includes(command)) assertWalletMaintenanceIdle(DIR)
 
 if (command === 'start') {
   const config = JSON.parse(readFileSync(join(DIR, 'config.json'), 'utf8'));
-  if (config.monitorOnly !== true && !config.wallets?.length) throw new Error('交易模式需要先配置 wallets');
   const check = spawnSync(process.execPath, ['--check', WORKER], { encoding: 'utf8' });
   if (check.status !== 0) throw new Error(check.stderr || '程序语法检查失败');
   if (servicePid()) {
     console.log('服务已在运行；修改配置后请先 stop 再 start。');
     status();
   } else {
+    if (!WEB) {
+      const snapshot = normalizeWalletConfig(config);
+      const report = await collectWalletReadiness({ config: snapshot, readWallet: (wallet, index) => readWalletReadinessSession(wallet, index, runWallet) });
+      if (readinessConfigKey(normalizeWalletConfig(JSON.parse(readFileSync(join(DIR, 'config.json'), 'utf8')))) !== readinessConfigKey(snapshot)) throw new Error('钱包配置在启动预检期间已改变，请重新启动');
+      assertAnyWalletReady(report);
+      for (const wallet of report.skipped) console.log(`[${wallet.name || wallet.walletId}] ${wallet.reason}`);
+    }
     rmSync(STOP, { force: true });
     const fd = openSync(join(DATA, WEB ? 'web_console.log' : 'watch_console.log'), 'a', 0o600);
     let child;

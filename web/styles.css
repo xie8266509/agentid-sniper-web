@@ -132,7 +132,7 @@ main { width: 100%; max-width: 1630px; padding: 30px 34px 42px; margin: 0 auto; 
 .panel-content { padding: 21px 20px; }
 .section-spacer { margin-top: 22px; }
 .text-link { font-size: 10px; font-weight: 500; color: #527b48; }
-.overview-workspace { display: grid; grid-template-columns: minmax(0,1.45fr) minmax(300px,1fr); gap: 23px; align-items: start; }
+.overview-workspace { display: grid; grid-template-columns: minmax(0,1.7fr) minmax(280px,.8fr); gap: 23px; align-items: start; }
 .overview-bottom { display: grid; grid-template-columns: minmax(0,1.65fr) minmax(260px,1fr); gap: 23px; align-items: start; margin-top: 23px; }
 .service-status-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
 .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 23px 18px; }
@@ -159,6 +159,18 @@ td strong { color: #45663b; font-size: 11px; font-weight: 550; }
 .work-table td, .work-table th { padding-left: 18px; padding-right: 18px; }
 .overview-wallet-table td { padding-top: 17px; padding-bottom: 17px; }
 .overview-wallet-table td:last-child { width: 60px; }
+.overview-wallet-table { min-width: 620px; }
+.overview-wallet-table td:first-child { min-width: 150px; }
+.panel-actions { display: flex; align-items: center; gap: 13px; flex-wrap: wrap; justify-content: flex-end; }
+.wallet-balance-summary { min-width: 110px; max-width: 185px; }
+.wallet-balance-line { display: flex; align-items: baseline; gap: 6px; line-height: 1.8; }
+.wallet-balance-line strong { color: #344b3f; font-size: 12px; font-weight: 550; overflow-wrap: anywhere; }
+.wallet-balance-line > span { font-size: 10px; color: #7c8980; }
+.balance-detail-link { border: 0; background: none; color: #818c82; font: inherit; font-size: 9px; padding: 4px 0 0; text-align: left; cursor: pointer; display: inline-flex; gap: 4px; align-items: center; }
+.balance-detail-link svg { width: 10px; height: 10px; }
+.balance-detail-link:hover { color: var(--green); }
+.balance-asset-detail { padding: 16px 0; border-bottom: 1px solid var(--line); }
+.balance-asset-detail .section-heading-inline { margin-bottom: 4px; gap: 12px; }
 .discovery-table .address { font-size: 9px; margin-top: 3px; }
 .wallet-summary-strip { display: flex; align-items: center; gap: 22px; margin: -4px 0 22px; font-size: 11px; color: #7c9170; flex-wrap: wrap; }
 .wallet-summary-strip > span { display: flex; align-items: center; gap: 6px; }
@@ -434,7 +446,7 @@ th { color: #7c8e71; }
   .topbar { padding: 0 25px; }
   .topbar-right { gap: 12px; }
   #scope-count { display: none; }
-  .overview-workspace { grid-template-columns: minmax(0,1.2fr) minmax(290px,1fr); gap: 18px; }
+  .overview-workspace { grid-template-columns: 1fr; gap: 18px; }
   .overview-bottom { gap: 18px; }
   .metric-card { padding: 19px 18px; }
   .work-table td, .work-table th { padding-left: 13px; padding-right: 13px; }
@@ -577,7 +589,7 @@ th { color: #7c8980; background: #f8faf6; }
 /* Keep identity and actions visible when the middle columns need more room. */
 .wallet-table-wrap { position: relative; overscroll-behavior-x: contain; scrollbar-width: thin; scrollbar-color: #bfccbd transparent; }
 @media (max-width:1100px) {
-  .wallet-table { min-width: 825px; }
+  .wallet-table { min-width: 950px; }
   .wallet-table th:nth-child(2), .wallet-table td:nth-child(2) { position: sticky; left: 0; min-width: 165px; max-width: 185px; background: #fff; z-index: 2; border-right: 1px solid var(--line); }
   .wallet-table th:last-child, .wallet-table td:last-child { position: sticky; right: 0; width: 152px; min-width: 152px; background: #fff; z-index: 3; border-left: 1px solid var(--line); box-shadow: -9px 0 12px -12px #23472c88; }
   .wallet-table th:nth-child(2), .wallet-table th:last-child { background: #f8faf6; }
@@ -598,15 +610,27 @@ th { color: #7c8980; background: #f8faf6; }
   .wallet-table td:nth-child(2) { grid-column: 1/-1; padding-right: 23px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
   .wallet-table .wallet-name-cell strong { max-width: none; font-size: 13px; }
   .wallet-table .wallet-name-cell .address { font-size: 10px; margin-top: 4px; }
-  .wallet-table td:nth-child(3)::before, .wallet-table td:nth-child(4)::before, .wallet-table td:nth-child(5)::before { display: block; font-size: 10px; line-height: 1.5; color: #84917c; margin-bottom: 7px; }
+  .wallet-table td:nth-child(3)::before, .wallet-table td:nth-child(4)::before, .wallet-table td:nth-child(5)::before, .wallet-table td:nth-child(6)::before { display: block; font-size: 10px; line-height: 1.5; color: #84917c; margin-bottom: 7px; }
   .wallet-table td:nth-child(3)::before { content: '连接与权限'; }
-  .wallet-table td:nth-child(4)::before { content: '执行模式'; }
-  .wallet-table td:nth-child(5)::before { content: '今日付费'; }
-  .wallet-table td:nth-child(5) { grid-column: 1/-1; }
+  .wallet-table td:nth-child(4)::before { content: '钱包余额'; }
+  .wallet-table td:nth-child(5)::before { content: '执行模式'; }
+  .wallet-table td:nth-child(6)::before { content: '今日付费'; }
+  .wallet-table td:nth-child(6) { grid-column: 1/-1; }
   .wallet-table td:last-child { grid-column: 1/-1; border-top: 1px solid var(--line); padding-top: 12px; }
   .wallet-table .row-actions { gap: 7px; }
   .wallet-table .row-actions .button { min-height: 33px; padding: 7px 11px; font-size: 11px; }
   .wallet-table .budget-cell { max-width: 220px; }
   .wallet-table .budget-track { max-width: none; }
   .wallet-table .table-error { max-width: none; }
+  .overview-wallet-wrap { overflow: visible; }
+  .overview-wallet-table, .overview-wallet-table tbody { display: block; min-width: 0; width: 100%; }
+  .overview-wallet-table thead { display: none; }
+  .overview-wallet-table tbody { padding: 14px; display: grid; gap: 12px; }
+  .overview-wallet-table tr { display: grid; grid-template-columns: minmax(0,1fr) minmax(100px,.8fr); gap: 16px; padding: 15px; border: 1px solid var(--line); border-radius: 6px; }
+  .overview-wallet-table td { padding: 0; min-width: 0; border: 0; }
+  .overview-wallet-table td:first-child, .overview-wallet-table td:last-child { width: auto; min-width: 0; grid-column: 1/-1; }
+  .overview-wallet-table td:first-child { padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+  .overview-wallet-table td:nth-child(2) { grid-column: 1/-1; }
+  .overview-wallet-table td[data-label]:not(:first-child)::before { content: attr(data-label); display: block; color: #84917c; font-size: 10px; line-height: 1.5; margin-bottom: 7px; }
+  .overview-wallet-table td:last-child { padding-top: 10px; border-top: 1px solid var(--line); }
 }

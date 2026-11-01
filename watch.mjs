@@ -8,6 +8,7 @@ import { makeWatchBaw } from './lib/wallet-cli.mjs';
 import { getPaidConfig, getRuleConfig, withinPaidBudget } from './lib/config.mjs';
 import { decodeAbiUint } from './lib/nft-codec.mjs';
 import { normalizeWalletConfig, getWalletId, effectiveWalletConfig, walletCanAutomate } from './lib/wallet-model.mjs';
+import { assessWalletReadiness, currentWalletReadiness, readWalletReadinessSession, readinessConfigKey, walletHasAutomaticWork } from './lib/wallet-readiness.mjs';
 import { withWalletExecution, markWalletBlocked, clearWalletBlocked, assertWalletMaintenanceIdle } from './lib/wallet-executor.mjs';
 import { createWalletBudget } from './lib/wallet-budget.mjs';
 import { createAgentMaturity } from './lib/agent-maturity.mjs';
@@ -203,21 +204,28 @@ function makeBaw(wc, index) {
     const kind = walletProfiles.get(wc.id)?.operationKind || (args[0] === 'market-order' && args[1] === 'swap' && String(fromToken).toLowerCase() !== NATIVE_BNB.toLowerCase() ? 'token-sell' : 'mint');
     if (!current || current.address?.toLowerCase() !== wc.address.toLowerCase() || current.bawDir !== wc.bawDir || current.instanceId !== wc.instanceId) return { t: MONITOR_NOTE, j: { success: false, error: { name: 'CONFIG_ERROR', message: '钱包身份或会话配置已变化，请重启后核对' } } };
     if (write && (config.monitorOnly || !(walletCanAutomate(config, current, kind) || args[0] === 'auth' && walletCanAutomate(config, current, 'token-sell')))) return { t: MONITOR_NOTE, j: { success: false, error: { name: 'CONFIG_ERROR', message: '此钱包已暂停或未授权此操作' } } };
-    if (!write) return adapter(args, timeout);
+    const preview = ['contract-call', 'sign-message', 'x402-payment', 'defi'].includes(args[0]) && args[1] === 'preview';
+    if ((write || preview) && WALLET_READINESS_ENFORCED) {
+      const W = walletProfiles.get(wc.id), health = await checkWatchWallet(W);
+      if (!health?.ready) return { t: health?.reason || '钱包尚未就绪', j: { success: false, error: { name: health?.code === 'OFFLINE' ? 'NOT_LOGGED_IN' : 'CONFIG_ERROR', message: health?.reason || '钱包尚未就绪' } } };
+    }
+    if (!write) return observeWalletResponse(walletProfiles.get(wc.id), await adapter(args, timeout));
     const scopeOf = (source, profile) => {
       const effective = effectiveWalletConfig(source, profile);
       return JSON.stringify([profile.id, profile.address.toLowerCase(), profile.bawDir, profile.instanceId, profile.agentId, profile.agentIdVerified, profile.legacyNames, profile.name, profile.mode, profile.paused, profile.archived, profile.draft, profile.autoMint, profile.autoSellTokens, profile.autoSellNfts, effective.paid, effective.rules, source.portfolioBudget?.maxBnbPerDay ?? null, source.monitorOnly, source.enableFileCommands]);
     };
     const scope = scopeOf(config, current);
-    return adapter(args, timeout, { beforeSend: () => {
+    return observeWalletResponse(walletProfiles.get(wc.id), await adapter(args, timeout, { beforeSend: () => {
       // The CLI address preflight awaits I/O. Re-read policy synchronously after
       // it, immediately before the write process is spawned.
       const latest = currentRuntimeConfig(), selected = runtimeWallet(walletProfiles.get(wc.id), latest);
-      if (existsSync(join(DIR, 'WATCH_STOP')) || !selected || latest.monitorOnly || !(walletCanAutomate(latest, selected, kind) || args[0] === 'auth' && walletCanAutomate(latest, selected, 'token-sell')) || scopeOf(latest, selected) !== scope) throw new Error('钱包已暂停、配置已变化或扫描器已停止，未提交交易');
-    } });
+      if (existsSync(join(DIR, 'WATCH_STOP')) || !selected || latest.monitorOnly || !(walletCanAutomate(latest, selected, kind) || args[0] === 'auth' && walletCanAutomate(latest, selected, 'token-sell')) || scopeOf(latest, selected) !== scope || WALLET_READINESS_ENFORCED && !watchWalletReady(walletProfiles.get(wc.id))) throw new Error('钱包连接或权限已失效、配置已变化或扫描器已停止，未提交交易');
+    } }));
   };
 }
 const walletProfiles = new Map();
+let WALLET_READINESS_ENFORCED = false;
+const WALLET_READINESS_JOBS = new Map();
 let WALLETS = (CONFIG.wallets || []).filter(wc => /^0x[a-fA-F0-9]{40}$/.test(wc.address || '')).map((wc, index) => createWatchWallet(wc, index));
 function createWatchWallet(wc, index) {
   const profile = { ...wc }, id = getWalletId(wc, index);
@@ -239,7 +247,43 @@ function runtimeWallet(W, config = currentRuntimeConfig()) {
 function canWallet(W, kind = 'mint') {
   if (MONITOR_ONLY || !W) return false;
   const config = currentRuntimeConfig(), wc = runtimeWallet(W, config);
-  return Boolean(wc && walletCanAutomate(config, wc, kind));
+  return Boolean(wc && walletCanAutomate(config, wc, kind) && (!WALLET_READINESS_ENFORCED || watchWalletReady(W)));
+}
+function watchReadinessScope(W) {
+  const config = currentRuntimeConfig(), wallet = runtimeWallet(W, config);
+  return wallet ? readinessConfigKey({ wallet, monitorOnly: config.monitorOnly }) : null;
+}
+function watchWalletReady(W) {
+  return Boolean(W?.readiness && W.readinessScope === watchReadinessScope(W) && currentWalletReadiness(W.readiness)?.ready);
+}
+function publishWatchReadiness(W, readiness, scope = null) {
+  if (!W) return readiness;
+  W.readiness = readiness; W.readinessScope = scope;
+  S.walletRuntime ||= {}; const state = S.walletRuntime[W.id] ||= {};
+  state.availability = { ...readiness };
+  if (W.readinessNotice !== readiness.code) { W.readinessNotice = readiness.code; logWallet(W, readiness.ready ? '钱包连接与权限已核验，按原策略运行' : readiness.reason); save(); }
+  return readiness;
+}
+function observeWalletResponse(W, result) {
+  const error = result?.j?.error, name = String(error?.name || '');
+  if (W && WALLET_READINESS_ENFORCED && !result?.j?.success && (['NOT_LOGGED_IN', 'UNCONNECTED', 'AUTH_REJECTED', 'CLI_NOT_READY'].includes(name) || /DEV_MODE|SESSION_EXPIRED|INVALID_SESSION/.test(name))) {
+    publishWatchReadiness(W, assessWalletReadiness(W.profile, { status: ['NOT_LOGGED_IN', 'UNCONNECTED', 'AUTH_REJECTED'].includes(name) ? 'UNCONNECTED' : 'ERROR' }));
+  }
+  return result;
+}
+function checkWatchWallet(W) {
+  if (!W || MONITOR_ONLY) return Promise.resolve(null);
+  if (WALLET_READINESS_JOBS.has(W.id)) return WALLET_READINESS_JOBS.get(W.id);
+  const config = currentRuntimeConfig(), wallet = runtimeWallet(W, config), scope = watchReadinessScope(W);
+  if (!wallet || !walletHasAutomaticWork(config, wallet)) return Promise.resolve(publishWatchReadiness(W, { walletId: W.id, name: W.name, address: W.addr, ready: false, code: 'CONFIG_DISABLED', reason: '此钱包已暂停或未启用自动操作', checkedAt: Date.now() }));
+  const job = (async () => {
+    let readiness;
+    try { readiness = assessWalletReadiness(wallet, await readWalletReadinessSession(wallet, W.index, async args => (await W.baw(args, 30000)).j)); }
+    catch { readiness = assessWalletReadiness(wallet, { status: 'ERROR' }); }
+    if (watchReadinessScope(W) !== scope) readiness = { ...readiness, ready: false, code: 'CONFIG_CHANGED', reason: '钱包或策略配置已改变，等待重新核验' };
+    return publishWatchReadiness(W, readiness, scope);
+  })().finally(() => WALLET_READINESS_JOBS.delete(W.id));
+  WALLET_READINESS_JOBS.set(W.id, job); return job;
 }
 function paidFor(W) {
   const config = currentRuntimeConfig(), wc = runtimeWallet(W, config);
@@ -2282,23 +2326,26 @@ async function paidLoop(mode = 'all', shard = null) {
 
 async function loginCheck() {
   if (MONITOR_ONLY) return;
+  const firstCheck = !WALLET_READINESS_ENFORCED;
+  WALLET_READINESS_ENFORCED = true;
   syncWalletProfiles();
+  if (firstCheck) for (const W of WALLETS) publishWatchReadiness(W, { walletId: W.id, name: W.name, address: W.addr, ready: false, code: 'CHECKING', reason: '正在核验钱包连接与操作权限', checkedAt: Date.now() });
   await Promise.allSettled(WALLETS.map(async W => {
-    if (!canWallet(W, 'mint') && !canWallet(W, 'token-sell')) return;
-    const r = await W.baw(['wallet', 'status'], 30000);
-    if (r.j?.data?.status === 'CONNECTED') {
-      const st = await W.baw(['wallet', 'settings'], 30000), exp = Date.parse(st.j?.data?.devMode?.expiresAt || '');
+    const config = currentRuntimeConfig(), wallet = runtimeWallet(W, config);
+    if (!wallet || !walletHasAutomaticWork(config, wallet)) return;
+    const readiness = await checkWatchWallet(W);
+    if (readiness?.ready) {
+      const exp = readiness.expiresAt;
       S.devAlert ||= {};
       if (exp && exp - Date.now() < 24 * 3600e3 && S.devAlert[W.id] !== exp) { S.devAlert[W.id] = exp; await tg(`⏰ [${W.name}] 开发者模式即将到期，请在对应币安 App 中续期；其他钱包继续运行`); }
-      if (st.j?.data?.devMode && st.j.data.devMode.enabled === false && S.devAlert[W.id + ':off'] !== 1) { S.devAlert[W.id + ':off'] = 1; await tg(`⚠️ [${W.name}] 开发者模式已关闭，此钱包等待恢复`); }
-      if (st.j?.data?.devMode?.enabled) S.devAlert[W.id + ':off'] = 0;
       return;
     }
     S.lastLoginAlert = S.lastLoginAlert && typeof S.lastLoginAlert === 'object' ? S.lastLoginAlert : {};
     if (Date.now() - (S.lastLoginAlert[W.id] || 0) < 6 * 3600e3) return;
     S.lastLoginAlert[W.id] = Date.now();
-    await tg(`🔑 [${W.name}] 钱包登录已失效，此钱包的自动操作暂停。请到 Web「钱包管理」重新配对；其他钱包继续运行。`);
+    await tg(`🔑 [${W.name}] ${readiness?.reason || '钱包状态未能核验'}。此钱包不创建新交易，已有交易继续核对；其他钱包继续运行。`);
   }));
+  save();
 }
 
 
@@ -2603,10 +2650,12 @@ async function main() {
   log(MONITOR_ONLY ? '启动监测（仅监控，不调用钱包 CLI）' : '启动监测');
   log(`入场门槛：进度至少 ${Math.round(ENTRY_POLICY.goPct * 1000) / 10}%，${ENTRY_POLICY.minAgents} 个 Agent ID 交易钱包；完全免费只通知`);
   save();
+  // Close every new-operation gate before starting background tasks. Read-only
+  // recovery remains available while each wallet is independently checked.
+  if (!MONITOR_ONLY) { void loginCheck().catch(error => log('钱包检查 ' + error.message)); const timer = setInterval(() => { void loginCheck().catch(() => {}); }, 30000); timer.unref?.(); process.on('exit', () => clearInterval(timer)); }
   const holdingsScheduler = startHoldingsScheduler();
   process.on('exit', () => holdingsScheduler.stop());
   tgCmdLoop().catch((e) => log('tgCmd ' + e.message));
-  let lastLogin = 0;
   for (;;) {
     try { if (statSync(SELF).mtimeMs !== SELF_MT) { if ((INFLIGHT > 0 || globalThis._xBusy) && !globalThis._waitSince) globalThis._waitSince = Date.now(); if ((INFLIGHT === 0 && !globalThis._xBusy) || Date.now() - (globalThis._waitSince || 0) > 300e3) { log('程序更新，重启'); save(); process.exit(0); } } } catch {} // 等进行中的交易与卖出处理，最多五分钟；持久化的未明意图在重启后核对。
     if (UPD.on && existsSync(join(DIR, 'UPDATE'))) { try { unlinkSync(join(DIR, 'UPDATE')); } catch {} doUpdate().then((m) => { log(m); console.log('\n' + m + '\n'); tgSay(m); }).catch((e) => log('update ' + e.message)); }
@@ -2632,7 +2681,6 @@ async function main() {
       if (!globalThis._inscBusy && Date.now() - (globalThis._inscAt || 0) > 30000) { globalThis._inscAt = Date.now(); globalThis._inscBusy = true; inscScan().catch(error => log('铭文通知检查 ' + error.message)).finally(() => { globalThis._inscBusy = false; }); }
       if (!globalThis._fpBusy && Date.now() - (globalThis._fpAt || 0) > 300e3) { globalThis._fpAt = Date.now(); globalThis._fpBusy = true; freeProgWatch().catch((e) => log('freeProg ' + e.message)).finally(() => { globalThis._fpBusy = false; }); } // 免費項目進度，每 5 分鐘
       if (!globalThis._nftBusy && Date.now() - (S.nftVolAt || 0) > 12 * 3600e3) { S.nftVolAt = Date.now(); globalThis._nftBusy = true; nftVolWatch().catch((e) => log('nftVol ' + e.message)).finally(() => { globalThis._nftBusy = false; }); } // 12 小時看一次 NFT 成交量（背景）
-      if (Date.now() - lastLogin > 600e3) { lastLogin = Date.now(); loginCheck().catch(() => {}); }
       // Classification may take minutes; measure lag against a fresh chain head,
       // rather than the head captured before the batch was scanned.
       const latestHead = await rpc('eth_blockNumber', []).then((value) => parseInt(value, 16)).catch(() => null);
